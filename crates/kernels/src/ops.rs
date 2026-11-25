@@ -89,8 +89,9 @@ impl RmsNormF32 {
         let (mut px, mut pw, mut py) = (x.dptr(), weight.map_or(0, |w| w.dptr()), y.dptr());
         let (mut r, mut c, mut e) = (rows, cols, eps);
         let mut params = [param(&mut px), param(&mut pw), param(&mut py), param(&mut r), param(&mut c), param(&mut e)];
-        // Few rows: a wider block cuts the dependent-load rounds per thread.
-        let block = if rows < 16 { (cols / 4).next_multiple_of(32).clamp(Self::BLOCK, 1024) } else { Self::BLOCK };
+        // A wide block cuts the dependent-load rounds per thread. The same block for any row
+        // count, so a row's result does not depend on how many rows the launch has.
+        let block = (cols / 4).next_multiple_of(32).clamp(Self::BLOCK, 1024);
         let cfg = LaunchConfig { grid: (rows, 1, 1), block: (block, 1, 1), shared_mem_bytes: 0 };
         // SAFETY: params match the kernel signature; sizes checked above; a null weight is handled by the kernel.
         unsafe { self.f.launch(cfg, stream, &mut params) }
@@ -391,6 +392,16 @@ pub struct Gemv {
     /// [`Gemv::launch_q_multi_t`] for 2..=8 tokens (index T - 2).
     multi_t: Vec<Function>,
     multi_mma: Function,
+    items_s: Function,
+    items_q8x: Function,
+    /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
+    rows_t: [Function; 2],
+    /// Small-batch forms of the int8 pipelined GEMM ([`Gemv::launch_mma_i8`]): [Q8_0, NVFP4] x [8, 16] tokens.
+    mma_dec: [[Function; 2]; 2],
+    /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
+    multi_mma_n: [Function; 3],
+    /// Grouped tensor-core expert GEMV ([`Gemv::launch_gmma`]): [Q8_0, NVFP4] x [1, 2, 4, 8] tiles.
+    gmma: [[Function; 4]; 2],
     items: [Function; 2],
     mma: [Function; 2],
     mma2: [Function; 2],
@@ -400,6 +411,13 @@ pub struct Gemv {
     wgmma: Function,
     wgmma2: Function,
     zero: Function,
+}
+
+/// Split K across blocks with atomic adds when a GEMM's grid is small (`ASTRAL_SPLITK=1`).
+/// Off by default: atomic adds make the sums depend on block timing, so a prompt's results
+/// would vary from run to run (and batched decode could not match single-sequence decode).
+pub fn split_k() -> bool {
+    std::env::var_os("ASTRAL_SPLITK").is_some()
 }
 
 /// Tokens per work item of [`Gemv::launch_mma`] (`MMA_TOK` in gemv.cu).
@@ -504,6 +522,14 @@ struct MultiQ8 {
     count: u32,
 }
 
+/// Columns of [`Gemv::launch_gmma`].
+pub enum GmmaCols<'a> {
+    /// One column per slot: matrix `ids[s]`, output row `s`.
+    Ids(&'a dyn Dev<i32>),
+    /// Work items `[e, start, count]` over `xidx` / `yidx` (an [`MmaWork`] on the device).
+    Items { items: &'a dyn Dev<u32>, xidx: &'a dyn Dev<u32>, yidx: &'a dyn Dev<u32>, n_items: u32 },
+}
+
 /// One product of [`Gemv::launch_q_multi`]: `y = m x`.
 pub struct MultiItem<'a> {
     pub m: &'a GemvMatrix,
@@ -574,6 +600,20 @@ impl Gemv {
             multi: f("astral_gemv_q8_0_multi")?,
             multi_t: (2..=8).map(|t| f(&format!("astral_gemv_q8_0_multi_t{t}"))).collect::<Result<_>>()?,
             multi_mma: f("astral_gemv_q8_0_multi_mma")?,
+            items_s: {
+                let k = f("astral_gemv_nvfp4_items_s1")?;
+                // Staged activations: let several blocks share an SM's shared memory.
+                k.set_carveout(100)?;
+                k
+            },
+            items_q8x: f("astral_gemv_q8_0_items_x")?,
+            rows_t: [f("astral_gemv_q8_0_rows_t16")?, f("astral_gemv_q8_0_rows_t32")?],
+            mma_dec: [[f("astral_gemm_q8_0_dec1")?, f("astral_gemm_q8_0_dec2")?], [f("astral_gemm_nvfp4_dec1")?, f("astral_gemm_nvfp4_dec2")?]],
+            multi_mma_n: [f("astral_gemv_q8_0_multi_mma_n2")?, f("astral_gemv_q8_0_multi_mma_n4")?, f("astral_gemv_q8_0_multi_mma_n8")?],
+            gmma: [
+                [f("astral_gmma_q8_0_n1")?, f("astral_gmma_q8_0_n2")?, f("astral_gmma_q8_0_n4")?, f("astral_gmma_q8_0_n8")?],
+                [f("astral_gmma_nvfp4_n1")?, f("astral_gmma_nvfp4_n2")?, f("astral_gmma_nvfp4_n4")?, f("astral_gmma_nvfp4_n8")?],
+            ],
             items: [f("astral_gemm_q8_0_items")?, f("astral_gemm_nvfp4_items")?],
             mma: [f("astral_gemm_q8_0_mma")?, f("astral_gemm_nvfp4_mma")?],
             mma2: [f("astral_gemm_q8_0_mma2")?, f("astral_gemm_nvfp4_mma2")?],
@@ -675,6 +715,97 @@ impl Gemv {
         yidx: &DeviceBuffer<u32>,
         idx_len: u32,
     ) -> Result<()> {
+        self.launch_mma_impl(stream, m, x, x_rows, y, y_rows, items, n_items, xidx, yidx, idx_len, false)
+    }
+
+    /// [`Gemv::launch_mma`] on the int8 activations only (never the f16 copy): the pipelined
+    /// int8 kernel, whose every output sums its K blocks in one fixed order, so a token's result
+    /// does not depend on the other tokens of the launch (batched decode). Needs n and k
+    /// multiples of 64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mma_i8(
+        &self,
+        stream: &Stream,
+        m: &GemvMatrix,
+        x: &QAct,
+        x_rows: u32,
+        y: &mut dyn DevMut<f32>,
+        y_rows: u32,
+        items: &DeviceBuffer<u32>,
+        n_items: u32,
+        xidx: &DeviceBuffer<u32>,
+        yidx: &DeviceBuffer<u32>,
+        idx_len: u32,
+        max_cols: u32,
+    ) -> Result<()> {
+        if !m.n.is_multiple_of(64) || !m.k.is_multiple_of(64) || std::env::var_os("ASTRAL_MMA_V1").is_some() {
+            return Err(invalid(format!("launch_mma_i8: n {} k {} must be multiples of 64", m.n, m.k)));
+        }
+        // Items of at most 16 tokens: the register-only form (same arithmetic per output).
+        let wi = match m.ty {
+            GemvType::Q8_0 => 0,
+            GemvType::Nvfp4 => 1,
+            t => return Err(invalid(format!("launch_mma_i8: {t:?} has no tensor-core kernel"))),
+        };
+        if max_cols <= 16 && m.k.is_multiple_of(128) && std::env::var_os("ASTRAL_NO_MMA_DEC").is_none() {
+            if n_items == 0 || x_rows == 0 || y_rows == 0 || idx_len == 0 || m.k != x.k || x_rows > x.max_slots {
+                return Err(invalid(format!("launch_mma_i8: {n_items} items, {x_rows} rows, k {} (activations k {})", m.k, x.k)));
+            }
+            if items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize || y.dlen() < y_rows as usize * m.n as usize {
+                return Err(invalid("launch_mma_i8: work lists or y too small".into()));
+            }
+            let (rq, ra) = m.ty.row_bytes(m.k);
+            let (mut pq, mut pa, mut px, mut pd, mut py) = (m.qs.device_ptr(), m.aux.device_ptr(), x.q.device_ptr(), x.d.device_ptr(), y.dptr());
+            let (mut n, mut k) = (m.n, m.k);
+            let (mut mq, mut ma) = ((rq * m.n as usize) as u64, (ra * m.n as usize) as u64);
+            let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
+            let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
+            let mut nm = m.n_mats;
+            let mut params = [
+                param(&mut pq),
+                param(&mut pa),
+                param(&mut px),
+                param(&mut pd),
+                param(&mut py),
+                param(&mut n),
+                param(&mut k),
+                param(&mut mq),
+                param(&mut ma),
+                param(&mut pi),
+                param(&mut pxi),
+                param(&mut pyi),
+                param(&mut il),
+                param(&mut xr),
+                param(&mut yr),
+                param(&mut psc),
+                param(&mut nm),
+            ];
+            let cfg = LaunchConfig { grid: (m.n / 64, n_items, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+            let f = &self.mma_dec[wi][(max_cols > 8) as usize];
+            // SAFETY: params match GEMM_DEC_ENTRY in gemv.cu (the GEMM_MMA_ENTRY signature);
+            // planes validated at upload, work lists and y checked above; n % 64 == 0 and
+            // k % 128 == 0; the kernel clamps every index and takes at most 16 tokens per item.
+            return unsafe { f.launch(cfg, stream, &mut params) };
+        }
+        self.launch_mma_impl(stream, m, x, x_rows, y, y_rows, items, n_items, xidx, yidx, idx_len, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_mma_impl(
+        &self,
+        stream: &Stream,
+        m: &GemvMatrix,
+        x: &QAct,
+        x_rows: u32,
+        y: &mut dyn DevMut<f32>,
+        y_rows: u32,
+        items: &DeviceBuffer<u32>,
+        n_items: u32,
+        xidx: &DeviceBuffer<u32>,
+        yidx: &DeviceBuffer<u32>,
+        idx_len: u32,
+        int8_only: bool,
+    ) -> Result<()> {
         let fi = match m.ty {
             GemvType::Q8_0 => 0,
             GemvType::Nvfp4 => 1,
@@ -692,7 +823,7 @@ impl Gemv {
         let (mut mq, mut ma) = ((rq * m.n as usize) as u64, (ra * m.n as usize) as u64);
         let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
         // f16 path (dequantised weights, f16 activations) when the activations carry an f16 copy.
-        if let Some(h) = x.h.as_ref().filter(|_| m.n.is_multiple_of(64) && m.k.is_multiple_of(64) && std::env::var_os("ASTRAL_MMA_INT8").is_none()) {
+        if let Some(h) = x.h.as_ref().filter(|_| !int8_only && m.n.is_multiple_of(64) && m.k.is_multiple_of(64) && std::env::var_os("ASTRAL_MMA_INT8").is_none()) {
             let mut ph = h.device_ptr();
             let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
             let mut nm = m.n_mats;
@@ -700,7 +831,7 @@ impl Gemv {
             // prompts); partial sums are added atomically into a zeroed y.
             let kt = m.k / 64;
             let blocks = (m.n / 64) * n_items;
-            let splits = if blocks >= 256 || std::env::var_os("ASTRAL_NO_SPLITK").is_some() { 1 } else { 256u32.div_ceil(blocks).min(kt).min(8) };
+            let splits = if blocks >= 256 || !split_k() { 1 } else { 256u32.div_ceil(blocks).min(kt).min(8) };
             let mut ktps = kt.div_ceil(splits);
             let splits = kt.div_ceil(ktps);
             if splits > 1 {
@@ -867,7 +998,7 @@ impl Gemv {
         // Split K when the grid is too small to fill the GPU (about 2 blocks per SM resident).
         let kc = m.k / 64;
         let blocks = (m.n / 128) * n_items;
-        let splits = if blocks >= 384 || std::env::var_os("ASTRAL_NO_SPLITK").is_some() { 1 } else { 512u32.div_ceil(blocks).min(kc).min(8) };
+        let splits = if blocks >= 384 || !split_k() { 1 } else { 512u32.div_ceil(blocks).min(kc).min(8) };
         let mut kcps = kc.div_ceil(splits);
         let splits = kc.div_ceil(kcps);
         if splits > 1 {
@@ -966,6 +1097,227 @@ impl Gemv {
         // SAFETY: MultiQ8 mirrors gemv.cu; planes validated at upload, activations hold >= ntok
         // rows of k and each y ntok * n values (checked); k % 128 == 0 for the 4-way K split.
         unsafe { self.multi_mma.launch(cfg, stream, &mut params) }
+    }
+
+    /// [`Gemv::launch_q_multi_mma`] for any number of tokens, 8 at a time. Each token's result
+    /// equals its single-token launch (the tensor-core kernel computes every column alike).
+    pub fn launch_q_multi_mma_rows(&self, stream: &Stream, items: &mut [MultiItem], ntok: u32) -> Result<()> {
+        let mut t0 = 0;
+        while t0 < ntok {
+            let c = (ntok - t0).min(64);
+            let f = match c {
+                1..=8 => &self.multi_mma,
+                9..=16 => &self.multi_mma_n[0],
+                17..=32 => &self.multi_mma_n[1],
+                _ => &self.multi_mma_n[2],
+            };
+            self.multi_q8_chunk(stream, items, t0, c, f, true)?;
+            t0 += c;
+        }
+        Ok(())
+    }
+
+    /// Grouped expert products on int8 tensor cores (Q8_0 or NVFP4): `y[s] = W_ids[s] x`
+    /// (`cols = Ids`, one column per slot, the activation row shared when `x.slots == 1`) or
+    /// the items of an [`MmaWork`] on the device (`cols = Items`, at most `max_cols` columns
+    /// per item). A column's result does not depend on the other columns of the launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gmma(&self, stream: &Stream, m: &GemvMatrix, x: &QAct, x_rows: u32, y: &mut dyn DevMut<f32>, y_rows: u32, cols: GmmaCols, max_cols: u32) -> Result<()> {
+        let wi = match m.ty {
+            GemvType::Q8_0 => 0,
+            GemvType::Nvfp4 => 1,
+            t => return Err(invalid(format!("launch_gmma: {t:?} has no tensor-core kernel"))),
+        };
+        let kstep = if wi == 0 { 128 } else { 64 };
+        if m.mx_scale.is_some() || m.k != x.k || !m.k.is_multiple_of(kstep) || x_rows == 0 || y_rows == 0 || y.dlen() < y_rows as usize * m.n as usize {
+            return Err(invalid(format!("launch_gmma: {:?} n {} k {} for activations k {} ({x_rows} rows, y {})", m.ty, m.n, m.k, x.k, y.dlen())));
+        }
+        let (mut pid, mut shared, mut pi, mut pxi, mut pyi, slots) = match cols {
+            GmmaCols::Ids(ids) => {
+                let n = ids.dlen() as u32;
+                if n == 0 || (x.slots != 1 && x.slots < n) || y_rows < n {
+                    return Err(invalid(format!("launch_gmma: {n} ids for {} activation rows", x.slots)));
+                }
+                (ids.dptr(), (x.slots == 1) as u32, 0u64, 0u64, 0u64, n)
+            }
+            GmmaCols::Items { items, xidx, yidx, n_items } => {
+                if n_items == 0 || items.dlen() < 3 * n_items as usize || xidx.dlen() == 0 || yidx.dlen() == 0 || x.slots < x_rows {
+                    return Err(invalid("launch_gmma: empty or short work lists".into()));
+                }
+                (0u64, 0u32, items.dptr(), xidx.dptr(), yidx.dptr(), n_items)
+            }
+        };
+        let ti = match max_cols {
+            0..=8 => 0,
+            9..=16 => 1,
+            17..=32 => 2,
+            _ => 3,
+        };
+        let (rq, ra) = m.ty.row_bytes(m.k);
+        let (mut pq, mut pa, mut px, mut pd, mut py) = (m.qs.device_ptr(), m.aux.device_ptr(), x.q.device_ptr(), x.d.device_ptr(), y.dptr());
+        let (mut n, mut k) = (m.n, m.k);
+        let (mut mq, mut ma) = ((rq * m.n as usize) as u64, (ra * m.n as usize) as u64);
+        let (mut xr, mut yr) = (x_rows, y_rows);
+        let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
+        let mut nm = m.n_mats;
+        let mut params = [
+            param(&mut pq),
+            param(&mut pa),
+            param(&mut px),
+            param(&mut pd),
+            param(&mut py),
+            param(&mut n),
+            param(&mut k),
+            param(&mut mq),
+            param(&mut ma),
+            param(&mut pid),
+            param(&mut shared),
+            param(&mut pi),
+            param(&mut pxi),
+            param(&mut pyi),
+            param(&mut xr),
+            param(&mut yr),
+            param(&mut psc),
+            param(&mut nm),
+        ];
+        let cfg = LaunchConfig { grid: (m.n.div_ceil(16), slots, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        // SAFETY: params match GMMA_ENTRY in gemv.cu; planes validated at upload, y covers
+        // y_rows rows of n, the ids / work lists cover the grid, and the kernel clamps the
+        // matrix, activation and output indices; k is a multiple of the 4-way K split.
+        unsafe { self.gmma[wi][ti].launch(cfg, stream, &mut params) }
+    }
+
+    /// `y[t] = m x[t]` for `ntok` int8 activation rows of a Q8_0 matrix, each row computed
+    /// exactly as [`Gemv::launch_q`] computes one (8 rows share each weight read).
+    pub fn launch_q_rows(&self, stream: &Stream, m: &GemvMatrix, x: &QAct, y: &mut dyn DevMut<f32>, ntok: u32) -> Result<()> {
+        if m.ty != GemvType::Q8_0 || m.n_mats != 1 || m.mat_scale.is_some() || m.k != x.k || x.slots < ntok || ntok == 0 {
+            return Err(invalid(format!("launch_q_rows: {:?} matrix k {} for {ntok} rows of k {} ({} held)", m.ty, m.k, x.k, x.slots)));
+        }
+        let mut items = [MultiItem { m, x, y }];
+        let mut t0 = 0;
+        while t0 < ntok {
+            let c = (ntok - t0).min(32);
+            if c > 8 {
+                self.q8_rows_chunk(stream, &mut items[0], t0, c)?;
+            } else {
+                let f = if c == 1 { &self.multi } else { &self.multi_t[c as usize - 2] };
+                self.multi_q8_chunk(stream, &mut items, t0, c, f, false)?;
+            }
+            t0 += c;
+        }
+        Ok(())
+    }
+
+    /// Tokens `t0..t0 + c` (9..=32) of one Q8_0 product on the rows kernels.
+    fn q8_rows_chunk(&self, stream: &Stream, it: &mut MultiItem, t0: u32, c: u32) -> Result<()> {
+        let k = it.m.k;
+        if !(9..=32).contains(&c) || it.x.slots < t0 + c || it.y.dlen() < ((t0 + c) * it.m.n) as usize {
+            return Err(invalid(format!("q8_rows: tokens {t0}..+{c} do not fit")));
+        }
+        let mut d = MultiQ8 { qs: [0; 8], aux: [0; 8], xq: [0; 8], xd: [0; 8], y: [0; 8], n: [0; 8], start: [0; 9], count: 1 };
+        d.qs[0] = it.m.qs.device_ptr();
+        d.aux[0] = it.m.aux.device_ptr();
+        d.xq[0] = it.x.q.device_ptr() + (t0 * k) as u64;
+        d.xd[0] = it.x.d.device_ptr() + 4 * (t0 * (k / 32)) as u64;
+        d.y[0] = it.y.dptr() + 4 * (t0 * it.m.n) as u64;
+        d.n[0] = it.m.n;
+        // 8 warps x 4 rows per block.
+        let blocks = it.m.n.div_ceil(4 * Self::ROWS_PER_BLOCK);
+        d.start[1] = blocks;
+        let (mut kk, mut cc) = (k, c);
+        let mut params = [param(&mut d), param(&mut kk), param(&mut cc)];
+        let cfg = LaunchConfig { grid: (blocks, 1, 1), block: (32 * Self::ROWS_PER_BLOCK, 1, 1), shared_mem_bytes: 0 };
+        // SAFETY: MultiQ8 mirrors gemv.cu; the activation planes hold >= t0 + c rows of k and y
+        // (t0 + c) * n values (checked), so the offset pointers stay inside them.
+        unsafe { self.rows_t[(c > 16) as usize].launch(cfg, stream, &mut params) }
+    }
+
+    /// One launch of a MultiQ8 kernel over tokens `t0..t0 + c` of every item.
+    fn multi_q8_chunk(&self, stream: &Stream, items: &mut [MultiItem], t0: u32, c: u32, f: &Function, mma: bool) -> Result<()> {
+        let k = items.first().map_or(0, |it| it.m.k);
+        let ok = (1..=if mma { 64 } else { 8 }).contains(&c)
+            && (1..=8).contains(&items.len())
+            && (!mma || k.is_multiple_of(128))
+            && items.iter().all(|it| it.m.ty == GemvType::Q8_0 && it.m.n_mats == 1 && it.m.mat_scale.is_none() && it.m.k == k && it.x.k == k && it.x.slots >= t0 + c);
+        if !ok {
+            return Err(invalid(format!("multi_q8: {} products for tokens {t0}..+{c} do not qualify", items.len())));
+        }
+        let mut d = MultiQ8 { qs: [0; 8], aux: [0; 8], xq: [0; 8], xd: [0; 8], y: [0; 8], n: [0; 8], start: [0; 9], count: items.len() as u32 };
+        let per_block = if mma { 16 } else { Self::ROWS_PER_BLOCK };
+        let mut blocks = 0u32;
+        for (i, it) in items.iter().enumerate() {
+            if it.y.dlen() < ((t0 + c) * it.m.n) as usize {
+                return Err(invalid(format!("multi_q8: y {} has {} values, need {}", i, it.y.dlen(), (t0 + c) * it.m.n)));
+            }
+            d.qs[i] = it.m.qs.device_ptr();
+            d.aux[i] = it.m.aux.device_ptr();
+            d.xq[i] = it.x.q.device_ptr() + (t0 * k) as u64;
+            d.xd[i] = it.x.d.device_ptr() + 4 * (t0 * (k / 32)) as u64;
+            d.y[i] = it.y.dptr() + 4 * (t0 * it.m.n) as u64;
+            d.n[i] = it.m.n;
+            d.start[i] = blocks;
+            blocks += it.m.n.div_ceil(per_block);
+        }
+        d.start[items.len()] = blocks;
+        let (mut kk, mut t) = (k, c);
+        let cfg = LaunchConfig { grid: (blocks, 1, 1), block: (if mma { 128 } else { 32 * Self::ROWS_PER_BLOCK }, 1, 1), shared_mem_bytes: 0 };
+        // SAFETY: MultiQ8 mirrors gemv.cu; planes validated at upload, the activation planes
+        // hold >= t0 + c rows of k and each y (t0 + c) * n values (checked), so the offset
+        // pointers stay inside them; the mma kernel needs k % 128 == 0 (checked).
+        if mma {
+            let mut params = [param(&mut d), param(&mut kk), param(&mut t)];
+            unsafe { f.launch(cfg, stream, &mut params) }
+        } else {
+            let mut params = [param(&mut d), param(&mut kk)];
+            unsafe { f.launch(cfg, stream, &mut params) }
+        }
+    }
+
+    /// Grouped NVFP4 products for batched decode: item `i` of `items` (device [`QItem`] words,
+    /// `n_items` of them, unused ones with n = 0) multiplies matrix `e` with activation rows
+    /// `xi` into output rows `yi`. Each (row, activation) is computed exactly as
+    /// [`Gemv::launch_q`] computes it for a single token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_items_exact(&self, stream: &Stream, m: &GemvMatrix, x: &QAct, x_rows: u32, y: &mut dyn DevMut<f32>, y_rows: u32, items: &DeviceBuffer<u32>, n_items: u32) -> Result<()> {
+        let q8 = m.ty == GemvType::Q8_0;
+        if !(q8 || m.ty == GemvType::Nvfp4) || m.mx_scale.is_some() || m.k != x.k || x_rows == 0 || x_rows > x.max_slots || n_items == 0 || !m.k.is_multiple_of(32) {
+            return Err(invalid(format!("launch_items_exact: {:?} matrix k {} for activations k {} x {x_rows}", m.ty, m.k, x.k)));
+        }
+        if items.len() < n_items as usize * QItem::WORDS || y.dlen() < y_rows as usize * m.n as usize {
+            return Err(invalid("launch_items_exact: work items or y too small".into()));
+        }
+        let units = m.k / 32;
+        let smem = if q8 { 0 } else { QITEM_ROWS as u32 * 16 * (2 * units + units.div_ceil(4)) };
+        if smem > 48 * 1024 {
+            return Err(invalid(format!("launch_items_exact: k {} needs {smem} bytes of shared memory", m.k)));
+        }
+        let (rq, ra) = m.ty.row_bytes(m.k);
+        let (mut pq, mut pa, mut px, mut pd, mut py) = (m.qs.device_ptr(), m.aux.device_ptr(), x.q.device_ptr(), x.d.device_ptr(), y.dptr());
+        let (mut n, mut k) = (m.n, m.k);
+        let (mut mq, mut ma) = ((rq * m.n as usize) as u64, (ra * m.n as usize) as u64);
+        let (mut pi, mut xr, mut yr) = (items.device_ptr(), x_rows, y_rows);
+        let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
+        let mut nm = m.n_mats;
+        let mut params = [
+            param(&mut pq),
+            param(&mut pa),
+            param(&mut px),
+            param(&mut pd),
+            param(&mut py),
+            param(&mut n),
+            param(&mut k),
+            param(&mut mq),
+            param(&mut ma),
+            param(&mut pi),
+            param(&mut xr),
+            param(&mut yr),
+            param(&mut psc),
+            param(&mut nm),
+        ];
+        let cfg = LaunchConfig { grid: (m.n.div_ceil(64), n_items, 1), block: (32 * Self::ROWS_PER_BLOCK, 1, 1), shared_mem_bytes: smem };
+        // SAFETY: params match astral_gemv_nvfp4_items_s1 / astral_gemv_q8_0_items_x; planes validated at upload, the item
+        // words cover n_items, y covers y_rows, and the kernel clamps e, xi and yi.
+        unsafe { if q8 { &self.items_q8x } else { &self.items_s }.launch(cfg, stream, &mut params) }
     }
 
     /// Whether the small-batch products run on tensor cores ([`Gemv::launch_q_multi_mma`]).
@@ -1171,8 +1523,9 @@ impl Gemv {
             param(&mut psc),
             param(&mut nm),
         ];
-        // Short, wide F32 / BF16 matrices: one block per row instead of one warp.
-        let rowblock = matches!(m.ty, GemvType::F32 | GemvType::Bf16) && m.n * slots < 2048 && m.k >= 1024;
+        // Short, wide F32 / BF16 matrices: one block per row instead of one warp. Chosen by the
+        // matrix shape alone, so a row's result does not depend on how many slots share the launch.
+        let rowblock = matches!(m.ty, GemvType::F32 | GemvType::Bf16) && m.n < 2048 && m.k >= 1024;
         let (f, cfg) = if rowblock {
             (&self.rb[m.ty.idx()], LaunchConfig { grid: (m.n, slots, 1), block: (256, 1, 1), shared_mem_bytes: 0 })
         } else {

@@ -75,6 +75,13 @@ pub fn is_available() -> bool {
 }
 
 /// CUDA driver API version as reported by `cuDriverGetVersion` (e.g. 13000).
+/// Starts (`true`) or stops collection for an attached profiler (Nsight); a no-op otherwise.
+pub fn profiler(on: bool) -> Result<()> {
+    let d = drv()?;
+    // SAFETY: no arguments; valid at any time after cuInit.
+    check(if on { "cuProfilerStart" } else { "cuProfilerStop" }, unsafe { if on { (d.fns.cuProfilerStart)() } else { (d.fns.cuProfilerStop)() } })
+}
+
 pub fn driver_version() -> Result<i32> {
     let d = drv()?;
     let mut v = 0;
@@ -362,6 +369,18 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         check("cuMemsetD8Async", unsafe { (d.fns.cuMemsetD8Async)(self.ptr, 0, self.bytes(), stream.raw) })
     }
 
+    /// Asynchronously zero-fills `len` elements from `offset` on `stream`.
+    pub fn zero_range_async(&mut self, offset: usize, len: usize, stream: &Stream) -> Result<()> {
+        let p = self.range(offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        self.ctx.bind()?;
+        let d = drv()?;
+        // SAFETY: the range was bounds-checked against the live allocation; ordering is on `stream`.
+        check("cuMemsetD8Async", unsafe { (d.fns.cuMemsetD8Async)(p, 0, len * size_of::<T>(), stream.raw) })
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -449,6 +468,23 @@ impl<T: DeviceCopy> Dev<T> for DeviceViewMut<'_, T> {
 impl<T: DeviceCopy> DevMut<T> for DeviceViewMut<'_, T> {}
 
 impl<'a, T: DeviceCopy> DeviceViewMut<'a, T> {
+    fn range(&self, offset: usize, len: usize) -> Result<DevicePtr> {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.len => Ok(self.ptr + (offset * size_of::<T>()) as u64),
+            _ => Err(AstralError::Invalid(format!("view [{offset}, +{len}) outside view of {}", self.len))),
+        }
+    }
+
+    /// A shared sub-view `[offset, offset + len)` of this view.
+    pub fn view(&self, offset: usize, len: usize) -> Result<DeviceView<'_, T>> {
+        Ok(DeviceView { ptr: self.range(offset, len)?, len, _b: PhantomData })
+    }
+
+    /// An exclusive sub-view `[offset, offset + len)` of this view.
+    pub fn view_mut(&mut self, offset: usize, len: usize) -> Result<DeviceViewMut<'_, T>> {
+        Ok(DeviceViewMut { ptr: self.range(offset, len)?, len, _b: PhantomData })
+    }
+
     /// Splits this view into two disjoint views: `[0, mid)` and `[mid, len)`.
     pub fn split_at_mut_views(self, mid: usize) -> Result<(DeviceViewMut<'a, T>, DeviceViewMut<'a, T>)> {
         if mid > self.len {

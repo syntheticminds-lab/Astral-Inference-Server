@@ -29,6 +29,16 @@ typedef unsigned short u16;
 #define MAX_DEPTH 8      // attention-residual states mixed at once (Inkling uses at most 4 blocks + cur);
                          // kept small so the per-state partial sums of astral_ink_mix stay in registers
 
+// Rows of a pass. Without `seq_p`, row t is token t of one sequence at position pos_p[0] + t.
+// With it (batched decode), row t belongs to sequence seq_p[t] (clamped to n_seqs - 1) at
+// position pos_p[t]; each sequence owns `capacity` cache positions and one conv state.
+__device__ __forceinline__ int row_pos(const int* pos_p, const int* seq_p, unsigned t) {
+    return seq_p ? pos_p[t] : pos_p[0] + (int)t;
+}
+__device__ __forceinline__ u64 row_seq(const int* seq_p, unsigned n_seqs, unsigned t) {
+    return seq_p ? (u64)min((unsigned)max(seq_p[t], 0), n_seqs - 1u) : 0ull;
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
@@ -619,16 +629,24 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep(
     const float* __restrict__ kdyn, const float* __restrict__ vdyn, unsigned dyn_heads,
     __half* __restrict__ kc, __half* __restrict__ vc, const int* __restrict__ pos_p,
     unsigned heads, unsigned kv_heads, unsigned hd, unsigned n_rel, float thr_qk, float thr_rel, float eps,
-    unsigned global, float floor_len, float alpha, unsigned capacity, unsigned do_conv) { PDL_WAIT();
-    // blockIdx.y = token t at position pos_p[0] + t; buffers are token-major. With do_conv = 0
-    // the K/V convs were already applied (astral_ink_conv_seq, prefill) and are skipped.
+    unsigned global, float floor_len, float alpha, unsigned capacity, unsigned do_conv,
+    const int* __restrict__ seq_p, unsigned n_seqs, unsigned conv_stride) { PDL_WAIT();
+    // blockIdx.y = row t (see row_pos); buffers are token-major. With do_conv = 0 the K/V convs
+    // were already applied (astral_ink_conv_seq, prefill) and are skipped.
     const unsigned job = blockIdx.x, t = threadIdx.x, tok = blockIdx.y;
     const unsigned width = kv_heads * hd;
     q += (u64)tok * heads * hd;
     r += (u64)tok * heads * n_rel;
     k += (u64)tok * width;
     v += (u64)tok * width;
-    const int posi = pos_p[0] + (int)tok;
+    const int posi = row_pos(pos_p, seq_p, tok);
+    {
+        const u64 sq = row_seq(seq_p, n_seqs, tok);
+        conv_kv += sq * conv_stride;
+        kc += sq * capacity * width;
+        vc += sq * capacity * width;
+        if (seq_p && kdyn) { kdyn += (u64)tok * dyn_heads * 4u; vdyn += (u64)tok * dyn_heads * 4u; }
+    }
     const float tau = 1.0f + alpha * logf(fmaxf(((float)posi + 1.0f) / floor_len, 1.0f));
     if (job < 2u * heads) {
         const bool is_r = job >= heads;
@@ -829,6 +847,65 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine3(Ctrl3
     }
 }
 
+// ctrl_down3 and ctrl_combine3 for CT tokens per block (tokens CT * blockIdx.y ..): each
+// weight load serves CT tokens; every token's arithmetic is that of the one-token kernels.
+#define CT 8u
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down3_t(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                          unsigned ntok) { PDL_WAIT();
+    const unsigned j = blockIdx.z, t0 = blockIdx.y * CT;
+    const unsigned nt = min(CT, ntok - t0);
+    const float* w = c.wd[j] + (u64)blockIdx.x * 2u * dim;
+    float sx[CT], sm[CT], dx[CT], dm[CT];
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) sx[t] = sm[t] = dx[t] = dm[t] = 0.0f;
+    for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float wa = w[i], wb = w[dim + i];
+#pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            if (t < nt) {
+                const float a = c.x[j][(u64)(t0 + t) * x_stride + i], b = c.msg[j][(u64)(t0 + t) * msg_stride + i];
+                sx[t] = fmaf(a, a, sx[t]);
+                sm[t] = fmaf(b, b, sm[t]);
+                dx[t] = fmaf(wa, a, dx[t]);
+                dm[t] = fmaf(wb, b, dm[t]);
+            }
+        }
+    }
+    for (unsigned t = 0; t < nt; ++t) {
+        const float vsx = block_sum(sx[t]);
+        const float vsm = block_sum(sm[t]);
+        const float vdx = block_sum(dx[t]);
+        const float vdm = block_sum(dm[t]);
+        if (threadIdx.x == 0) c.cd[j][(u64)(t0 + t) * gridDim.x + blockIdx.x] = vdx * rsqrtf(vsx / (float)dim + 1e-6f) + vdm * rsqrtf(vsm / (float)dim + 1e-6f);
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine3_t(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                             unsigned rank, unsigned ntok) { PDL_WAIT();
+    const unsigned j = blockIdx.z, t0 = blockIdx.y * CT;
+    const unsigned nt = min(CT, ntok - t0);
+    const unsigned n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31u;
+    if (n >= dim) return;
+    const float* wg = c.wgf[j] + (u64)n * rank;
+    const float* wf = c.wgf[j] + (u64)(dim + n) * rank;
+    // rank <= 64: each lane holds its (at most 2) weights of both rows.
+    float g0 = 0.0f, g1 = 0.0f, f0 = 0.0f, f1 = 0.0f;
+    if (lane < rank) { g0 = wg[lane]; f0 = wf[lane]; }
+    if (lane + 32u < rank) { g1 = wg[lane + 32u]; f1 = wf[lane + 32u]; }
+    for (unsigned t = 0; t < nt; ++t) {
+        const unsigned tok = t0 + t;
+        const float* cd = c.cd[j] + (u64)tok * rank;
+        float g = 0.0f, f = 0.0f;
+        if (lane < rank) { const float v = cd[lane]; g = fmaf(g0, v, g); f = fmaf(f0, v, f); }
+        if (lane + 32u < rank) { const float v = cd[lane + 32u]; g = fmaf(g1, v, g); f = fmaf(f1, v, f); }
+        g = warp_sum(g);
+        f = warp_sum(f);
+        if (lane == 0) {
+            const float xv = c.x[j][(u64)tok * x_stride + n];
+            c.out[j][(u64)tok * dim + n] = (xv - tanhf(f) * xv) + tanhf(g) * c.msg[j][(u64)tok * msg_stride + n];
+        }
+    }
+}
+
 // Up to three rms_q8 jobs (blockIdx.y = job): y_j = rms_norm(x_j) * w_j, quantised. Rows of x_j at
 // t * x_stride; grid (ntok, jobs).
 struct Rms3 {
@@ -885,46 +962,55 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_situ_q8(const float
     q8_store(a * (lb > 0.0f ? lb * tanhf(u / lb) : u), xq, xd, b, lane, xh);
 }
 
+// One token of astral_ink_conv_residual for channel c, with every rounding explicit (no
+// compiler contraction) so the single-sequence and batched forms agree bit for bit.
+__device__ __forceinline__ void conv_res_tok(const float* __restrict__ x, const float* __restrict__ moe_w, unsigned slots, unsigned t,
+                                             unsigned c, unsigned channels, float& in0, float& in1, float& in2, float w0, float w1,
+                                             float w2, float w3, float* __restrict__ cur, float* __restrict__ bank_row) {
+    float xin;
+    if (moe_w) {
+        xin = 0.0f;
+        for (unsigned s = 0; s < slots; ++s) xin = fmaf(moe_w[(u64)t * slots + s], x[((u64)t * slots + s) * channels + c], xin);
+    } else {
+        xin = x[(u64)t * channels + c];
+    }
+    float out = __fmul_rn(in0, w0);
+    out = fmaf(in1, w1, out);
+    out = fmaf(in2, w2, out);
+    out = fmaf(xin, w3, out);
+    in0 = in1;
+    in1 = in2;
+    in2 = xin;
+    const float y = __fmul_rn(__fadd_rn(xin, out), rsqrtf(5.0f));
+    const u64 o = (u64)t * channels + c;
+    if (bank_row) {
+        bank_row[o] = cur[o];
+        cur[o] = y;
+    } else {
+        cur[o] = __fadd_rn(cur[o], y);
+    }
+}
+
 // Short conv (no dynamic taps) of `x` into the residual stream:
 //   y = conv(x)   (x = sum_s w[s] y_s[c] when `moe_w` is set: the MoE combine first)
 //   bank_row ? (bank_row = cur, cur = y) : (cur += y)
 extern "C" __global__ void astral_ink_conv_residual(const float* __restrict__ x, const float* __restrict__ moe_w, unsigned slots,
                                                     unsigned ntok, float* __restrict__ state, const float* __restrict__ weight,
-                                                    float* __restrict__ cur, float* __restrict__ bank_row, unsigned channels) { PDL_WAIT();
+                                                    float* __restrict__ cur, float* __restrict__ bank_row, unsigned channels,
+                                                    const int* __restrict__ seq_p, unsigned n_seqs, unsigned conv_stride) { PDL_WAIT();
     // Over `ntok` consecutive tokens (token-major x / cur / bank_row), one thread per channel.
     // With moe_w: x is [t][slot][c] and the input is sum_s moe_w[t * slots + s] x[t][s][c].
-    const float norm = rsqrtf(5.0f);
+    // With seq_p (batched decode): row t is one token of its own sequence, with its own state.
+    const unsigned t0 = seq_p ? blockIdx.y : 0u, t1 = seq_p ? blockIdx.y + 1u : ntok;
+    float* st = seq_p ? state + row_seq(seq_p, n_seqs, blockIdx.y) * conv_stride : state;
     for (unsigned c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
-        float in0 = state[c * 3 + 0], in1 = state[c * 3 + 1], in2 = state[c * 3 + 2];
+        float in0 = st[c * 3 + 0], in1 = st[c * 3 + 1], in2 = st[c * 3 + 2];
         const float* w = weight + (u64)c * 4;
         const float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
-        for (unsigned t = 0; t < ntok; ++t) {
-            float xin;
-            if (moe_w) {
-                xin = 0.0f;
-                for (unsigned s = 0; s < slots; ++s) xin += moe_w[(u64)t * slots + s] * x[((u64)t * slots + s) * channels + c];
-            } else {
-                xin = x[(u64)t * channels + c];
-            }
-            float out = in0 * w0;
-            out += in1 * w1;
-            out += in2 * w2;
-            out += xin * w3;
-            in0 = in1;
-            in1 = in2;
-            in2 = xin;
-            const float y = (xin + out) * norm;
-            const u64 o = (u64)t * channels + c;
-            if (bank_row) {
-                bank_row[o] = cur[o];
-                cur[o] = y;
-            } else {
-                cur[o] = cur[o] + y;
-            }
-        }
-        state[c * 3 + 0] = in0;
-        state[c * 3 + 1] = in1;
-        state[c * 3 + 2] = in2;
+        for (unsigned t = t0; t < t1; ++t) conv_res_tok(x, moe_w, slots, t, c, channels, in0, in1, in2, w0, w1, w2, w3, cur, bank_row);
+        st[c * 3 + 0] = in0;
+        st[c * 3 + 1] = in1;
+        st[c * 3 + 2] = in2;
     }
 }
 
@@ -940,16 +1026,22 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split(
     const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
     const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
     float* __restrict__ part, const int* __restrict__ pos_p, unsigned heads, unsigned kv_heads, unsigned n_rel,
-    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits) { PDL_WAIT();
-    // blockIdx.z = query token at position pos_p[0] + z (causal: it sees positions <= its own).
+    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits,
+    const int* __restrict__ seq_p, unsigned n_seqs) { PDL_WAIT();
+    // blockIdx.z = query row z (see row_pos; causal: it sees positions <= its own).
     constexpr unsigned HD = 128;
     const unsigned h = blockIdx.x, sp = blockIdx.y, z = blockIdx.z;
     q += (u64)z * heads * HD;
     r += (u64)z * heads * n_rel;
     sink += (u64)z * heads;
     part += (u64)z * heads * max_splits * (HD + 2);
+    {
+        const u64 so = row_seq(seq_p, n_seqs, z) * capacity * kv_heads * HD;
+        kc += so;
+        vc += so;
+    }
     const unsigned kvh = h / (heads / kv_heads);
-    const unsigned pos = min((unsigned)pos_p[0] + z, min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
     const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
     // Split sp takes chunks sp, sp + gridDim.y, ... (a fixed split count serves any context).
     if (lo + sp * ATT_CHUNK > pos) return;
@@ -1029,20 +1121,28 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split1(
     const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
     const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
     float* __restrict__ part, const int* __restrict__ pos_p, unsigned heads, unsigned kv_heads, unsigned n_rel,
-    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits) { PDL_WAIT();
-    // blockIdx.z = query token at position pos_p[0] + z (causal: it sees positions <= its own).
+    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits,
+    const int* __restrict__ seq_p, unsigned n_seqs) { PDL_WAIT();
+    // blockIdx.z = query row z (see row_pos; causal: it sees positions <= its own).
     constexpr unsigned HD = 128;
     const unsigned h = blockIdx.x, sp = blockIdx.y, z = blockIdx.z;
     q += (u64)z * heads * HD;
     r += (u64)z * heads * n_rel;
     sink += (u64)z * heads;
     part += (u64)z * heads * max_splits * (HD + 2);
+    {
+        const u64 so = row_seq(seq_p, n_seqs, z) * capacity * kv_heads * HD;
+        kc += so;
+        vc += so;
+    }
     const unsigned kvh = h / (heads / kv_heads);
-    const unsigned pos = min((unsigned)pos_p[0] + z, min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
     const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
-    // One 64-position chunk per split: the caller launches enough splits for the whole range
-    // (decode at full capacity, exact-size prefill). Faster per call than the looping form.
-    const unsigned start = lo + sp * ATT_CHUNK;
+    // One 64-position chunk per split, max_splits of them for the whole range (decode at full
+    // capacity, exact-size prefill); a block handles splits sp, sp + gridDim.y, ... (each
+    // written as its own partial, so the grid size does not change the result).
+    for (unsigned spl = sp; spl < max_splits; spl += gridDim.y) {
+    const unsigned start = lo + spl * ATT_CHUNK;
     if (start > pos) return;
     const unsigned end = min(pos + 1, start + ATT_CHUNK);
     const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
@@ -1103,7 +1203,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split1(
     wacc[warp][lane * 4 + 2] = a2; wacc[warp][lane * 4 + 3] = a3;
     __syncthreads();
     const float M = fmaxf(fmaxf(wm[0], wm[1]), fmaxf(wm[2], wm[3]));
-    float* out = part + ((u64)h * max_splits + sp) * (HD + 2);
+    float* out = part + ((u64)h * max_splits + spl) * (HD + 2);
     const unsigned d = threadIdx.x;   // 128 threads = HD
     float acc = 0.0f, L = 0.0f;
 #pragma unroll
@@ -1114,15 +1214,18 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split1(
     }
     out[2 + d] = acc;
     if (d == 0) { out[0] = M; out[1] = L; }
+    __syncthreads();   // the shared partials are rewritten by the next split
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_merge(const float* __restrict__ part, float* __restrict__ out,
                                                                         const int* __restrict__ pos_p, unsigned window,
-                                                                        unsigned capacity, unsigned max_splits) { PDL_WAIT();
-    // blockIdx.x = head, blockIdx.y = query token.
+                                                                        unsigned capacity, unsigned max_splits,
+                                                                        const int* __restrict__ seq_p) { PDL_WAIT();
+    // blockIdx.x = head, blockIdx.y = query row.
     constexpr unsigned HD = 128;
     const unsigned h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, heads = gridDim.x;
-    const unsigned pos = min((unsigned)pos_p[0] + z, min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
     const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
     const unsigned n_splits = min((pos + 1 - lo + ATT_CHUNK - 1) / ATT_CHUNK, max_splits);
     const float* p = part + ((u64)z * heads + h) * max_splits * (HD + 2);
@@ -1144,10 +1247,11 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_merge_q8(const
                                                                            const int* __restrict__ pos_p, unsigned window,
                                                                            unsigned capacity, unsigned max_splits,
                                                                            const float* __restrict__ g, signed char* __restrict__ xq,
-                                                                           float* __restrict__ xd, __half* __restrict__ xh) { PDL_WAIT();
+                                                                           float* __restrict__ xd, __half* __restrict__ xh,
+                                                                           const int* __restrict__ seq_p) { PDL_WAIT();
     constexpr unsigned HD = 128;
     const unsigned h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, heads = gridDim.x;
-    const unsigned pos = min((unsigned)pos_p[0] + z, min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
     const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
     const unsigned n_splits = min((pos + 1 - lo + ATT_CHUNK - 1) / ATT_CHUNK, max_splits);
     const float* p = part + ((u64)z * heads + h) * max_splits * (HD + 2);
@@ -1341,8 +1445,9 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine_t(cons
 // Small f32 GEMM for the prefill loop controller: C[m][n] (+)= sum_k A(m, k) * W[n * ldw + k].
 // A(m, k) = k < k_split ? a0[m * lda + k] * s(m, 0) : a1[m * lda1 + k - k_split] * s(m, 1), with
 // s from `row_scale` ([m][2], or 1) -- so concat(rms(x), rms(msg)) is never materialised.
-// 32x32 tiles, BK 32, 256 threads (2x2 outputs each); grid z splits K (`atomic` adds into C,
-// which must start at zero).
+// 32x32 tiles, BK 32, 256 threads (2x2 outputs each); grid z splits K: atomic = 1 adds into C
+// (which must start at zero), atomic = 2 writes split z's partial C to c + z * M * ldc (summed
+// in a fixed order by astral_ink_sum_splits, so the result does not depend on timing).
 extern "C" __global__ void __launch_bounds__(256) astral_ink_sgemm_tn(const float* __restrict__ a0, const float* __restrict__ a1,
                                                                       unsigned lda, unsigned lda1, unsigned k_split, const float* __restrict__ row_scale,
                                                                       const float* __restrict__ w, unsigned ldw, float* __restrict__ c,
@@ -1384,10 +1489,20 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_sgemm_tn(const floa
         for (unsigned j = 0; j < 2; ++j) {
             const unsigned m = m0 + ty * 2u + i, n = n0 + tx * 2u + j;
             if (m < M && n < N) {
-                if (atomic) atomicAdd(&c[(u64)m * ldc + n], acc[i][j]);
+                if (atomic == 1u) atomicAdd(&c[(u64)m * ldc + n], acc[i][j]);
+                else if (atomic == 2u) c[((u64)blockIdx.z * M + m) * ldc + n] = acc[i][j];   // per-split partials
                 else c[(u64)m * ldc + n] = acc[i][j];
             }
         }
+    }
+}
+
+// out[i] = ((p[0][i] + p[1][i]) + p[2][i]) + ... over `splits` partials of n values each.
+extern "C" __global__ void astral_ink_sum_splits(const float* __restrict__ p, float* __restrict__ out, unsigned n, unsigned splits) { PDL_WAIT();
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = p[i];
+        for (unsigned z = 1; z < splits; ++z) v += p[(u64)z * n + i];
+        out[i] = v;
     }
 }
 

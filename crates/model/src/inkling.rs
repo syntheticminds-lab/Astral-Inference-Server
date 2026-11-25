@@ -10,7 +10,7 @@ use crate::dspark::{hist_offsets, DraftWeights, Spec, SpecStats};
 use astral_core::{AstralError, Result};
 use astral_gpu::{Context, Dev, DevMut, DeviceBuffer, GraphExec, Stream};
 use astral_kernels::dspark::{DevIndex, DsparkOps};
-use astral_kernels::inkling::{AttnPrep, AttnShape, InklingOps};
+use astral_kernels::inkling::{AttnPrep, AttnShape, InklingOps, SeqRows};
 use astral_kernels::ops::{Gemv, GemvMatrix, GemvType, MmaWork, MultiItem, QAct, QItem, RmsNormF32, QITEM_ROWS};
 use astral_kernels::KernelRegistry;
 use astral_loader::{Gguf, TensorInfo};
@@ -118,6 +118,11 @@ impl Config {
         self.kv_heads * self.head_dim
     }
 
+    /// Floats of short-conv state per cache slot and sequence (last 3 inputs per channel).
+    fn conv_len(&self) -> usize {
+        3 * self.conv_channels()
+    }
+
     /// Short-conv channels: K, V, attention output, FFN output.
     fn conv_channels(&self) -> usize {
         2 * self.kv_width() + 2 * self.dim
@@ -139,6 +144,10 @@ struct Layer {
     sink_q8: GemvMatrix,
     kp_q8: Option<GemvMatrix>,
     vp_q8: Option<GemvMatrix>,
+    /// F32 copies of the same three, for the prefill GEMM.
+    sink_f32: GemvMatrix,
+    kp_f32: Option<GemvMatrix>,
+    vp_f32: Option<GemvMatrix>,
     q_clip: DeviceBuffer<f32>,
     rel_bias: DeviceBuffer<f32>,
     rel_clip: DeviceBuffer<f32>,
@@ -295,6 +304,9 @@ impl Weights {
                 sink_q8: l.mat_q8(&b("attn_sink_proj.weight"))?,
                 kp_q8: if swa { None } else { Some(l.mat_q8(&b("attn_k_conv_proj.weight"))?) },
                 vp_q8: if swa { None } else { Some(l.mat_q8(&b("attn_v_conv_proj.weight"))?) },
+                sink_f32: l.stacked_f32(&[&b("attn_sink_proj.weight")])?,
+                kp_f32: if swa { None } else { Some(l.stacked_f32(&[&b("attn_k_conv_proj.weight")])?) },
+                vp_f32: if swa { None } else { Some(l.stacked_f32(&[&b("attn_v_conv_proj.weight")])?) },
                 q_clip: l.vec(&b("attn_q_clip.weight"))?,
                 rel_bias: l.vec(&b("attn_rel_bias.weight"))?,
                 rel_clip: l.vec(&b("attn_rel_clip.weight"))?,
@@ -462,6 +474,32 @@ impl Exec<'_> {
         }
     }
 
+    /// Decode-time dense Q8_0 product of `ntok` rows (single token or batched decode): the dp4a
+    /// GEMV for one token, and for several the rows kernels that compute every row exactly as
+    /// that GEMV does (so batched results do not depend on the batch).
+    fn mm_decode(&self, m: &GemvMatrix, qa: &QAct, y: &mut dyn DevMut<f32>, ntok: usize) -> Result<()> {
+        if ntok == 1 {
+            return self.gemv.launch_q(self.st, m, qa, y, None);
+        }
+        self.gemv.launch_q_rows(self.st, m, qa, y, ntok as u32)
+    }
+
+    /// [`Exec::mm`], or for prefill passes (`prefill`) always the prefill GEMMs, whatever the
+    /// token count.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_any(&self, m: &GemvMatrix, qa: &QAct, y: &mut DeviceBuffer<f32>, ntok: usize, dense: &DeviceBuffer<u32>, work: &DevWork, prefill: bool) -> Result<()> {
+        if !prefill {
+            return self.mm(m, qa, y, ntok, dense, work);
+        }
+        if use_mma() && m.n.is_multiple_of(16) {
+            let n = ntok as u32;
+            self.gemv.launch_mma(self.st, m, qa, n, y, n, &work.items, work.n_items, &work.xidx, &work.yidx, work.idx_len)
+        } else {
+            let items = ntok.div_ceil(QITEM_ROWS) as u32;
+            self.gemv.launch_items(self.st, m, qa, ntok as u32, y, ntok as u32, dense, items)
+        }
+    }
+
     /// `y[t] = W x[t]` with f32 activations (F32 / BF16 weights), `x` token-major of width k.
     fn mm_f32(&self, m: &GemvMatrix, x: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>, ntok: usize, zero_ids: &DeviceBuffer<i32>) -> Result<()> {
         if ntok == 1 {
@@ -499,14 +537,46 @@ pub struct Session {
     reset_graph: Option<GraphExec>,
     /// DSpark speculative decoding, when enabled ([`Session::enable_spec`]).
     spec: Option<Box<Spec>>,
+    /// Sequences with their own KV cache and conv state (sequence 0 is the single-sequence API's).
+    n_seqs: usize,
+    /// Batched decode: rows per pass, per-row inputs and outputs, and one graph per row count.
+    max_batch: usize,
+    b: BatchBufs,
+    batch_graphs: Vec<Option<GraphExec>>,
+    /// Per-sequence `reset_seq` graphs (zeroing that sequence's conv state).
+    seq_reset: Vec<Option<GraphExec>>,
+    /// Row count the dense work lists (`s.work[0]`, `s.items_dense`) currently describe.
+    dense_rows: usize,
+}
+
+/// Device buffers of the batched decode pass.
+struct BatchBufs {
+    seq: DeviceBuffer<i32>,
+    pos: DeviceBuffer<i32>,
+    logits: DeviceBuffer<f32>,
+    next: DeviceBuffer<i32>,
+    part_v: DeviceBuffer<f32>,
+    part_i: DeviceBuffer<u32>,
+    dops: DsparkOps,
+    /// First position of each segment of a packed prefill pass.
+    seg_pos: DeviceBuffer<i32>,
+}
+
+/// One row of a batched decode step: feed `token` to sequence `seq` at position `pos`.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeRow {
+    pub seq: usize,
+    pub pos: u32,
+    pub token: u32,
 }
 
 /// Floats of attention workspace: decode at full capacity, or `tmax` tokens over 512 positions.
-fn attn_work_len(c: &Config, capacity: u32, tmax: usize) -> usize {
+fn attn_work_len(c: &Config, capacity: u32, tmax: usize, max_batch: usize) -> usize {
     use astral_kernels::inkling::{attn_workspace, ATT_CHUNK};
     let (h, hd) = (c.heads as u32, c.head_dim as u32);
-    // Decode, and passes of up to QITEM_ROWS tokens (speculative verification), at full capacity.
-    let decode = attn_workspace(QITEM_ROWS.min(tmax) as u32, h, hd, capacity.div_ceil(ATT_CHUNK));
+    // Decode (up to `max_batch` sequences), and passes of up to QITEM_ROWS tokens (speculative
+    // verification), at full capacity.
+    let decode = attn_workspace(QITEM_ROWS.max(max_batch).min(tmax) as u32, h, hd, capacity.div_ceil(ATT_CHUNK));
     if split_prefill() {
         decode.max(attn_workspace(tmax.min(512) as u32, h, hd, 512u32.div_ceil(ATT_CHUNK)))
     } else {
@@ -514,23 +584,38 @@ fn attn_work_len(c: &Config, capacity: u32, tmax: usize) -> usize {
     }
 }
 
+/// Bytes of KV cache and conv state one sequence of `capacity` positions takes.
+pub fn seq_bytes(c: &Config, capacity: u32) -> usize {
+    c.n_slots() * (2 * 2 * capacity as usize * c.kv_width() + 4 * c.conv_len())
+}
+
 impl Session {
     pub fn new(ctx: &Arc<Context>, w: Weights, capacity: u32) -> Result<Self> {
+        Self::with_seqs(ctx, w, capacity, 1, 1)
+    }
+
+    /// A session with `n_seqs` independent sequences of `capacity` positions each, decoded
+    /// together up to `max_batch` at a time ([`Session::decode_batch`]).
+    pub fn with_seqs(ctx: &Arc<Context>, w: Weights, capacity: u32, n_seqs: usize, max_batch: usize) -> Result<Self> {
         if capacity == 0 || capacity > astral_kernels::inkling::MAX_CTX {
             return Err(bad(format!("capacity {capacity} outside 1..={}", astral_kernels::inkling::MAX_CTX)));
         }
+        let n_seqs = n_seqs.max(1);
         let reg = KernelRegistry::load(ctx)?;
         let c = &w.cfg;
         let tmax = std::env::var("ASTRAL_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_TMAX).clamp(1, PREFILL_TMAX).min(capacity as usize);
+        let max_batch = max_batch.clamp(1, n_seqs).min(PREFILL_TMAX);
+        // Batch rows share the prefill scratch: it must hold max_batch tokens.
+        let tmax = tmax.max(max_batch);
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(ctx, n);
         let (d, kvw, slots, t, ke) = (c.dim, c.kv_width(), c.n_slots(), tmax, c.n_expert_used);
         let mut kc = Vec::with_capacity(slots);
         let mut vc = Vec::with_capacity(slots);
         let mut conv = Vec::with_capacity(slots);
         for _ in 0..slots {
-            kc.push(DeviceBuffer::<u16>::zeroed(ctx, capacity as usize * kvw)?);
-            vc.push(DeviceBuffer::<u16>::zeroed(ctx, capacity as usize * kvw)?);
-            conv.push(z(3 * c.conv_channels())?);
+            kc.push(DeviceBuffer::<u16>::zeroed(ctx, n_seqs * capacity as usize * kvw)?);
+            vc.push(DeviceBuffer::<u16>::zeroed(ctx, n_seqs * capacity as usize * kvw)?);
+            conv.push(z(n_seqs * c.conv_len())?);
         }
         let rank = w.loops.first().map_or(1, |l| l.down[0].n as usize);
         let dynw = w.layers.iter().filter_map(|l| l.k_conv_proj.as_ref()).map(|m| m.n as usize).max().unwrap_or(4);
@@ -551,7 +636,7 @@ impl Session {
             r: z(t * c.heads * c.n_rel as usize)?,
             sinks: z(t * c.heads)?,
             attn: z(t * c.heads * c.head_dim)?,
-            attn_work: z(attn_work_len(c, capacity, t))?,
+            attn_work: z(attn_work_len(c, capacity, t, max_batch))?,
             gate: z(t * c.heads * c.head_dim)?,
             o: z(t * d)?,
             m: z(t * d)?,
@@ -586,6 +671,16 @@ impl Session {
             },
             dbg: None,
         };
+        let b = BatchBufs {
+            seq: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            pos: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            logits: z(max_batch * w.output.n as usize)?,
+            next: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            part_v: z(max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            part_i: DeviceBuffer::<u32>::zeroed(ctx, max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            dops: DsparkOps::new(&reg)?,
+            seg_pos: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+        };
         let mut me = Self {
             stream: Stream::new(ctx)?,
             eager_stream: Stream::new(ctx)?,
@@ -603,19 +698,153 @@ impl Session {
             graph: None,
             reset_graph: None,
             spec: None,
+            n_seqs,
+            max_batch,
+            b,
+            batch_graphs: (0..=max_batch).map(|_| None).collect(),
+            seq_reset: (0..n_seqs).map(|_| None).collect(),
+            dense_rows: 0,
             w,
         };
         me.capture_graph()?;
         {
+            let cl = me.w.cfg.conv_len();
             let Session { stream, conv, reset_graph, .. } = &mut me;
             *reset_graph = Some(stream.capture(|st| {
                 for c in conv.iter_mut() {
-                    c.zero_async(st)?;
+                    c.zero_range_async(0, cl, st)?;
                 }
                 Ok(())
             })?);
         }
         Ok(me)
+    }
+
+    /// Sequences this session holds state for.
+    pub fn n_seqs(&self) -> usize {
+        self.n_seqs
+    }
+
+    /// Most rows one [`Session::decode_batch`] call takes.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
+    /// Forget sequence `seq`: zero its short-conv state (its KV cache is overwritten as it
+    /// fills). Runs as a graph, like [`Session::reset`].
+    pub fn reset_seq(&mut self, seq: usize) -> Result<()> {
+        if seq >= self.n_seqs {
+            return Err(bad(format!("reset_seq: sequence {seq} of {}", self.n_seqs)));
+        }
+        if seq == 0 {
+            return self.reset();
+        }
+        let cl = self.w.cfg.conv_len();
+        let Session { stream, conv, seq_reset, .. } = self;
+        if seq_reset[seq].is_none() {
+            seq_reset[seq] = Some(stream.capture(|st| {
+                for c in conv.iter_mut() {
+                    c.zero_range_async(seq * cl, cl, st)?;
+                }
+                Ok(())
+            })?);
+        }
+        seq_reset[seq].as_ref().expect("captured above").launch(stream)?;
+        stream.synchronize()
+    }
+
+    /// Points the dense work lists at `rows` consecutive rows (prefill chunks, verify passes and
+    /// batched decode share them).
+    fn set_dense(&mut self, rows: usize) -> Result<()> {
+        if self.dense_rows == rows {
+            return Ok(());
+        }
+        let s = &mut self.s;
+        let mut words = QItem::words(&QItem::dense(rows as u32));
+        words.resize(s.items_dense.len(), 0);
+        s.items_dense.copy_from_slice(&words)?;
+        let mut dense = MmaWork::default();
+        dense.push(0, &(0..rows as u32).map(|r| (r, r)).collect::<Vec<_>>());
+        s.work[0].upload(&dense)?;
+        self.dense_rows = rows;
+        Ok(())
+    }
+
+    /// One decode step for several sequences at once: row `i` feeds `rows[i].token` to
+    /// `rows[i].seq` at `rows[i].pos` and gets back that sequence's greedy next token. Each row
+    /// count runs as its own CUDA graph (captured on first use, see [`Session::capture_batch`]).
+    /// The sequences must be distinct and each must have been prefilled up to `pos`.
+    pub fn decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
+        let n = rows.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n > self.max_batch {
+            return Err(bad(format!("decode_batch: {n} rows, at most {}", self.max_batch)));
+        }
+        for r in rows {
+            if r.seq >= self.n_seqs || r.pos >= self.capacity {
+                return Err(bad(format!("decode_batch: sequence {} at position {} (sequences {}, context {})", r.seq, r.pos, self.n_seqs, self.capacity)));
+            }
+        }
+        self.set_dense(n)?;
+        if !self.capture {
+            self.capture_batch(n)?;
+        }
+        let tmax = self.s.tmax;
+        let mut tok = vec![0i32; tmax];
+        let (mut sq, mut ps) = (vec![0i32; self.max_batch], vec![0i32; self.max_batch]);
+        for (i, r) in rows.iter().enumerate() {
+            tok[i] = r.token as i32;
+            sq[i] = r.seq as i32;
+            ps[i] = r.pos as i32;
+        }
+        self.s.token.copy_from_slice(&tok)?;
+        self.b.seq.copy_from_slice(&sq)?;
+        self.b.pos.copy_from_slice(&ps)?;
+        if self.capture {
+            // Verification: eager, with every slot's output copied to the host.
+            let conv_stride = self.w.cfg.conv_len() as u32;
+            let n_seqs = self.n_seqs as u32;
+            let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, captured, .. } = self;
+            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
+            captured.clear();
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+            forward(&Exec { st: stream, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, Some(captured), &mut SpecIo::none(), 0, Some(&mut io), None)?;
+        } else {
+            self.batch_graphs[n].as_ref().expect("captured above").launch(&self.stream)?;
+        }
+        self.stream.synchronize()?;
+        let next = self.b.next.to_vec()?;
+        Ok(next[..n].iter().map(|&t| t as u32).collect())
+    }
+
+    /// Logits of the `n` rows of the last [`Session::decode_batch`] (unpadded vocabulary, row-major).
+    pub fn batch_logits(&self, n: usize) -> Result<Vec<f32>> {
+        let (vp, v) = (self.w.output.n as usize, self.w.cfg.vocab);
+        let all = self.b.logits.to_vec()?;
+        Ok((0..n.min(self.max_batch)).flat_map(|r| all[r * vp..r * vp + v].to_vec()).collect())
+    }
+
+    /// Records the batched decode pass for `n` rows as a CUDA graph (nothing runs).
+    pub fn capture_batch(&mut self, n: usize) -> Result<()> {
+        if n == 0 || n > self.max_batch {
+            return Err(bad(format!("capture_batch: {n} rows, at most {}", self.max_batch)));
+        }
+        if self.batch_graphs[n].is_some() {
+            return Ok(());
+        }
+        self.set_dense(n)?;
+        let conv_stride = self.w.cfg.conv_len() as u32;
+        let n_seqs = self.n_seqs as u32;
+        let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, batch_graphs, .. } = self;
+        let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
+        let g = stream.capture(|st| {
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+            forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut SpecIo::none(), 0, Some(&mut io), None)
+        })?;
+        batch_graphs[n] = Some(g);
+        Ok(())
     }
 
     /// Records the one-token forward pass as a CUDA graph (nothing runs), so the first decode
@@ -625,7 +854,7 @@ impl Session {
             return Ok(());
         }
         let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, graph, .. } = self;
-        let g = stream.capture(|st| forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, 1, None, &mut SpecIo::none()))?;
+        let g = stream.capture(|st| forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, 1, None, &mut SpecIo::none(), 0, None, None))?;
         *graph = Some(g);
         Ok(())
     }
@@ -651,10 +880,10 @@ impl Session {
         if eager {
             captured.clear();
             let ex = Exec { st: stream, gemv, ops, rms };
-            forward(&ex, w, kc, vc, conv, s, *capacity, *pos, 1, capture.then_some(captured), &mut SpecIo::none())?;
+            forward(&ex, w, kc, vc, conv, s, *capacity, *pos, 1, capture.then_some(captured), &mut SpecIo::none(), 0, None, None)?;
         } else {
             if graph.is_none() {
-                let g = stream.capture(|st| forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, 1, None, &mut SpecIo::none()))?;
+                let g = stream.capture(|st| forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, 1, None, &mut SpecIo::none(), 0, None, None))?;
                 *graph = Some(g);
             }
             graph.as_ref().expect("graph captured above").launch(stream)?;
@@ -680,12 +909,101 @@ impl Session {
     /// the last one. Eager (no graph): every chunk shape differs and MoE grouping reads the
     /// router's picks on the host once per layer.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
+        let pos = self.pos;
+        let draft = self.spec.is_some();
+        let next = self.prefill_inner(0, pos, tokens, draft)?;
+        self.pos = pos + tokens.len() as u32;
+        if std::env::var_os("ASTRAL_RECAPTURE").is_some() {
+            self.graph = None;
+            self.capture_graph()?;
+        }
+        Ok(next)
+    }
+
+    /// Prefills several new sequences together (each after [`Session::reset_seq`]): `jobs[i] =
+    /// (sequence, prompt)`. Prompts are packed into passes of up to the prefill chunk size (a
+    /// long prompt continues in the next pass), so the weights are read once per pass rather than
+    /// once per prompt. Returns each sequence's greedy next token. No draft context is stored.
+    pub fn prefill_many(&mut self, jobs: &[(usize, &[u32])]) -> Result<Vec<u32>> {
+        for &(q, t) in jobs {
+            if q >= self.n_seqs || t.is_empty() || t.len() > self.capacity as usize {
+                return Err(bad(format!("prefill_many: sequence {q} with {} tokens (sequences {}, context {})", t.len(), self.n_seqs, self.capacity)));
+            }
+        }
+        let mut out = vec![0u32; jobs.len()];
+        let mut done = vec![0usize; jobs.len()];
+        loop {
+            let tmax = self.s.tmax;
+            let (mut segs, mut owners, mut rows) = (Vec::new(), Vec::new(), 0usize);
+            for (i, &(q, t)) in jobs.iter().enumerate() {
+                if done[i] < t.len() && rows < tmax && segs.len() < self.max_batch {
+                    let n = (t.len() - done[i]).min(tmax - rows);
+                    segs.push(Seg { seq: q, row0: rows, len: n, pos0: done[i] as u32 });
+                    owners.push(i);
+                    rows += n;
+                }
+            }
+            if segs.is_empty() {
+                return Ok(out);
+            }
+            let mut tok = vec![0i32; tmax];
+            for (sg, &i) in segs.iter().zip(&owners) {
+                for (r, &x) in jobs[i].1[sg.pos0 as usize..sg.pos0 as usize + sg.len].iter().enumerate() {
+                    tok[sg.row0 + r] = x as i32;
+                }
+            }
+            let mut sp = vec![0i32; self.max_batch];
+            for (k, sg) in segs.iter().enumerate() {
+                sp[k] = sg.pos0 as i32;
+            }
+            self.set_dense(rows)?;
+            self.s.token.copy_from_slice(&tok)?;
+            self.b.seg_pos.copy_from_slice(&sp)?;
+            self.captured.clear();
+            let conv_stride = self.w.cfg.conv_len() as u32;
+            let n_seqs = self.n_seqs as u32;
+            {
+                let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, .. } = self;
+                let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos } = b;
+                let cap = *capacity;
+                // One-off graph (as in prefill): PDL off for the large prefill kernels.
+                let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
+                let g = stream.capture(|st| {
+                    let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+                    forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
+                });
+                stream.context().set_pdl(prev);
+                g?.launch(stream)?;
+                stream.synchronize()?;
+            }
+            let next = self.b.next.to_vec()?;
+            for (k, (sg, &i)) in segs.iter().zip(&owners).enumerate() {
+                done[i] += sg.len;
+                if done[i] == jobs[i].1.len() {
+                    out[i] = next[k] as u32;
+                }
+            }
+        }
+    }
+
+    /// Prefills `tokens` into sequence `seq` from position `pos` (0 for a new sequence, after
+    /// [`Session::reset_seq`]); returns the greedy next token. No draft context is stored: the
+    /// sequence decodes through [`Session::decode_batch`].
+    pub fn prefill_seq(&mut self, seq: usize, pos: u32, tokens: &[u32]) -> Result<u32> {
+        if seq >= self.n_seqs {
+            return Err(bad(format!("prefill_seq: sequence {seq} of {}", self.n_seqs)));
+        }
+        self.prefill_inner(seq, pos, tokens, false)
+    }
+
+    fn prefill_inner(&mut self, seq: usize, pos_start: u32, tokens: &[u32], draft: bool) -> Result<u32> {
         if tokens.is_empty() {
             return Err(bad("prefill: no tokens".into()));
         }
-        if self.pos as usize + tokens.len() > self.capacity as usize {
-            return Err(bad(format!("prefill: {} tokens at position {} exceed the context of {}", tokens.len(), self.pos, self.capacity)));
+        if pos_start as usize + tokens.len() > self.capacity as usize {
+            return Err(bad(format!("prefill: {} tokens at position {} exceed the context of {}", tokens.len(), pos_start, self.capacity)));
         }
+        let mut cur_pos = pos_start;
         use astral_kernels::inkling::{attn_workspace, ATT_CHUNK};
         let mut next = 0;
         let mut done = 0;
@@ -695,26 +1013,30 @@ impl Session {
             let (h, hd) = (self.w.cfg.heads as u32, self.w.cfg.head_dim as u32);
             let mut t = (tokens.len() - done).min(self.s.tmax);
             // Only the split-K fallback needs workspace; flash-attention prefill does not.
-            while split_prefill() && t > 1 && attn_workspace(t as u32, h, hd, (self.pos + t as u32).div_ceil(ATT_CHUNK)) > self.s.attn_work.len() {
+            while split_prefill() && t > 1 && attn_workspace(t as u32, h, hd, (cur_pos + t as u32).div_ceil(ATT_CHUNK)) > self.s.attn_work.len() {
                 t /= 2;
             }
+            if t > 1 {
+                self.set_dense(t)?;
+            }
             let chunk = &tokens[done..done + t];
-            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, pos, capture, captured, spec, .. } = self;
+            let pos = &mut cur_pos;
+            {
+                let mut sp = vec![0i32; self.max_batch];
+                sp[0] = *pos as i32;
+                self.b.seg_pos.copy_from_slice(&sp)?;
+            }
+            let seg1 = [Seg { seq, row0: 0, len: t, pos0: *pos }];
+            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, capture, captured, spec, b, .. } = self;
+            let segs = Some((&seg1[..], &b.seg_pos));
+            let mut no_spec: Option<Box<Spec>> = None;
+            let spec = if draft { spec } else { &mut no_spec };
             let mut tok = vec![0i32; s.tmax];
             for (i, &x) in chunk.iter().enumerate() {
                 tok[i] = x as i32;
             }
             s.token.copy_from_slice(&tok)?;
             s.pos.copy_from_slice(&[*pos as i32])?;
-            if t > 1 {
-                let mut words = QItem::words(&QItem::dense(t as u32));
-                words.resize(s.items_dense.len(), 0);
-                s.items_dense.copy_from_slice(&words)?;
-                let mut dense = MmaWork::default();
-                let rows: Vec<(u32, u32)> = (0..t as u32).map(|r| (r, r)).collect();
-                dense.push(0, &rows);
-                s.work[0].upload(&dense)?;
-            }
             let ex = Exec { st: stream, gemv, ops, rms };
             if let Some(k) = std::env::var("ASTRAL_EAGER_DIAG").ok().and_then(|v| v.parse().ok()) {
                 DIAG_LIMIT.store(k, std::sync::atomic::Ordering::Relaxed);
@@ -727,14 +1049,14 @@ impl Session {
                 let cap = *capacity;
                 // PDL helps decode's small kernels but slows prefill's large ones: off while capturing.
                 let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
-                let captured_graph = stream.capture(|st| forward(&Exec { st, gemv: ex.gemv, ops: ex.ops, rms: ex.rms }, w, kc, vc, conv, s, cap, p0, t, None, &mut spec_io(spec)));
+                let captured_graph = stream.capture(|st| forward(&Exec { st, gemv: ex.gemv, ops: ex.ops, rms: ex.rms }, w, kc, vc, conv, s, cap, p0, t, None, &mut spec_io(spec), seq, None, segs));
                 stream.context().set_pdl(prev);
                 match captured_graph {
                     Ok(g) => g.launch(stream).and_then(|_| stream.synchronize()),
                     Err(e) => Err(e),
                 }
             } else {
-                forward(&ex, w, kc, vc, conv, s, *capacity, *pos, t, capture.then_some(captured), &mut spec_io(spec))
+                forward(&ex, w, kc, vc, conv, s, *capacity, *pos, t, capture.then_some(captured), &mut spec_io(spec), seq, None, segs)
             };
             DIAG_LIMIT.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
             r?;
@@ -755,10 +1077,6 @@ impl Session {
             *pos += t as u32;
             next = s.next.to_vec()?[0] as u32;
             done += t;
-        }
-        if std::env::var_os("ASTRAL_RECAPTURE").is_some() {
-            self.graph = None;
-            self.capture_graph()?;
         }
         Ok(next)
     }
@@ -850,7 +1168,7 @@ impl Session {
         if let Some(&t) = self.spec.as_ref().and_then(|sp| sp.forced_host.get(prompt.len())) {
             next = t;
         }
-        let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, pos, spec, .. } = self;
+        let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, pos, spec, dense_rows, .. } = self;
         let sp = spec.as_deref_mut().expect("checked above");
         let vmax = sp.k + 1;
         // The verify pass's dense work list (prefill left its own in work[0]).
@@ -860,6 +1178,7 @@ impl Session {
         let mut words = QItem::words(&QItem::dense(vmax as u32));
         words.resize(s.items_dense.len(), 0);
         s.items_dense.copy_from_slice(&words)?;
+        *dense_rows = vmax;
         let mut tok = vec![0i32; s.tmax];
         tok[0] = next as i32;
         s.token.copy_from_slice(&tok)?;
@@ -889,7 +1208,7 @@ impl Session {
                         all: Some((&mut sp.logits_all, &mut sp.next_all)),
                         argmax: Some((&sp.ops, &mut sp.part_v, &mut sp.part_i)),
                     };
-                    forward(&ex, w, kc, vc, conv, s, *capacity, 0, nv, None, &mut io)?;
+                    forward(&ex, w, kc, vc, conv, s, *capacity, 0, nv, None, &mut io, 0, None, None)?;
                 }
                 sp.ops.accept(st, &sp.next_all, &mut s.token, kv as u32, &mut sp.out, &mut sp.info, &mut s.pos, sp.forced.as_ref().map(|f| f as &dyn Dev<i32>))?;
                 sp.ops.conv_commit(st, &sp.table, sp.entries, sp.max_ch, &sp.info)?;
@@ -1044,6 +1363,34 @@ impl SpecIo<'_> {
     }
 }
 
+/// Rows `row0..row0 + len` of a prefill pass: tokens of sequence `seq` from position `pos0`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Seg {
+    pub(crate) seq: usize,
+    pub(crate) row0: usize,
+    pub(crate) len: usize,
+    pub(crate) pos0: u32,
+}
+
+/// The rows of a batched decode pass, as the layers see them.
+#[derive(Clone, Copy)]
+struct BatchRows<'a> {
+    rows: SeqRows<'a>,
+    pos: &'a DeviceBuffer<i32>,
+}
+
+/// A batched decode pass: row `t` of `s.token` is the next input of sequence `rows.seq[t]` at
+/// position `pos[t]`; the greedy pick of every row lands in `next`.
+struct BatchIo<'a> {
+    rows: SeqRows<'a>,
+    pos: &'a DeviceBuffer<i32>,
+    logits: &'a mut DeviceBuffer<f32>,
+    next: &'a mut DeviceBuffer<i32>,
+    part_v: &'a mut DeviceBuffer<f32>,
+    part_i: &'a mut DeviceBuffer<u32>,
+    dops: &'a DsparkOps,
+}
+
 /// A slot's conv-input history for a verify pass.
 struct Hist<'a> {
     buf: &'a mut DeviceBuffer<f32>,
@@ -1067,8 +1414,13 @@ fn forward(
     ntok: usize,
     mut captured: Option<&mut Vec<(usize, Vec<f32>)>>,
     io: &mut SpecIo,
+    seq: usize,
+    mut batch: Option<&mut BatchIo>,
+    segs: Option<(&[Seg], &DeviceBuffer<i32>)>,
 ) -> Result<()> {
     let cfg = &w.cfg;
+    // Packed prefill (segs) reuses the batch buffers only for its outputs.
+    let brows = if segs.is_some() { None } else { batch.as_deref().map(|b| BatchRows { rows: b.rows, pos: b.pos }) };
     let d = cfg.dim;
     let td = ntok * d;
     let rs = s.tmax * d;
@@ -1093,7 +1445,7 @@ fn forward(
         }
         visit += 1;
         let mut hist = io.hist.as_deref_mut().map(|h| Hist { buf: &mut h[slot], rows: hist_rows });
-        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut())?;
+        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs)?;
         if let Some(c) = captured.as_deref_mut() {
             ex.st.synchronize()?;
             let mut v = s.cur.to_vec()?;
@@ -1161,6 +1513,47 @@ fn forward(
         }
     }
 
+    // Packed prefill: logits and greedy pick after the last row of every segment (into the
+    // batch output buffers, row i for segment i).
+    if let (Some((list, _)), Some(b)) = (segs, batch.as_deref_mut()) {
+        let vp = w.output.n as usize;
+        for (i, sg) in list.iter().enumerate() {
+            let last = (sg.row0 + sg.len - 1) * d;
+            {
+                let bank = s.bank.view(last, s.bank.len() - last)?;
+                let cur = s.cur.view(last, d)?;
+                ex.ops.mix(ex.st, &bank, &blocks, rs, &cur, &w.output_res_query, 1, &mut s.m, d as u32, 1)?;
+            }
+            ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa_last, 1, cfg.rms_eps)?;
+            let mut lg = b.logits.view_mut(i * vp, vp)?;
+            match w.output.ty {
+                GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa_last, &mut lg, 1)?,
+                GemvType::Nvfp4 => ex.gemv.launch_q(ex.st, &w.output, &s.qa_last, &mut lg, None)?,
+                _ => ex.gemv.launch(ex.st, &w.output, &s.mn, 0, &mut lg)?,
+            }
+            if cfg.softcap != 0.0 {
+                ex.ops.softcap(ex.st, &mut lg, w.output.n, cfg.softcap)?;
+            }
+            ex.ops.argmax(ex.st, &lg, cfg.vocab as u32, &mut b.next.view_mut(i, 1)?)?;
+        }
+        return Ok(());
+    }
+
+    // Batched decode: logits and greedy pick of every row.
+    if let Some(b) = batch.as_deref_mut() {
+        let vp = w.output.n as usize;
+        ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
+        ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
+        match w.output.ty {
+            GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa[0], &mut *b.logits, ntok)?,
+            _ => ex.mm(&w.output, &s.qa[0], b.logits, ntok, &s.items_dense, &s.work[0])?,
+        }
+        if cfg.softcap != 0.0 {
+            ex.ops.softcap(ex.st, &mut *b.logits, (vp * ntok) as u32, cfg.softcap)?;
+        }
+        return b.dops.argmax_rows(ex.st, &*b.logits, vp as u32, cfg.vocab as u32, ntok as u32, &mut *b.part_v, &mut *b.part_i, &mut *b.next);
+    }
+
     // Output for the last token: depth mix, norm, LM head, softcap, greedy pick.
     let last = (ntok - 1) * d;
     {
@@ -1170,7 +1563,8 @@ fn forward(
     }
     ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa_last, 1, cfg.rms_eps)?;
     match w.output.ty {
-        GemvType::Q8_0 | GemvType::Nvfp4 => ex.gemv.launch_q(ex.st, &w.output, &s.qa_last, &mut s.logits, None)?,
+        GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa_last, &mut s.logits, 1)?,
+        GemvType::Nvfp4 => ex.gemv.launch_q(ex.st, &w.output, &s.qa_last, &mut s.logits, None)?,
         _ => ex.gemv.launch(ex.st, &w.output, &s.mn, 0, &mut s.logits)?,
     }
     if cfg.softcap != 0.0 {
@@ -1216,6 +1610,13 @@ fn fuse_mix() -> bool {
 /// batches); `ASTRAL_SIDE_BF16=1` keeps the separate BF16 GEMVs.
 fn side_q8() -> bool {
     std::env::var_os("ASTRAL_SIDE_BF16").is_none()
+}
+
+/// Decode GEMVs (single token and batched) on int8 tensor cores; `ASTRAL_DECODE_DP4A=1` for
+/// the dp4a kernels (single token only: batched decode needs the tensor-core path for
+/// batch-independent results).
+fn decode_mma() -> bool {
+    Gemv::small_mma() && std::env::var_os("ASTRAL_DECODE_DP4A").is_none()
 }
 
 /// Group MoE picks on the host (one sync per layer) instead of on the GPU.
@@ -1277,22 +1678,42 @@ fn layer(
     pos0: u32,
     ntok: usize,
     mut hist: Option<&mut Hist>,
+    seq: usize,
+    batch: Option<BatchRows>,
+    segs: Option<(&[Seg], &DeviceBuffer<i32>)>,
 ) -> Result<()> {
     let cfg = &w.cfg;
     let l = &w.layers[ip];
+    // One sequence's cache and conv state, or (batched decode) every sequence's, rows indexed.
+    let (kv_span, conv_span) = (capacity as usize * cfg.kv_width(), cfg.conv_len());
+    let (kv_off, conv_off) = if batch.is_some() { (0, 0) } else { (seq * kv_span, seq * conv_span) };
+    let kv_len = if batch.is_some() { kc.len() } else { kv_span };
+    let conv_len = if batch.is_some() { conv.len() } else { conv_span };
+    let (kc_all, vc_all, conv_all) = (kc, vc, conv);
+    // The sequence segments of a prefill / verify pass (one unless prompts are packed).
+    let one_seg = [Seg { seq, row0: 0, len: ntok, pos0 }];
+    let seg_list: &[Seg] = segs.map_or(&one_seg[..], |(l, _)| l);
+    let rows = batch.map(|b| b.rows);
+    // Prefill passes (segments) pick their kernels independently of the token count, so a
+    // prompt gets the same result alone or packed with others.
+    let prefill = segs.is_some();
+    // Per-token decode kernels: a single token, or one token of each batched sequence.
+    let per_tok = batch.is_some() || (ntok == 1 && !prefill);
     let hoff = hist.as_ref().map(|h| crate::dspark::hist_offsets(h.rows, cfg.kv_width(), cfg.dim));
     let (st, d, du, nt) = (ex.st, cfg.dim, cfg.dim as u32, ntok as u32);
     let (heads, kvh, hd, n_rel) = (cfg.heads as u32, cfg.kv_heads as u32, cfg.head_dim as u32, cfg.n_rel);
     let kvw = cfg.kv_width();
     let rs = s.tmax * d;
-    let tap = ntok == 1 && s.dbg.is_some() && loop_i.is_none() && ip == tap_layer();
+    let tap = (ntok == 1 || batch.is_some()) && s.dbg.is_some() && loop_i.is_none() && ip == tap_layer();
+    // Batched decode: the taps record row ASTRAL_TAP_ROW.
+    let tap_row = if batch.is_some() { std::env::var("ASTRAL_TAP_ROW").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize).min(ntok - 1) } else { 0 };
     macro_rules! tap {
         ($name:literal, $buf:ident) => {
             if tap {
                 st.synchronize()?;
-                let mut v = s.$buf.to_vec()?;
-                v.truncate(v.len() / s.tmax);
-                s.dbg.as_mut().unwrap().push(($name, v));
+                let v = s.$buf.to_vec()?;
+                let w = v.len() / s.tmax;
+                s.dbg.as_mut().unwrap().push(($name, v[tap_row * w..(tap_row + 1) * w].to_vec()));
             }
         };
     }
@@ -1324,7 +1745,7 @@ fn layer(
             ex.ops.mix(st, &s.bank, blocks, rs, &s.cur, qry, nq as u32, &mut s.mixed, du, nt)?;
         }
     }
-    let batched_ctrl = (ntok == 1 || small_batch(ntok)) && std::env::var_os("ASTRAL_NO_BATCH_CTRL").is_none();
+    let batched_ctrl = (per_tok || (!prefill && small_batch(ntok))) && std::env::var_os("ASTRAL_NO_BATCH_CTRL").is_none();
     if let (Some(li), true) = (loop_i, batched_ctrl) {
         // Q, K and V controllers in two launches, then their three input norms in one.
         let lp = &w.loops[li];
@@ -1361,7 +1782,7 @@ fn layer(
         for j in 0..3 {
             let x = if nq > 0 { s.mixed.view(row(j) * d, s.mixed.len() - row(j) * d)? } else { s.cur.view(0, s.cur.len())? };
             let msg = s.msgs.view(j * d, s.msgs.len() - j * d)?;
-            if ntok == 1 || small_batch(ntok) {
+            if per_tok || (!prefill && small_batch(ntok)) {
                 ex.ops.ctrl_down(st, &lp.down[j], &x, x_stride, &msg, 4 * d, &mut s.cd, du, nt)?;
                 ex.ops.ctrl_combine(st, &lp.gain_forget[j], &s.cd, &x, x_stride, &msg, 4 * d, &mut s.inputs[j], du, nt)?;
             } else {
@@ -1390,9 +1811,8 @@ fn layer(
     let (ik, iv) = if n_in == 3 { (1, 2) } else { (0, 0) };
     if tap {
         st.synchronize()?;
-        let mut v = s.normed[0].to_vec()?;
-        v.truncate(d);
-        s.dbg.as_mut().unwrap().push(("attn_in_normed", v));
+        let v = s.normed[0].to_vec()?;
+        s.dbg.as_mut().unwrap().push(("attn_in_normed", v[tap_row * d..(tap_row + 1) * d].to_vec()));
     }
 
     // Projections: Q, gate, R, K and V (one launch when decoding); the BF16 sink and tap
@@ -1400,7 +1820,7 @@ fn layer(
     // Decode and small batches: one launch for Q, gate, R, K, V and (as Q8_0 copies) the sink
     // and conv-tap projections.
     let mut side_fused = false;
-    let multi_path = ntok == 1 || (small_batch(ntok) && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.ty == GemvType::Q8_0 && m.n_mats == 1 && m.mat_scale.is_none()));
+    let multi_path = per_tok || (!prefill && small_batch(ntok) && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.ty == GemvType::Q8_0 && m.n_mats == 1 && m.mat_scale.is_none()));
     if multi_path {
         let side = side_q8() && s.dbg.is_none();
         let mut items: Vec<MultiItem> = vec![
@@ -1419,23 +1839,40 @@ fn layer(
         }
         // Decode: the tensor-core fused GEMV (measured faster than dp4a here: 174.5 vs 171.4 tok/s);
         // ASTRAL_DECODE_DP4A=1 for the dp4a kernel.
-        if ntok == 1 && Gemv::small_mma() && std::env::var_os("ASTRAL_DECODE_DP4A").is_none() && l.wq.k.is_multiple_of(128) {
+        let decode_mma = decode_mma() && l.wq.k.is_multiple_of(128);
+        if ntok == 1 && decode_mma {
             ex.gemv.launch_q_multi_mma(st, &mut items, 1)?;
         } else if ntok == 1 {
             ex.gemv.launch_q_multi(st, &mut items)?;
+        } else if batch.is_some() {
+            // Batched decode: every row exactly as the one-token launch computes it.
+            if decode_mma {
+                ex.gemv.launch_q_multi_mma_rows(st, &mut items, nt)?;
+            } else {
+                for it in items.iter_mut() {
+                    ex.gemv.launch_q_rows(st, it.m, it.x, &mut *it.y, nt)?;
+                }
+            }
         } else {
             ex.gemv.launch_q_multi_t(st, &mut items, nt)?;
         }
         side_fused = side;
     } else {
-        ex.mm(&l.wq, &s.qa[0], &mut s.q, ntok, &s.items_dense, &s.work[0])?;
-        ex.mm(&l.wgate, &s.qa[0], &mut s.gate, ntok, &s.items_dense, &s.work[0])?;
-        ex.mm(&l.wrel, &s.qa[0], &mut s.r, ntok, &s.items_dense, &s.work[0])?;
-        ex.mm(&l.wk, &s.qa[ik], &mut s.k, ntok, &s.items_dense, &s.work[0])?;
-        ex.mm(&l.wv, &s.qa[iv], &mut s.v, ntok, &s.items_dense, &s.work[0])?;
+        ex.mm_any(&l.wq, &s.qa[0], &mut s.q, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wgate, &s.qa[0], &mut s.gate, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wrel, &s.qa[0], &mut s.r, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wk, &s.qa[ik], &mut s.k, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wv, &s.qa[iv], &mut s.v, ntok, &s.items_dense, &s.work[0], prefill)?;
     }
     let (kp, vp) = (l.k_conv_proj.as_ref(), l.v_conv_proj.as_ref());
-    if !side_fused {
+    if !side_fused && prefill {
+        // Prefill: tiled f32 GEMMs (the same kernels for any token count).
+        ex.ops.gemm_f32_ws(st, &s.normed[0], d, &l.sink_f32, &mut s.sinks, nt, &mut s.gu)?;
+        if let (Some(kq), Some(vq)) = (l.kp_f32.as_ref(), l.vp_f32.as_ref()) {
+            ex.ops.gemm_f32_ws(st, &s.normed[ik], d, kq, &mut s.kdyn, nt, &mut s.gu)?;
+            ex.ops.gemm_f32_ws(st, &s.normed[iv], d, vq, &mut s.vdyn, nt, &mut s.gu)?;
+        }
+    } else if !side_fused {
         ex.mm_f32(&l.sink, &s.normed[0], &mut s.sinks, ntok, &s.zero_ids)?;
         if let (Some(kp), Some(vp)) = (kp, vp) {
             ex.mm_f32(kp, &s.normed[ik], &mut s.kdyn, ntok, &s.zero_ids)?;
@@ -1448,125 +1885,230 @@ fn layer(
     let dyn_heads = kp.map_or(0, |m| m.n / 4);
     // Prefill: convolved K and V go to s.attn and s.o (free until the attention and the output
     // projection), which attn_prep then reads.
-    if ntok > 1 {
-        let taps_k = kp.map(|m| (&s.kdyn as &dyn Dev<f32>, m.n as usize, dyn_heads));
-        let taps_v = vp.map(|m| (&s.vdyn as &dyn Dev<f32>, m.n as usize, dyn_heads));
-        // Verify passes: the conv kernels also save their inputs for the rollback (no state update).
-        {
-            let mut hk = match (hist.as_mut(), hoff) {
-                (Some(h), Some(o)) => Some(h.buf.view_mut(o[0], ntok * kvw)?),
-                _ => None,
-            };
-            ex.ops.conv_par(st, &s.k, kvw, &mut s.attn, kvw, nt, &conv.view(0, 3 * kvw)?, &l.k_conv, taps_k, kvw as u32, hk.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
-            if hk.is_none() {
-                ex.ops.conv_state(st, &s.k, kvw, nt, &mut conv.view_mut(0, 3 * kvw)?, kvw as u32)?;
-            }
-        }
-        {
-            let mut hv = match (hist.as_mut(), hoff) {
-                (Some(h), Some(o)) => Some(h.buf.view_mut(o[1], ntok * kvw)?),
-                _ => None,
-            };
-            ex.ops.conv_par(st, &s.v, kvw, &mut s.o, kvw, nt, &conv.view(3 * kvw, 3 * kvw)?, &l.v_conv, taps_v, kvw as u32, hv.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
-            if hv.is_none() {
-                ex.ops.conv_state(st, &s.v, kvw, nt, &mut conv.view_mut(3 * kvw, 3 * kvw)?, kvw as u32)?;
-            }
-        }
-    }
-    let (kbuf, vbuf): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>) = if ntok > 1 { (&mut s.attn, &mut s.o) } else { (&mut s.k, &mut s.v) };
-    ex.ops.attn_prep(
-        st,
-        AttnPrep {
-            q: &mut s.q,
-            r: &mut s.r,
-            k: kbuf,
-            v: vbuf,
-            q_scale: &l.q_clip,
-            r_scale: &l.rel_clip,
-            conv_kv: &mut conv.view_mut(0, 6 * kvw)?,
-            k_conv: &l.k_conv,
-            v_conv: &l.v_conv,
-            kdyn: if ntok == 1 { kp.map(|_| &s.kdyn as &dyn Dev<f32>) } else { None },
-            vdyn: if ntok == 1 { vp.map(|_| &s.vdyn as &dyn Dev<f32>) } else { None },
-            dyn_heads,
-            ntok: nt,
-            conv: ntok == 1,
-            kc: &mut *kc,
-            vc: &mut *vc,
-            pos: &s.pos,
-            heads,
-            kv_heads: kvh,
-            head_dim: hd,
-            n_rel,
-            thr_qk: cfg.qk_clip,
-            thr_rel: cfg.rel_clip,
-            eps: cfg.rms_eps,
-            global: !l.swa,
-            log_floor: cfg.log_floor,
-            log_alpha: cfg.log_alpha,
-            capacity,
-        },
-    )?;
-    tap!("Qcur", q);
-    tap!("Kcur", k);
-    tap!("Vcur", v);
-    tap!("Rcur", r);
-    tap!("sinks", sinks);
-
-    // Attention, output gate, output projection, post conv into the residual stream. The
-    // first layer of each block starts a new stream; the old one joins the blocks.
     let shape = AttnShape { heads, kv_heads: kvh, head_dim: hd, n_rel, extent: cfg.rel_extent, window: if l.swa { cfg.n_swa } else { 0 }, capacity };
     use astral_kernels::inkling::ATT_CHUNK;
     let mut gated = false;
-    if ntok == 1 && (hd != 128 || n_rel > 32 || std::env::var_os("ASTRAL_ATTN_SIMPLE").is_some()) {
-        ex.ops.attn_decode(st, &s.q, &s.r, &s.sinks, &*kc, &*vc, &l.rel_bias, &mut s.attn, &s.pos, shape)?;
-    } else if ntok > 1 && !small_batch(ntok) && hd == 128 && n_rel <= 16 && n_rel.is_multiple_of(4) && !split_prefill() {
-        ex.ops.attn_prefill(st, &s.q, &s.r, &s.sinks, &*kc, &*vc, &l.rel_bias, &mut s.attn, &s.pos, shape, nt)?;
-    } else {
-        // Decode: a fixed split count for the whole context (graph-capturable); prefill: enough
-        // splits for the chunk's last position.
-        // Small batches (verify passes, graph-captured at any position) use the decode split.
-        // (capped: each split loops over chunks, so a large context does not launch idle blocks.)
-        // Decode: one chunk per split over the whole capacity (measured fastest). Verify passes:
-        // a capped split count with each split looping over chunks (no idle blocks at large
-        // contexts). Prefill: exact splits for the chunk's last position.
-        let chunk_loop = small_batch(ntok);
-        let splits = if ntok == 1 {
-            capacity.div_ceil(ATT_CHUNK)
-        } else if chunk_loop {
-            capacity.div_ceil(ATT_CHUNK).min(graph_splits())
-        } else {
-            (pos0 + nt).div_ceil(ATT_CHUNK)
+    if !per_tok {
+        // Prefill / verify: per sequence segment (one, or several prompts packed in the pass),
+        // the convs, attention prep and attention on that segment's rows and its own state.
+        let one = [Seg { seq, row0: 0, len: ntok, pos0 }];
+        let (list, seg_pos): (&[Seg], Option<&DeviceBuffer<i32>>) = match segs {
+            Some((l, p)) => (l, Some(p)),
+            None => (&one, None),
         };
-        // The merge also applies the output gate and quantises for the O projection (except
-        // when the debug taps want the ungated attention output).
-        let fuse_gate = s.dbg.is_none();
-        let gate = if fuse_gate { Some((&s.gate as &dyn Dev<f32>, &mut s.qa_attn)) } else { None };
-        ex.ops.attn_decode_split(st, &s.q, &s.r, &s.sinks, &*kc, &*vc, &l.rel_bias, &mut s.attn_work, &mut s.attn, &s.pos, shape, nt, splits, chunk_loop, gate)?;
-        gated = fuse_gate;
+        let packed = segs.is_some();
+        let (q_w, r_w, dyn_w) = ((heads * hd) as usize, (heads * n_rel) as usize, kp.map_or(0, |m| m.n as usize));
+        for (si, sg) in list.iter().enumerate() {
+            let (r0, n) = (sg.row0, sg.len);
+            let nn = n as u32;
+            let (ko, co) = (sg.seq * kv_span, sg.seq * conv_span);
+            let mut cv = conv_all.view_mut(co, conv_span)?;
+            let taps_k = kp.map(|m| -> Result<_> { Ok((s.kdyn.view(r0 * dyn_w, n * dyn_w)?, m.n as usize, dyn_heads)) }).transpose()?;
+            let taps_v = vp.map(|m| -> Result<_> { Ok((s.vdyn.view(r0 * dyn_w, n * dyn_w)?, m.n as usize, dyn_heads)) }).transpose()?;
+            // Verify passes: the conv kernels also save their inputs for the rollback (no state update).
+            {
+                let mut hk = match (hist.as_mut(), hoff) {
+                    (Some(h), Some(o)) => Some(h.buf.view_mut(o[0], ntok * kvw)?),
+                    _ => None,
+                };
+                let src = s.k.view(r0 * kvw, n * kvw)?;
+                let mut dst = s.attn.view_mut(r0 * kvw, n * kvw)?;
+                ex.ops.conv_par(st, &src, kvw, &mut dst, kvw, nn, &cv.view(0, 3 * kvw)?, &l.k_conv, taps_k.as_ref().map(|(v, a, b)| (v as &dyn Dev<f32>, *a, *b)), kvw as u32, hk.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
+                if hk.is_none() {
+                    ex.ops.conv_state(st, &src, kvw, nn, &mut cv.view_mut(0, 3 * kvw)?, kvw as u32)?;
+                }
+            }
+            {
+                let mut hv = match (hist.as_mut(), hoff) {
+                    (Some(h), Some(o)) => Some(h.buf.view_mut(o[1], ntok * kvw)?),
+                    _ => None,
+                };
+                let src = s.v.view(r0 * kvw, n * kvw)?;
+                let mut dst = s.o.view_mut(r0 * kvw, n * kvw)?;
+                ex.ops.conv_par(st, &src, kvw, &mut dst, kvw, nn, &cv.view(3 * kvw, 3 * kvw)?, &l.v_conv, taps_v.as_ref().map(|(v, a, b)| (v as &dyn Dev<f32>, *a, *b)), kvw as u32, hv.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
+                if hv.is_none() {
+                    ex.ops.conv_state(st, &src, kvw, nn, &mut cv.view_mut(3 * kvw, 3 * kvw)?, kvw as u32)?;
+                }
+            }
+            let pos_v = match seg_pos {
+                Some(p) => p.view(si, 1)?,
+                None => s.pos.view(0, 1)?,
+            };
+            let mut kcv = kc_all.view_mut(ko, kv_span)?;
+            let mut vcv = vc_all.view_mut(ko, kv_span)?;
+            ex.ops.attn_prep(
+                st,
+                AttnPrep {
+                    q: &mut s.q.view_mut(r0 * q_w, n * q_w)?,
+                    r: &mut s.r.view_mut(r0 * r_w, n * r_w)?,
+                    k: &mut s.attn.view_mut(r0 * kvw, n * kvw)?,
+                    v: &mut s.o.view_mut(r0 * kvw, n * kvw)?,
+                    q_scale: &l.q_clip,
+                    r_scale: &l.rel_clip,
+                    conv_kv: &mut cv,
+                    k_conv: &l.k_conv,
+                    v_conv: &l.v_conv,
+                    kdyn: None,
+                    vdyn: None,
+                    dyn_heads,
+                    ntok: nn,
+                    conv: false,
+                    kc: &mut kcv,
+                    vc: &mut vcv,
+                    pos: &pos_v,
+                    heads,
+                    kv_heads: kvh,
+                    head_dim: hd,
+                    n_rel,
+                    thr_qk: cfg.qk_clip,
+                    thr_rel: cfg.rel_clip,
+                    eps: cfg.rms_eps,
+                    global: !l.swa,
+                    log_floor: cfg.log_floor,
+                    log_alpha: cfg.log_alpha,
+                    capacity,
+                    rows: None,
+                },
+            )?;
+        }
+        tap!("Qcur", q);
+        tap!("Kcur", k);
+        tap!("Vcur", v);
+        tap!("Rcur", r);
+        tap!("sinks", sinks);
+        for (si, sg) in list.iter().enumerate() {
+            let (r0, n) = (sg.row0, sg.len);
+            let nn = n as u32;
+            let ko = sg.seq * kv_span;
+            let pos_v = match seg_pos {
+                Some(p) => p.view(si, 1)?,
+                None => s.pos.view(0, 1)?,
+            };
+            let kcv = kc_all.view(ko, kv_span)?;
+            let vcv = vc_all.view(ko, kv_span)?;
+            let q = s.q.view(r0 * q_w, n * q_w)?;
+            let r = s.r.view(r0 * r_w, n * r_w)?;
+            let sk = s.sinks.view(r0 * heads as usize, n * heads as usize)?;
+            if (prefill || !small_batch(n)) && hd == 128 && n_rel <= 16 && n_rel.is_multiple_of(4) && !split_prefill() {
+                let mut out = s.attn.view_mut(r0 * q_w, n * q_w)?;
+                ex.ops.attn_prefill(st, &q, &r, &sk, &kcv, &vcv, &l.rel_bias, &mut out, &pos_v, shape, nn)?;
+            } else {
+                // Verify passes (graph-captured at any position): a capped split count, each split
+                // looping over chunks; prefill fallback: exact splits for the segment's last position.
+                let chunk_loop = !prefill && small_batch(n);
+                let splits = if chunk_loop { capacity.div_ceil(ATT_CHUNK).min(graph_splits()) } else { (sg.pos0 + nn).div_ceil(ATT_CHUNK) };
+                // The merge also applies the output gate and quantises for the O projection (one
+                // unpacked segment only: the quantised rows start at row 0).
+                let fuse_gate = s.dbg.is_none() && !packed;
+                let gate = if fuse_gate { Some((&s.gate as &dyn Dev<f32>, &mut s.qa_attn)) } else { None };
+                let mut out = s.attn.view_mut(r0 * q_w, n * q_w)?;
+                ex.ops.attn_decode_split(st, &q, &r, &sk, &kcv, &vcv, &l.rel_bias, &mut s.attn_work, &mut out, &pos_v, shape, nn, splits, chunk_loop, gate, None)?;
+                gated = fuse_gate;
+            }
+        }
+    } else {
+        let mut kc = kc_all.view_mut(kv_off, kv_len)?;
+        let mut vc = vc_all.view_mut(kv_off, kv_len)?;
+        let mut conv = conv_all.view_mut(conv_off, conv_len)?;
+        ex.ops.attn_prep(
+            st,
+            AttnPrep {
+                q: &mut s.q,
+                r: &mut s.r,
+                k: &mut s.k,
+                v: &mut s.v,
+                q_scale: &l.q_clip,
+                r_scale: &l.rel_clip,
+                conv_kv: &mut conv.view_mut(0, conv_len)?,
+                k_conv: &l.k_conv,
+                v_conv: &l.v_conv,
+                kdyn: kp.map(|_| &s.kdyn as &dyn Dev<f32>),
+                vdyn: vp.map(|_| &s.vdyn as &dyn Dev<f32>),
+                dyn_heads,
+                ntok: nt,
+                conv: true,
+                kc: &mut kc,
+                vc: &mut vc,
+                pos: match batch {
+                    Some(b) => b.pos,
+                    None => &s.pos,
+                },
+                heads,
+                kv_heads: kvh,
+                head_dim: hd,
+                n_rel,
+                thr_qk: cfg.qk_clip,
+                thr_rel: cfg.rel_clip,
+                eps: cfg.rms_eps,
+                global: !l.swa,
+                log_floor: cfg.log_floor,
+                log_alpha: cfg.log_alpha,
+                capacity,
+                rows,
+            },
+        )?;
+        tap!("Qcur", q);
+        tap!("Kcur", k);
+        tap!("Vcur", v);
+        tap!("Rcur", r);
+        tap!("sinks", sinks);
+
+        // Attention, output gate, output projection, post conv into the residual stream. The
+        // first layer of each block starts a new stream; the old one joins the blocks.
+        if batch.is_none() && ntok == 1 && (hd != 128 || n_rel > 32 || std::env::var_os("ASTRAL_ATTN_SIMPLE").is_some()) {
+            ex.ops.attn_decode(st, &s.q, &s.r, &s.sinks, &kc, &vc, &l.rel_bias, &mut s.attn, &s.pos, shape)?;
+        } else {
+            // Decode: one chunk per split over the whole capacity (graph-capturable, measured
+            // fastest). The merge also applies the output gate and quantises for the O
+            // projection (except when the debug taps want the ungated attention output).
+            let splits = capacity.div_ceil(ATT_CHUNK);
+            let fuse_gate = s.dbg.is_none();
+            let gate = if fuse_gate { Some((&s.gate as &dyn Dev<f32>, &mut s.qa_attn)) } else { None };
+            let pos = match batch {
+                Some(b) => b.pos,
+                None => &s.pos,
+            };
+            ex.ops.attn_decode_split(st, &s.q, &s.r, &s.sinks, &kc, &vc, &l.rel_bias, &mut s.attn_work, &mut s.attn, pos, shape, nt, splits, false, gate, rows)?;
+            gated = fuse_gate;
+        }
     }
     tap!("kqv_out", attn);
     if !gated {
         ex.ops.gate_q8(st, &mut s.attn, &s.gate, &mut s.qa_attn, nt)?;
     }
-    ex.mm(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0])?;
+    if per_tok {
+        ex.mm_decode(&l.wo, &s.qa_attn, &mut s.o, ntok)?;
+    } else {
+        ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], prefill)?;
+    }
     let starts_block = ip % cfg.attn_res_block == 0;
     if starts_block && *next_row >= BANK_ROWS {
         return Err(bad("attention-residual bank full".into()));
     }
     {
         let mut bank_row = if starts_block { Some(s.bank.view_mut(*next_row * rs, rs)?) } else { None };
-        let br = bank_row.as_mut().map(|b| b as &mut dyn DevMut<f32>);
-        if ntok == 1 {
-            ex.ops.conv_residual(st, &s.o, None, nt, &mut conv.view_mut(2 * kvw * 3, 3 * d)?, &l.attn_post_conv, &mut s.cur, br, du)?;
+        if per_tok {
+            let br = bank_row.as_mut().map(|b| b as &mut dyn DevMut<f32>);
+            let mut conv = conv_all.view_mut(conv_off, conv_len)?;
+            ex.ops.conv_residual(st, &s.o, None, nt, &mut conv.view_mut(2 * kvw * 3, conv_len - 2 * kvw * 3)?, &l.attn_post_conv, &mut s.cur, br, du, rows)?;
         } else {
-            let mut ha = match (hist.as_mut(), hoff) {
-                (Some(h), Some(o)) => Some(h.buf.view_mut(o[2], ntok * d)?),
-                _ => None,
-            };
-            ex.ops.conv_res_par(st, &s.o, nt, &conv.view(2 * kvw * 3, 3 * d)?, &l.attn_post_conv, &mut s.cur, br, du, ha.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
-            if ha.is_none() {
-                ex.ops.conv_state(st, &s.o, d, nt, &mut conv.view_mut(2 * kvw * 3, 3 * d)?, du)?;
+            for sg in seg_list.iter() {
+                let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
+                let (r0, n) = (sg.row0 * d, sg.len * d);
+                let mut ha = match (hist.as_mut(), hoff) {
+                    (Some(h), Some(o)) => Some(h.buf.view_mut(o[2], ntok * d)?),
+                    _ => None,
+                };
+                let src = s.o.view(r0, n)?;
+                let mut cur = s.cur.view_mut(r0, n)?;
+                let mut bv = match bank_row.as_mut() {
+                    Some(b) => Some(b.view_mut(r0, n)?),
+                    None => None,
+                };
+                ex.ops.conv_res_par(st, &src, sg.len as u32, &cv.view(2 * kvw * 3, 3 * d)?, &l.attn_post_conv, &mut cur, bv.as_mut().map(|v| v as &mut dyn DevMut<f32>), du, ha.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
+                if ha.is_none() {
+                    ex.ops.conv_state(st, &src, d, sg.len as u32, &mut cv.view_mut(2 * kvw * 3, 3 * d)?, du)?;
+                }
             }
         }
     }
@@ -1587,11 +2129,17 @@ fn layer(
     }
     if let Some(li) = loop_i {
         let lp = &w.loops[li];
-        let msg = s.msgs.view(3 * d, s.msgs.len() - 3 * d)?;
-        if ntok == 1 || small_batch(ntok) {
-            ex.ops.ctrl_down(st, &lp.down[3], &s.m, d, &msg, 4 * d, &mut s.cd, du, nt)?;
-            ex.ops.ctrl_combine(st, &lp.gain_forget[3], &s.cd, &s.m, d, &msg, 4 * d, &mut s.ctmp, du, nt)?;
+        if per_tok || (!prefill && small_batch(ntok)) {
+            // The same launch as the attention-input controllers (one job), so one token or many
+            // share the kernels and their per-token arithmetic.
+            let Scratch { msgs, m, cd, ctmp, .. } = &mut *s;
+            let msg = msgs.view(3 * d, msgs.len() - 3 * d)?;
+            let rank = lp.down[3].n as usize;
+            let mut cdv = cd.view_mut(0, ntok * rank)?;
+            let mut jobs: [(&GemvMatrix, &GemvMatrix, &dyn Dev<f32>, &dyn Dev<f32>, &mut dyn DevMut<f32>, &mut dyn DevMut<f32>); 1] = [(&lp.down[3], &lp.gain_forget[3], &*m, &msg, &mut cdv, &mut *ctmp)];
+            ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt)?;
         } else {
+            let msg = s.msgs.view(3 * d, s.msgs.len() - 3 * d)?;
             ex.ops.ctrl_t(st, &lp.down[3], &lp.gain_forget[3], &s.m, d, &msg, 4 * d, &mut s.crms, &mut s.cd, &mut s.gu, &mut s.ctmp, du, nt)?;
         }
     }
@@ -1601,24 +2149,47 @@ fn layer(
     }
     tap!("ffn_normed", mn);
     let (ne, k) = (cfg.n_expert as u32, cfg.n_expert_used as u32);
-    if l.router.ty == GemvType::F32 && ntok <= QITEM_ROWS && s.dbg.is_none() && std::env::var_os("ASTRAL_NO_FUSE_ROUTER").is_none() {
+    if l.router.ty == GemvType::F32 && !prefill && (ntok <= QITEM_ROWS || batch.is_some()) && s.dbg.is_none() && std::env::var_os("ASTRAL_NO_FUSE_ROUTER").is_none() {
         // Router GEMV + top-k in one kernel (the last block per token selects).
         let bias = l.probs_b.as_ref().map(|b| b as &dyn Dev<f32>);
         ex.ops.router_fused(st, &l.router, &s.mn, &mut s.rlogits, bias, &mut s.ids, &mut s.w, k, cfg.expert_scale, nt, &mut s.router_cnt)?;
     } else {
-        ex.mm_f32(&l.router, &s.mn, &mut s.rlogits, ntok, &s.zero_ids)?;
+        if prefill {
+            ex.ops.gemm_f32_ws(st, &s.mn, d, &l.router, &mut s.rlogits, nt, &mut s.gu)?;
+        } else {
+            ex.mm_f32(&l.router, &s.mn, &mut s.rlogits, ntok, &s.zero_ids)?;
+        }
         tap!("ffn_moe_logits", rlogits);
         ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
     }
     let pairs = ntok * k as usize;
-    if ntok == 1 {
+    // Decode (one token or a batch): picks grouped by expert on the GPU, then the pipelined int8
+    // tensor-core GEMM, whose per-token results do not depend on the batch.
+    let moe_mma = std::env::var_os("ASTRAL_DECODE_MOE_MMA").is_some() && [&l.gate_up, &l.down].iter().all(|m| matches!(m.ty, GemvType::Q8_0 | GemvType::Nvfp4) && m.mx_scale.is_none() && m.n.is_multiple_of(64) && m.k.is_multiple_of(64));
+    if per_tok && moe_mma {
+        let p32 = pairs as u32;
+        let max_items = ((s.work[1].items.len() / 3) as u32).min((p32.div_ceil(64) + cfg.n_expert as u32).min(p32));
+        let [_, w1, w2] = &mut s.work;
+        ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items)?;
+        let (w1, w2) = (&s.work[1], &s.work[2]);
+        ex.gemv.launch_mma_i8(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32, nt)?;
+        ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+        ex.gemv.launch_mma_i8(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32, nt)?;
+    } else if ntok == 1 && !prefill {
         let ids = s.ids.view(0, k as usize)?;
         ex.gemv.launch_q(st, &l.gate_up, &s.qa[0], &mut s.gu, Some(&ids as &dyn Dev<i32>))?;
         ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, k, cfg.situ_beta, cfg.situ_lb)?;
         ex.gemv.launch_q(st, &l.down, &s.qa_ff, &mut s.y, Some(&ids as &dyn Dev<i32>))?;
     } else {
         let p32 = pairs as u32;
-        if small_batch(ntok) {
+        if batch.is_some() {
+            // Batched decode, every (token, expert) pair as the one-token dp4a GEMV computes it.
+            let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);
+            ex.ops.moe_group_q(st, &s.ids, p32, k, cfg.n_expert as u32, &mut s.items_gu, &mut s.items_dn, mi)?;
+            ex.gemv.launch_items_exact(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &s.items_gu, mi)?;
+            ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            ex.gemv.launch_items_exact(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &s.items_dn, mi)?;
+        } else if !prefill && small_batch(ntok) {
             // Few tokens (verify passes): dp4a grouped GEMV, each used expert read once, grouped
             // on the GPU (graph-capturable).
             let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);
@@ -1682,17 +2253,24 @@ fn layer(
     // Combine, post conv and the residual add.
     let wv = s.w.view(0, pairs)?;
     let st_off = (2 * kvw + d) * 3;
-    if ntok == 1 {
-        ex.ops.conv_residual(st, &s.y, Some((&wv as &dyn Dev<f32>, k)), nt, &mut conv.view_mut(st_off, 3 * d)?, &l.ffn_post_conv, &mut s.cur, None, du)
+    if per_tok {
+        let mut conv = conv_all.view_mut(conv_off, conv_len)?;
+        ex.ops.conv_residual(st, &s.y, Some((&wv as &dyn Dev<f32>, k)), nt, &mut conv.view_mut(st_off, conv_len - st_off)?, &l.ffn_post_conv, &mut s.cur, None, du, rows)
     } else {
         ex.ops.moe_combine_t(st, &s.y, &wv, &mut s.o, du, k, nt)?;
-        let mut hf = match (hist.as_mut(), hoff) {
-            (Some(h), Some(o)) => Some(h.buf.view_mut(o[3], ntok * d)?),
-            _ => None,
-        };
-        ex.ops.conv_res_par(st, &s.o, nt, &conv.view(st_off, 3 * d)?, &l.ffn_post_conv, &mut s.cur, None, du, hf.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
-        if hf.is_none() {
-            ex.ops.conv_state(st, &s.o, d, nt, &mut conv.view_mut(st_off, 3 * d)?, du)?;
+        for sg in seg_list.iter() {
+            let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
+            let (r0, n) = (sg.row0 * d, sg.len * d);
+            let mut hf = match (hist.as_mut(), hoff) {
+                (Some(h), Some(o)) => Some(h.buf.view_mut(o[3], ntok * d)?),
+                _ => None,
+            };
+            let src = s.o.view(r0, n)?;
+            let mut cur = s.cur.view_mut(r0, n)?;
+            ex.ops.conv_res_par(st, &src, sg.len as u32, &cv.view(st_off, 3 * d)?, &l.ffn_post_conv, &mut cur, None, du, hf.as_mut().map(|v| v as &mut dyn DevMut<f32>))?;
+            if hf.is_none() {
+                ex.ops.conv_state(st, &src, d, sg.len as u32, &mut cv.view_mut(st_off, 3 * d)?, du)?;
+            }
         }
         Ok(())
     }

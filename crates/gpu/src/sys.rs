@@ -142,6 +142,8 @@ api_table! {
         cuGraphLaunch(CUgraphExec, CUstream);
         cuGraphExecDestroy(CUgraphExec);
         cuGraphDestroy(CUgraph);
+        cuProfilerStart();
+        cuProfilerStop();
     }
 }
 

@@ -20,7 +20,7 @@
 use astral_core::Result;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: astral <hw [--bench | --bench-fresh] | selftest | gguf-info <model> [--tensors] | verify-embd <file> <log> | verify-model <file> <log> | generate <model> <n> <ids...> | spec-generate <model> <checkpoint dir> <k> <n> <ids...|@file> | serve <model> [--checkpoint <dir>] [--no-draft] [--k 6] [--host 0.0.0.0] [--port 8000] [--ctx 8192] [--name inkling-2-mini] | version>";
+const USAGE: &str = "usage: astral <hw [--bench | --bench-fresh] | selftest | gguf-info <model> [--tensors] | verify-embd <file> <log> | verify-model <file> <log> | generate <model> <n> <ids...> | batch-check <model> <n> <steps> | spec-generate <model> <checkpoint dir> <k> <n> <ids...|@file> | serve <model> [--checkpoint <dir>] [--no-draft] [--k 6] [--host 0.0.0.0] [--port 8000] [--ctx 8192] [--name inkling-2-mini] [--queue 64] [--max-seqs N] | version>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("qwen-generate") if args.len() >= 4 => cmd_qwen_generate(&args[1], &args[2], &args[3..]),
         Some("generate") if args.len() >= 4 => cmd_generate(&args[1], &args[2], &args[3..]),
         Some("serve") if args.len() >= 2 => cmd_serve(&args[1..]),
+        Some("batch-check") if args.len() >= 4 => cmd_batch_check(&args[1], &args[2], &args[3]),
         Some("cmp-prefill") if args.len() >= 3 => cmd_cmp_prefill(&args[1], &args[2..]),
         Some("spec-generate") if args.len() >= 6 => cmd_spec_generate(&args[1], &args[2], &args[3], &args[4], &args[5..]),
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-gemv" => cmd_kbench_mxfp4(&args[2..], false),
@@ -147,6 +148,240 @@ fn load_session(path: &str, capacity: u32) -> Result<astral_model::inkling::Sess
     let w = astral_model::inkling::Weights::load(&ctx, &g)?;
     eprintln!("loaded {:.2} GB of weights in {:.1} s", w.bytes as f64 / 1e9, t0.elapsed().as_secs_f64());
     astral_model::inkling::Session::new(&ctx, w, capacity)
+}
+
+/// `batch-check <gguf> <n> <steps>`: decodes `n` sequences together and compares every row's
+/// logits and greedy pick with the same sequence decoded alone (teacher-forced on the
+/// single-sequence tokens, so every step compares the same inputs).
+fn cmd_batch_check(path: &str, n: &str, steps: &str) -> Result<bool> {
+    use astral_model::inkling::{DecodeRow, Session, Weights};
+    let bad = |m: String| astral_core::AstralError::Invalid(m);
+    let n: usize = n.parse().map_err(|_| bad("batch-check: n must be a number".into()))?;
+    let steps: usize = steps.parse().map_err(|_| bad("batch-check: steps must be a number".into()))?;
+    let ctx = astral_gpu::Context::new(astral_gpu::Device::get(0)?)?;
+    let g = astral_loader::open_model(path)?;
+    let w = Weights::load(&ctx, &g)?;
+    let mut s = Session::with_seqs(&ctx, w, 2048, n, n)?;
+    let prompts: Vec<Vec<u32>> = (0..n).map(|i| (0..(6 + i % 5)).map(|j| ((i * 7919 + j * 104729) % 150000 + 1000) as u32).collect()).collect();
+    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32;
+    // ASTRAL_CHECK_PREFILL=1: prefill logits of prompt 4 on slot 0 twice, then on every slot.
+    if std::env::var_os("ASTRAL_CHECK_PREFILL").is_some() {
+        let p = &prompts[4.min(n - 1)];
+        let mut base = None;
+        for q in [0usize, 0].into_iter().chain(1..n) {
+            s.reset_seq(q)?;
+            s.prefill_seq(q, 0, p)?;
+            let l = s.logits()?;
+            let b = base.get_or_insert_with(|| l.clone());
+            let d = l.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("prefill on slot {q}: max |diff| {d:.3e}");
+        }
+        return Ok(true);
+    }
+    // Reference: each sequence alone (sequence 0, one-token graph).
+    let (mut rt, mut rl) = (Vec::new(), Vec::new());
+    // ASTRAL_CHECK_REF=batch: the reference is the one-row batched pass on the same slot.
+    let ref_batch = std::env::var("ASTRAL_CHECK_REF").is_ok_and(|v| v == "batch");
+    for (i, p) in prompts.iter().enumerate() {
+        let mut t;
+        let mut lg;
+        if ref_batch {
+            s.reset_seq(i)?;
+            t = s.prefill_seq(i, 0, p)?;
+            lg = vec![s.logits()?];
+        } else {
+            s.reset()?;
+            t = s.prefill(p)?;
+            lg = vec![s.logits()?];
+        }
+        let mut toks = vec![t];
+        let ref_prefill = std::env::var("ASTRAL_CHECK_REF").is_ok_and(|v| v == "prefill");
+        for k in 1..steps {
+            if ref_prefill {
+                // Teacher-forced: the prompt and the tokens so far through the prefill path.
+                let mut seq_toks = p.clone();
+                seq_toks.extend(&toks);
+                s.reset()?;
+                t = s.prefill(&seq_toks)?;
+                lg.push(s.logits()?);
+            } else if ref_batch {
+                t = s.decode_batch(&[DecodeRow { seq: i, pos: (p.len() + k - 1) as u32, token: t }])?[0];
+                lg.push(s.batch_logits(1)?);
+            } else {
+                t = s.step(t)?;
+                lg.push(s.logits()?);
+            }
+            toks.push(t);
+        }
+        rt.push(toks);
+        rl.push(lg);
+    }
+    // ASTRAL_CHECK_SLOTS=1: first step of sequence 0, every slot's output, step() vs batch.
+    if std::env::var_os("ASTRAL_CHECK_SLOTS").is_some() {
+        let ci: usize = std::env::var("ASTRAL_CHECK_IDX").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n - 1);
+        let cs: usize = std::env::var("ASTRAL_CHECK_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n - 1);
+        s.reset()?;
+        s.prefill(&prompts[ci])?;
+        let taps = std::env::var_os("ASTRAL_CHECK_TAPS").is_some();
+        s.capture = true;
+        s.set_debug(taps);
+        s.step(rt[ci][0])?;
+        let a = std::mem::take(&mut s.captured);
+        let ta = s.take_debug();
+        s.set_debug(false);
+        let mode = std::env::var("ASTRAL_CHECK_SLOTS").unwrap_or_default();
+        s.reset()?;
+        let pre = |s: &mut Session| -> astral_core::Result<()> {
+            s.set_debug(taps);
+            Ok(())
+        };
+        if mode == "step" {
+            s.prefill(&prompts[ci])?;
+            pre(&mut s)?;
+            s.step(rt[ci][0])?;
+        } else if mode == "seqstep" {
+            s.prefill_seq(cs, 0, &prompts[ci])?;
+            s.pos = prompts[ci].len() as u32;
+            pre(&mut s)?;
+            s.step(rt[ci][0])?;
+        } else if mode == "prefillbatch" {
+            s.prefill(&prompts[ci])?;
+            pre(&mut s)?;
+            s.decode_batch(&[DecodeRow { seq: cs, pos: prompts[ci].len() as u32, token: rt[ci][0] }])?;
+        } else {
+            s.prefill_seq(cs, 0, &prompts[ci])?;
+            pre(&mut s)?;
+            s.decode_batch(&[DecodeRow { seq: cs, pos: prompts[ci].len() as u32, token: rt[ci][0] }])?;
+        }
+        s.capture = false;
+        let tb = s.take_debug();
+        s.set_debug(false);
+        for ((na, va), (_, vb)) in ta.iter().zip(tb.iter()) {
+            let d = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("tap {na}: max |diff| {d:.3e}");
+        }
+        for ((sa, va), (_, vb)) in a.iter().zip(s.captured.iter()) {
+            let d = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("slot {sa:2}: max |diff| {d:.3e}");
+        }
+    }
+    s.reset()?;
+    let mut ok = true;
+    // All prompts prefilled together (packed passes): each must match its own prefill.
+    for i in 0..n {
+        s.reset_seq(i)?;
+    }
+    let jobs: Vec<(usize, &[u32])> = prompts.iter().enumerate().map(|(i, p)| (i, p.as_slice())).collect();
+    let firsts = s.prefill_many(&jobs)?;
+    for (i, &t) in firsts.iter().enumerate() {
+        if t != rt[i][0] {
+            println!("seq {i}: prefill pick {t} != {}", rt[i][0]);
+            ok = false;
+        }
+    }
+    // ASTRAL_CHECK_BATCH_SLOTS=i: row i of the first batched step vs its single-sequence step.
+    if let Some(ci) = std::env::var("ASTRAL_CHECK_BATCH_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let ci = ci.min(n - 1);
+        s.reset()?;
+        s.prefill(&prompts[ci])?;
+        let taps = std::env::var_os("ASTRAL_CHECK_TAPS").is_some();
+        s.capture = true;
+        s.set_debug(taps);
+        s.step(rt[ci][0])?;
+        let ta = s.take_debug();
+        s.set_debug(false);
+        let a = std::mem::take(&mut s.captured);
+        for (i, p) in prompts.iter().enumerate() {
+            s.reset_seq(i)?;
+            s.prefill_seq(i, 0, p)?;
+        }
+        s.set_debug(taps);
+        let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: prompts[i].len() as u32, token: rt[i][0] }).collect();
+        s.decode_batch(&rows)?;
+        s.capture = false;
+        let tb = s.take_debug();
+        s.set_debug(false);
+        for ((na, va), (_, vb)) in ta.iter().zip(tb.iter()) {
+            let m = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("tap {na}: max |diff| {m:.3e}");
+        }
+        let d = a[0].1.len();
+        for ((sa, va), (_, vb)) in a.iter().zip(s.captured.iter()) {
+            let r = &vb[ci * d..(ci + 1) * d];
+            let m = va.iter().zip(r).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("slot {sa:2}: row {ci} max |diff| {m:.3e}");
+        }
+        return Ok(true);
+    }
+    let vocab = rl[0][0].len();
+    for k in 0..steps - 1 {
+        let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: (prompts[i].len() + k) as u32, token: rt[i][k] }).collect();
+        let next = s.decode_batch(&rows)?;
+        let lg = s.batch_logits(n)?;
+        let (mut maxd, mut picks) = (0.0f32, 0usize);
+        for i in 0..n {
+            let row = &lg[i * vocab..(i + 1) * vocab];
+            let r = &rl[i][k + 1];
+            let rd = row.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            if rd > 0.0 && std::env::var_os("ASTRAL_CHECK_ROWS").is_some() {
+                println!("  row {i} (prompt {} tokens): {rd:.3e}", prompts[i].len());
+            }
+            maxd = maxd.max(rd);
+            if next[i] != rt[i][k + 1] || argmax(row) != next[i] {
+                picks += 1;
+            }
+        }
+        println!("step {k:3}: max |logit diff| {maxd:.3e}, {picks} / {n} picks differ");
+        ok &= picks == 0 && maxd == 0.0;
+    }
+    // Timing: one batched step at this batch size.
+    let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: (prompts[i].len() + steps) as u32, token: 1000 }).collect();
+    s.decode_batch(&rows)?;
+    if std::env::var_os("ASTRAL_PROFILE").is_some() {
+        astral_gpu::profiler(true)?;
+        s.decode_batch(&rows)?;
+        astral_gpu::profiler(false)?;
+        return Ok(ok);
+    }
+    let reps = 20;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        s.decode_batch(&rows)?;
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    println!("batch {n}: {ms:.2} ms per step, {:.0} tok/s", n as f64 * 1e3 / ms);
+    let long: Vec<u32> = (0..512).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
+    s.reset_seq(0)?;
+    s.prefill_seq(0, 0, &long)?;
+    if std::env::var_os("ASTRAL_PROFILE_PREFILL").is_some() {
+        s.reset_seq(0)?;
+        astral_gpu::profiler(true)?;
+        s.prefill_seq(0, 0, &long)?;
+        astral_gpu::profiler(false)?;
+        return Ok(ok);
+    }
+    let t0 = std::time::Instant::now();
+    s.reset_seq(0)?;
+    s.prefill_seq(0, 0, &long)?;
+    println!("prefill 512 tokens: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    if n >= 4 {
+        let k = n.min(16);
+        for i in 0..k {
+            s.reset_seq(i)?;
+        }
+        let jobs: Vec<(usize, &[u32])> = (0..k).map(|i| (i, long.as_slice())).collect();
+        let t0 = std::time::Instant::now();
+        let prof = std::env::var_os("ASTRAL_PROFILE_PACKED").is_some();
+        if prof {
+            astral_gpu::profiler(true)?;
+        }
+        s.prefill_many(&jobs)?;
+        if prof {
+            astral_gpu::profiler(false)?;
+        }
+        println!("prefill {k} x 512 tokens packed: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(ok)
 }
 
 /// Max |a - b| over the printed first/last three values of each row.
@@ -374,13 +609,14 @@ fn cmd_cmp_prefill(path: &str, ids: &[String]) -> Result<bool> {
 }
 
 /// `serve <model> [--checkpoint <dir>] [--no-draft] [--k N] [--host H] [--port P] [--ctx N]
-/// [--name S] [--queue N]`: the OpenAI-compatible server. `<model>` is a `.gguf` file or a
+/// [--name S] [--queue N] [--max-seqs N]`: the OpenAI-compatible server. `<model>` is a `.gguf` file or a
 /// safetensors checkpoint directory. The checkpoint directory provides the tokenizer and the
 /// DSpark draft (used unless `--no-draft`); it defaults to `<model>` when that is a directory.
 fn cmd_serve(a: &[String]) -> Result<bool> {
     let bad = |m: String| astral_core::AstralError::Invalid(m);
     let gguf = a.first().ok_or_else(|| bad("serve: missing model (a .gguf file or a checkpoint directory)".into()))?.clone();
     let (mut ckpt, mut draft, mut k, mut host, mut port, mut ctx, mut name, mut queue) = (None::<String>, true, 6usize, "0.0.0.0".to_string(), 8000u16, 8192u32, "inkling-2-mini".to_string(), 64usize);
+    let mut max_seqs = 0usize;
     let mut i = 1;
     while i < a.len() {
         let val = |i: usize| a.get(i + 1).cloned().ok_or_else(|| bad(format!("serve: {} needs a value", a[i])));
@@ -414,13 +650,17 @@ fn cmd_serve(a: &[String]) -> Result<bool> {
                 queue = val(i)?.parse().map_err(|_| bad("serve: --queue must be a number".into()))?;
                 i += 1;
             }
+            "--max-seqs" => {
+                max_seqs = val(i)?.parse().map_err(|_| bad("serve: --max-seqs must be a number".into()))?;
+                i += 1;
+            }
             o => return Err(bad(format!("serve: unknown option {o}"))),
         }
         i += 1;
     }
     let ckpt = ckpt.or_else(|| std::path::Path::new(&gguf).is_dir().then(|| gguf.clone()));
     let ckpt = std::path::PathBuf::from(ckpt.ok_or_else(|| bad("serve: --checkpoint <dir> (tokenizer and draft) is required with a .gguf model".into()))?);
-    let engine = astral_api::engine::EngineConfig { gguf: gguf.into(), draft: draft.then(|| ckpt.clone()), k, ctx, queue };
+    let engine = astral_api::engine::EngineConfig { gguf: gguf.into(), draft: draft.then(|| ckpt.clone()), k, ctx, queue, max_seqs };
     astral_api::serve(astral_api::ServerConfig { engine, tokenizer_dir: ckpt, host, port, model_name: name })?;
     Ok(true)
 }

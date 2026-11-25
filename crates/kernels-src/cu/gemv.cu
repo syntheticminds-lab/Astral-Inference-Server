@@ -437,7 +437,12 @@ __device__ __forceinline__ void mma_s8_16832(int (&c)[4], const unsigned (&a)[4]
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
 }
 
-extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT();
+// NT tiles of 8 tokens (T <= 8 * NT): every weight fragment is loaded once and multiplied
+// with each tile. A token's arithmetic (the K split, the order of the k-steps, the scaling and
+// the final reduction) does not depend on NT, T or its tile, so results are the same for any
+// batch size. U = k-steps of loads in flight (does not change the arithmetic).
+template <unsigned NT, unsigned U>
+__device__ __forceinline__ void q8_multi_mma(const MultiQ8& m, unsigned K, unsigned T) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const unsigned bx = blockIdx.x;
     unsigned i = 0;
@@ -450,18 +455,28 @@ extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma(Mul
     const unsigned char* w1 = m.qs[i] + (u64)r1 * K + tg * 4u;
     const u16* s0 = reinterpret_cast<const u16*>(m.aux[i]) + (u64)r0 * KB;
     const u16* s1 = reinterpret_cast<const u16*>(m.aux[i]) + (u64)r1 * KB;
-    const bool tok_ok = g < T;
-    const signed char* xb = m.xq[i] + (u64)min(g, T - 1u) * K + tg * 4u;
-    const unsigned t0 = tg * 2u, t1 = tg * 2u + 1u;
-    const float* xd0 = m.xd[i] + (u64)min(t0, T - 1u) * KB;
-    const float* xd1 = m.xd[i] + (u64)min(t1, T - 1u) * KB;
-    const bool ok0 = t0 < T, ok1 = t1 < T;
+    const unsigned tiles = min((T + 7u) >> 3, NT);
+    const signed char* xb[NT];
+    const float* xd0[NT];
+    const float* xd1[NT];
+    bool tok_ok[NT], ok0[NT], ok1[NT];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        const unsigned col = 8u * j + g, t0 = 8u * j + tg * 2u, t1 = t0 + 1u;
+        tok_ok[j] = col < T;
+        xb[j] = m.xq[i] + (u64)min(col, T - 1u) * K + tg * 4u;
+        xd0[j] = m.xd[i] + (u64)min(t0, T - 1u) * KB;
+        xd1[j] = m.xd[i] + (u64)min(t1, T - 1u) * KB;
+        ok0[j] = t0 < T;
+        ok1[j] = t1 < T;
+    }
     const unsigned kb0 = warp * KB / 4u, kb1 = (warp + 1u) * KB / 4u;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    constexpr unsigned U = 4;
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
     for (unsigned kb = kb0; kb < kb1; kb += U) {
-        unsigned a[U][4], b[U][2];
-        float ws0[U], ws1[U], xs0[U], xs1[U];
+        unsigned a[U][4], b[U][NT][2];
+        float ws0[U], ws1[U], xs0[U][NT], xs1[U][NT];
 #pragma unroll
         for (unsigned u = 0; u < U; ++u) {
             const unsigned k = min(kb + u, kb1 - 1u);
@@ -470,41 +485,141 @@ extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma(Mul
             a[u][1] = __ldg(reinterpret_cast<const unsigned*>(w1 + off));
             a[u][2] = __ldg(reinterpret_cast<const unsigned*>(w0 + off + 16u));
             a[u][3] = __ldg(reinterpret_cast<const unsigned*>(w1 + off + 16u));
-            b[u][0] = tok_ok ? __ldg(reinterpret_cast<const unsigned*>(xb + off)) : 0u;
-            b[u][1] = tok_ok ? __ldg(reinterpret_cast<const unsigned*>(xb + off + 16u)) : 0u;
             ws0[u] = __half2float(__ushort_as_half(__ldg(s0 + k)));
             ws1[u] = __half2float(__ushort_as_half(__ldg(s1 + k)));
-            xs0[u] = ok0 ? __ldg(xd0 + k) : 0.0f;
-            xs1[u] = ok1 ? __ldg(xd1 + k) : 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j) {
+                if (j < tiles) {
+                    b[u][j][0] = tok_ok[j] ? __ldg(reinterpret_cast<const unsigned*>(xb[j] + off)) : 0u;
+                    b[u][j][1] = tok_ok[j] ? __ldg(reinterpret_cast<const unsigned*>(xb[j] + off + 16u)) : 0u;
+                    xs0[u][j] = ok0[j] ? __ldg(xd0[j] + k) : 0.0f;
+                    xs1[u][j] = ok1[j] ? __ldg(xd1[j] + k) : 0.0f;
+                }
+            }
         }
 #pragma unroll
         for (unsigned u = 0; u < U; ++u) {
             if (kb + u < kb1) {
-                int c[4];
-                mma_s8_16832(c, a[u], b[u][0], b[u][1]);
-                acc[0] = fmaf((float)c[0], ws0[u] * xs0[u], acc[0]);
-                acc[1] = fmaf((float)c[1], ws0[u] * xs1[u], acc[1]);
-                acc[2] = fmaf((float)c[2], ws1[u] * xs0[u], acc[2]);
-                acc[3] = fmaf((float)c[3], ws1[u] * xs1[u], acc[3]);
+#pragma unroll
+                for (unsigned j = 0; j < NT; ++j) {
+                    if (j < tiles) {
+                        int c[4];
+                        mma_s8_16832(c, a[u], b[u][j][0], b[u][j][1]);
+                        acc[j][0] = fmaf((float)c[0], ws0[u] * xs0[u][j], acc[j][0]);
+                        acc[j][1] = fmaf((float)c[1], ws0[u] * xs1[u][j], acc[j][1]);
+                        acc[j][2] = fmaf((float)c[2], ws1[u] * xs0[u][j], acc[j][2]);
+                        acc[j][3] = fmaf((float)c[3], ws1[u] * xs1[u][j], acc[j][3]);
+                    }
+                }
             }
         }
     }
-    __shared__ float red[4][32][4];
+    __shared__ float red[4][32][4 * NT];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) red[warp][lane][e] = acc[e];
+    for (unsigned j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) red[warp][lane][4 * j + e] = acc[j][e];
     __syncthreads();
     if (warp == 0) {
-#pragma unroll
-        for (int e = 0; e < 4; ++e) acc[e] = red[0][lane][e] + red[1][lane][e] + red[2][lane][e] + red[3][lane][e];
         const unsigned ra = row0 + g, rb = row0 + g + 8u;
         float* y = m.y[i];
-        if (ra < N && ok0) y[(u64)t0 * N + ra] = acc[0];
-        if (ra < N && ok1) y[(u64)t1 * N + ra] = acc[1];
-        if (rb < N && ok0) y[(u64)t0 * N + rb] = acc[2];
-        if (rb < N && ok1) y[(u64)t1 * N + rb] = acc[3];
+#pragma unroll
+        for (unsigned j = 0; j < NT; ++j) {
+            if (j >= tiles) continue;
+            float v[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) v[e] = red[0][lane][4 * j + e] + red[1][lane][4 * j + e] + red[2][lane][4 * j + e] + red[3][lane][4 * j + e];
+            const unsigned t0 = 8u * j + tg * 2u, t1 = t0 + 1u;
+            if (ra < N && ok0[j]) y[(u64)t0 * N + ra] = v[0];
+            if (ra < N && ok1[j]) y[(u64)t1 * N + ra] = v[1];
+            if (rb < N && ok0[j]) y[(u64)t0 * N + rb] = v[2];
+            if (rb < N && ok1[j]) y[(u64)t1 * N + rb] = v[3];
+        }
     }
 #endif
 }
+
+extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_multi_mma<1, 4>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma_n2(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_multi_mma<2, 4>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma_n4(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_multi_mma<4, 2>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(128) astral_gemv_q8_0_multi_mma_n8(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_multi_mma<8, 2>(m, K, T); }
+
+// q8_multi_t with a runtime token count <= T (rows t >= count are neither read nor written):
+// the same per-token arithmetic as the single-token q_dot, for batched decode.
+template <unsigned T>
+__device__ __forceinline__ void q8_rows_t(const MultiQ8& m, unsigned K, unsigned count) {
+    // A warp computes R weight rows at once (each activation load serves R rows); per row the
+    // lane's units, their order and the reduction are those of q_dot<2, 32, 4>.
+    constexpr unsigned G = 32u, U = 2u, R = 4u;
+    const unsigned warp = threadIdx.x >> 5, sub = threadIdx.x & 31u;
+    const unsigned N = m.n[0];
+    const unsigned n0 = (blockIdx.x * (blockDim.x >> 5) + warp) * R;
+    if (n0 >= N) return;
+    const unsigned units = K >> 4;
+    const uint4* w[R];
+    const u16* wd[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) {
+        const unsigned n = min(n0 + r, N - 1u);
+        w[r] = reinterpret_cast<const uint4*>(m.qs[0] + (u64)n * K);
+        wd[r] = reinterpret_cast<const u16*>(m.aux[0] + (u64)n * (K >> 5) * 2u);
+    }
+    const uint4* xv = reinterpret_cast<const uint4*>(m.xq[0]);
+    const float* xd = m.xd[0];
+    float acc[R][T];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
+#pragma unroll
+        for (unsigned t = 0; t < T; ++t) acc[r][t] = 0.0f;
+    for (unsigned base = 0; base < units; base += G * U) {
+        uint4 wv[U][R];
+        float dw[U][R];
+#pragma unroll
+        for (unsigned j = 0; j < U; ++j) {
+            const unsigned u = base + sub + G * j;
+            if (u < units) {
+#pragma unroll
+                for (unsigned r = 0; r < R; ++r) {
+                    wv[j][r] = __ldg(w[r] + u);
+                    dw[j][r] = __half2float(__ushort_as_half(__ldg(wd[r] + (u >> 1))));
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < U; ++j) {
+            const unsigned u = base + sub + G * j;
+            if (u < units) {
+#pragma unroll
+                for (unsigned t = 0; t < T; ++t) {
+                    if (t < count) {
+                        const uint4 a = __ldg(xv + (u64)t * units + u);
+                        const float xs = __ldg(xd + (u64)t * (K >> 5) + (u >> 1));
+#pragma unroll
+                        for (unsigned r = 0; r < R; ++r) {
+                            int sum = __dp4a((int)wv[j][r].x, (int)a.x, 0);
+                            sum = __dp4a((int)wv[j][r].y, (int)a.y, sum);
+                            sum = __dp4a((int)wv[j][r].z, (int)a.z, sum);
+                            sum = __dp4a((int)wv[j][r].w, (int)a.w, sum);
+                            acc[r][t] = fmaf((float)sum, dw[j][r] * xs, acc[r][t]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) {
+#pragma unroll
+        for (unsigned t = 0; t < T; ++t) {
+            float a = acc[r][t];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (sub == t && t < count && n0 + r < N) m.y[0][(u64)t * N + n0 + r] = a;
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_rows_t16(MultiQ8 m, unsigned K, unsigned count) { PDL_WAIT(); q8_rows_t<16>(m, K, count); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_rows_t32(MultiQ8 m, unsigned K, unsigned count) { PDL_WAIT(); q8_rows_t<32>(m, K, count); }
 
 #define Q8_MULTI_T_ENTRY(T) \
     extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_multi_t##T(MultiQ8 m, unsigned K) { PDL_WAIT(); q8_multi_t<T>(m, K); }
@@ -2035,3 +2150,545 @@ __device__ __forceinline__ void gemv_mx4_split(const u8* __restrict__ qs, const 
     }
 GEMV_MX4_SPLIT_ENTRY(astral_gemv_mx4_w2, 2)
 GEMV_MX4_SPLIT_ENTRY(astral_gemv_mx4_w4, 4)
+
+// =============================================================================================
+// Grouped NVFP4 GEMV for batched decode: work item i (a QItem: matrix e, up to NB activation
+// rows xi[], output rows yi[]) multiplies every weight row of matrix e once with each of the
+// item's activation rows. The arithmetic per (row, activation) is exactly that of
+// astral_gemv_nvfp4_s1 (32 lanes per row, U = 6 loads in flight, the same multiply-add order
+// and reduction), so a token's result does not depend on how many tokens share the launch.
+// Activations are staged in shared memory (NB rows of K int8 + K/32 scales).
+// grid = (ceil(N / 64), n_items), 256 threads, NB * (K + K / 8) bytes of shared memory.
+// Staged activations per column: the first 16 bytes of every 32-value unit, then the second
+// 16 bytes, then the K / 32 scales (lanes of a warp read consecutive 16-byte words).
+template <unsigned C>
+__device__ __forceinline__ void fp4_items_rows(const u8* __restrict__ qs, const u8* __restrict__ aux, const uint4* __restrict__ sx,
+                                               unsigned rs, float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux,
+                                               const QItem& it, unsigned y_rows, const float* __restrict__ mat_scale, unsigned e) {
+    constexpr unsigned G = 32u, U = 3u, R = 2u;
+    const unsigned warp = threadIdx.x >> 5, sub = threadIdx.x & 31u;
+    const unsigned units = K >> 5;
+    for (unsigned rr = 0; rr < 8u; rr += R) {
+        const unsigned n0 = blockIdx.x * 64u + warp * 8u + rr;
+        if (n0 >= N) break;
+        const u8* w[R];
+        const u8* wd[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            const unsigned n = min(n0 + r, N - 1u);
+            w[r] = qs + e * mat_qs + (u64)n * (K >> 1);
+            wd[r] = aux + e * mat_aux + (u64)n * (K >> 4);
+        }
+        float acc[R][C];
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r)
+#pragma unroll
+            for (unsigned t = 0; t < C; ++t) acc[r][t] = 0.0f;
+        for (unsigned base = 0; base < units; base += G * U) {
+            uint4 wv[U][R];
+            unsigned sc[U][R];
+#pragma unroll
+            for (unsigned i = 0; i < U; ++i) {
+                const unsigned u = base + sub + G * i;
+                if (u < units) {
+#pragma unroll
+                    for (unsigned r = 0; r < R; ++r) {
+                        wv[i][r] = ld_stream16(w[r] + (u64)u * 16u);
+                        sc[i][r] = ld_stream_u16(wd[r] + (u64)u * 2u);
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < U; ++i) {
+                const unsigned u = base + sub + G * i;
+                if (u < units) {
+                    int2 a0[R], a1[R], b0[R], b1[R];
+                    float2 d2[R];
+#pragma unroll
+                    for (unsigned r = 0; r < R; ++r) {
+                        a0[r] = table16((int)wv[i][r].x, k_e2m1x2);
+                        a1[r] = table16((int)wv[i][r].y, k_e2m1x2);
+                        b0[r] = table16((int)wv[i][r].z, k_e2m1x2);
+                        b1[r] = table16((int)wv[i][r].w, k_e2m1x2);
+                        d2[r] = __half22float2(__halves2half2(__ushort_as_half((unsigned short)((sc[i][r] & 0xffu) << 7)),
+                                                              __ushort_as_half((unsigned short)((sc[i][r] >> 8) << 7))));
+                    }
+#pragma unroll
+                    for (unsigned t = 0; t < C; ++t) {
+                        const uint4* sq = sx + (u64)t * rs;
+                        const uint4 x0 = sq[u], x1 = sq[units + u];
+                        const float xs = reinterpret_cast<const float*>(sq + 2u * units)[u];
+#pragma unroll
+                        for (unsigned r = 0; r < R; ++r) {
+                            int s0 = __dp4a(a0[r].x, (int)x0.x, 0);
+                            s0 = __dp4a(a1[r].x, (int)x0.y, s0);
+                            s0 = __dp4a(a0[r].y, (int)x0.z, s0);
+                            s0 = __dp4a(a1[r].y, (int)x0.w, s0);
+                            int s1 = __dp4a(b0[r].x, (int)x1.x, 0);
+                            s1 = __dp4a(b1[r].x, (int)x1.y, s1);
+                            s1 = __dp4a(b0[r].y, (int)x1.z, s1);
+                            s1 = __dp4a(b1[r].y, (int)x1.w, s1);
+                            acc[r][t] = fmaf(fmaf((float)s0, d2[r].x, (float)s1 * d2[r].y), xs, acc[r][t]);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            const unsigned n = n0 + r;
+#pragma unroll
+            for (unsigned t = 0; t < C; ++t) {
+                float a = acc[r][t] * 128.0f;
+#pragma unroll
+                for (unsigned o = G / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (sub == 0 && n < N) y[(u64)min(it.yi[t], y_rows - 1u) * N + n] = mat_scale ? a * mat_scale[e] : a;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_nvfp4_items_s1(
+    const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq, const float* __restrict__ xd,
+    float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux, const QItem* __restrict__ items, unsigned x_rows,
+    unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT();
+    // A warp computes 2 rows at once, so each staged activation load serves both. Per row the
+    // lane's units and their order are those of astral_gemv_nvfp4_s1 (U only groups loads);
+    // the body is specialised on the item's token count (no predicated-off iterations).
+    const QItem it = items[blockIdx.y];
+    const unsigned cnt = min(it.n, (unsigned)NB);
+    if (cnt == 0u) return;
+    extern __shared__ uint4 smem4[];
+    const unsigned units = K >> 5;
+    const unsigned rs = 2u * units + (units + 3u) / 4u;   // uint4 per staged column
+    for (unsigned t = 0; t < cnt; ++t) {
+        const unsigned xr = min(it.xi[t], x_rows - 1u);
+        uint4* sq = smem4 + (u64)t * rs;
+        const uint4* gq = reinterpret_cast<const uint4*>(xq + (u64)xr * K);
+        for (unsigned i = threadIdx.x; i < 2u * units; i += blockDim.x) sq[(i & 1u) * units + (i >> 1)] = __ldg(gq + i);
+        float* sd = reinterpret_cast<float*>(sq + 2u * units);
+        const float* gd = xd + (u64)xr * units;
+        for (unsigned i = threadIdx.x; i < units; i += blockDim.x) sd[i] = __ldg(gd + i);
+    }
+    __syncthreads();
+    const unsigned e = min(it.e, n_mats - 1u);
+    switch (cnt) {
+        case 1: fp4_items_rows<1>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 2: fp4_items_rows<2>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 3: fp4_items_rows<3>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 4: fp4_items_rows<4>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 5: fp4_items_rows<5>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 6: fp4_items_rows<6>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        case 7: fp4_items_rows<7>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+        default: fp4_items_rows<8>(qs, aux, smem4, rs, y, N, K, mat_qs, mat_aux, it, y_rows, mat_scale, e); break;
+    }
+}
+
+// The Q8_0 form of astral_gemv_nvfp4_items_s1: each (row, activation) exactly as
+// astral_gemv_q8_0_dp4a computes it (32 lanes per row, U = 4, same multiply-add order and
+// reduction); activation rows are read from global memory (as the multi-token kernels do).
+// grid = (ceil(N / 64), n_items), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_items_x(
+    const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq, const float* __restrict__ xd,
+    float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux, const QItem* __restrict__ items, unsigned x_rows,
+    unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT();
+    constexpr unsigned G = 32u, U = QShape<2>::U;
+    const QItem it = items[blockIdx.y];
+    const unsigned cnt = min(it.n, (unsigned)NB);
+    if (cnt == 0u) return;
+    const unsigned warp = threadIdx.x >> 5, sub = threadIdx.x & 31u;
+    const unsigned e = min(it.e, n_mats - 1u), units = K >> 4;
+    for (unsigned rr = 0; rr < 64u; rr += blockDim.x >> 5) {
+    const unsigned n = blockIdx.x * 64u + rr + warp;
+    if (n >= N) break;
+    const uint4* w = reinterpret_cast<const uint4*>(qs + e * mat_qs + (u64)n * K);
+    const u16* wd = reinterpret_cast<const u16*>(aux + e * mat_aux + (u64)n * (K >> 5) * 2u);
+    unsigned xr[NB];
+#pragma unroll
+    for (unsigned t = 0; t < NB; ++t) xr[t] = min(t < cnt ? it.xi[t] : 0u, x_rows - 1u);
+    float acc[NB];
+#pragma unroll
+    for (unsigned t = 0; t < NB; ++t) acc[t] = 0.0f;
+    for (unsigned base = 0; base < units; base += G * U) {
+        uint4 wv[U];
+#pragma unroll
+        for (unsigned i = 0; i < U; ++i) {
+            const unsigned u = base + sub + G * i;
+            if (u < units) wv[i] = __ldg(w + u);
+        }
+#pragma unroll
+        for (unsigned i = 0; i < U; ++i) {
+            const unsigned u = base + sub + G * i;
+            if (u < units) {
+                const float dw = __half2float(__ushort_as_half(__ldg(wd + (u >> 1))));
+#pragma unroll
+                for (unsigned t = 0; t < NB; ++t) {
+                    if (t < cnt) {
+                        const uint4 a = __ldg(reinterpret_cast<const uint4*>(xq + (u64)xr[t] * K) + u);
+                        int sum = __dp4a((int)wv[i].x, (int)a.x, 0);
+                        sum = __dp4a((int)wv[i].y, (int)a.y, sum);
+                        sum = __dp4a((int)wv[i].z, (int)a.z, sum);
+                        sum = __dp4a((int)wv[i].w, (int)a.w, sum);
+                        acc[t] = fmaf((float)sum, dw * __ldg(xd + (u64)xr[t] * (K >> 5) + (u >> 1)), acc[t]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned t = 0; t < NB; ++t) {
+        float a = acc[t];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (t < cnt && sub == 0) y[(u64)min(it.yi[t], y_rows - 1u) * N + n] = mat_scale ? a * mat_scale[e] : a;
+    }
+    }
+}
+
+// =============================================================================================
+// Grouped decode GEMV on int8 tensor cores, for MoE experts (Q8_0 or NVFP4 weights, int8
+// activations). Block = 16 weight rows of one matrix x up to 8 * NT columns; 4 warps split K
+// four ways, as astral_gemv_q8_0_multi_mma does. Columns come from either
+//   ids mode   (ids != 0): blockIdx.y = slot s, matrix ids[s], one column: activation row
+//              (x_shared ? 0 : s), output row s (one token's experts, as launch_q with ids)
+//   items mode (ids == 0): item blockIdx.y = (matrix e, start, count) over xidx / yidx (the
+//              MmaWork lists of astral_ink_moe_group).
+// A column's arithmetic (K split, k-step order, scaling, reduction) is the same whatever the
+// other columns are, so a token's result does not depend on the batch.
+//   Q8_0:  m16n8k32 per 32-value block (one weight scale per k-step).
+//   NVFP4: m16n8k16 per 16-value block (one UE4M3 scale per k-step); thread tg of a k-step
+//          holds values 4 tg .. 4 tg + 3 (the low / high nibbles of word tg & 1 of the block).
+__device__ __forceinline__ void mma_s8_16816(int (&c)[4], unsigned a0, unsigned a1, unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+
+template <int WT, unsigned NT, unsigned U>
+__device__ __forceinline__ void gmma_q(const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq,
+                                       const float* __restrict__ xd, float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs,
+                                       u64 mat_aux, const int* __restrict__ ids, unsigned x_shared, const unsigned* __restrict__ items,
+                                       const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned x_rows,
+                                       unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    unsigned e, cnt, st = 0;
+    if (ids) {
+        e = min((unsigned)max(ids[blockIdx.y], 0), n_mats - 1u);
+        cnt = 1u;
+    } else {
+        const unsigned* it = items + 3u * blockIdx.y;
+        e = min(it[0], n_mats - 1u);
+        st = it[1];
+        cnt = min(it[2], 8u * NT);
+    }
+    if (cnt == 0u) return;
+    auto xrow = [&](unsigned c) -> unsigned { return ids ? (x_shared ? 0u : blockIdx.y) : min(xidx[st + c], x_rows - 1u); };
+    auto yrow = [&](unsigned c) -> unsigned { return ids ? blockIdx.y : min(yidx[st + c], y_rows - 1u); };
+    const unsigned row0 = blockIdx.x * 16u;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, tg = lane & 3u;
+    const unsigned r0 = min(row0 + g, N - 1u), r1 = min(row0 + g + 8u, N - 1u);
+    const unsigned tiles = (cnt + 7u) >> 3;
+    const unsigned KX = K >> 5;                        // activation scale blocks per row
+    const unsigned KS = WT == 2 ? K >> 5 : K >> 4;     // k-steps
+    const signed char* xb[NT];
+    const float* xd0[NT];
+    const float* xd1[NT];
+    bool tok_ok[NT], ok0[NT], ok1[NT];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        const unsigned col = 8u * j + g, t0 = 8u * j + tg * 2u, t1 = t0 + 1u;
+        tok_ok[j] = col < cnt;
+        ok0[j] = t0 < cnt;
+        ok1[j] = t1 < cnt;
+        xb[j] = xq + (u64)xrow(min(col, cnt - 1u)) * K + tg * 4u;
+        xd0[j] = xd + (u64)xrow(min(t0, cnt - 1u)) * KX;
+        xd1[j] = xd + (u64)xrow(min(t1, cnt - 1u)) * KX;
+    }
+    const u64 rq = WT == 2 ? (u64)K : (u64)(K >> 1), ra = WT == 2 ? (u64)(K >> 5) * 2u : (u64)(K >> 4);
+    const u8* wr0 = qs + e * mat_qs + (u64)r0 * rq;
+    const u8* wr1 = qs + e * mat_qs + (u64)r1 * rq;
+    const u8* ar0 = aux + e * mat_aux + (u64)r0 * ra;
+    const u8* ar1 = aux + e * mat_aux + (u64)r1 * ra;
+    const unsigned kb0 = warp * KS / 4u, kb1 = (warp + 1u) * KS / 4u;
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    for (unsigned kb = kb0; kb < kb1; kb += U) {
+        unsigned a[U][4], b[U][NT][2];
+        float ws0[U], ws1[U], xs0[U][NT], xs1[U][NT];
+#pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            const unsigned k = min(kb + u, kb1 - 1u);
+            if constexpr (WT == 2) {
+                const unsigned off = k * 32u + tg * 4u;
+                a[u][0] = __ldg(reinterpret_cast<const unsigned*>(wr0 + off));
+                a[u][1] = __ldg(reinterpret_cast<const unsigned*>(wr1 + off));
+                a[u][2] = __ldg(reinterpret_cast<const unsigned*>(wr0 + off + 16u));
+                a[u][3] = __ldg(reinterpret_cast<const unsigned*>(wr1 + off + 16u));
+                ws0[u] = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const u16*>(ar0) + k)));
+                ws1[u] = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const u16*>(ar1) + k)));
+            } else {
+                // 16-value block k: 8 bytes; word (tg & 1) holds this thread's values in its low
+                // (tg < 2) or high nibbles.
+                const unsigned off = k * 8u + (tg & 1u) * 4u;
+                const int2 d0 = table16((int)__ldg(reinterpret_cast<const unsigned*>(wr0 + off)), k_e2m1x2);
+                const int2 d1 = table16((int)__ldg(reinterpret_cast<const unsigned*>(wr1 + off)), k_e2m1x2);
+                a[u][0] = (unsigned)(tg < 2u ? d0.x : d0.y);
+                a[u][1] = (unsigned)(tg < 2u ? d1.x : d1.y);
+                // Canonical UE4M3: bits x << 7 as f16 are value * 2^-8 (the 2^8 and ggml's 0.5 are
+                // applied once at the end).
+                ws0[u] = __half2float(__ushort_as_half((unsigned short)((unsigned)__ldg(ar0 + k) << 7)));
+                ws1[u] = __half2float(__ushort_as_half((unsigned short)((unsigned)__ldg(ar1 + k) << 7)));
+            }
+            const unsigned xoff = WT == 2 ? k * 32u : k * 16u;
+            const unsigned xsb = WT == 2 ? k : k >> 1;
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j) {
+                if (j < tiles) {
+                    b[u][j][0] = tok_ok[j] ? __ldg(reinterpret_cast<const unsigned*>(xb[j] + xoff)) : 0u;
+                    if constexpr (WT == 2) b[u][j][1] = tok_ok[j] ? __ldg(reinterpret_cast<const unsigned*>(xb[j] + xoff + 16u)) : 0u;
+                    xs0[u][j] = ok0[j] ? __ldg(xd0[j] + xsb) : 0.0f;
+                    xs1[u][j] = ok1[j] ? __ldg(xd1[j] + xsb) : 0.0f;
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            if (kb + u < kb1) {
+#pragma unroll
+                for (unsigned j = 0; j < NT; ++j) {
+                    if (j < tiles) {
+                        int c[4];
+                        if constexpr (WT == 2) {
+                            mma_s8_16832(c, a[u], b[u][j][0], b[u][j][1]);
+                        } else {
+                            mma_s8_16816(c, a[u][0], a[u][1], b[u][j][0]);
+                        }
+                        acc[j][0] = fmaf((float)c[0], ws0[u] * xs0[u][j], acc[j][0]);
+                        acc[j][1] = fmaf((float)c[1], ws0[u] * xs1[u][j], acc[j][1]);
+                        acc[j][2] = fmaf((float)c[2], ws1[u] * xs0[u][j], acc[j][2]);
+                        acc[j][3] = fmaf((float)c[3], ws1[u] * xs1[u][j], acc[j][3]);
+                    }
+                }
+            }
+        }
+    }
+    __shared__ float red[4][32][4 * NT];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) red[warp][lane][4 * j + q] = acc[j][q];
+    __syncthreads();
+    if (warp == 0) {
+        const float post = (WT == 2 ? 1.0f : 128.0f) * (mat_scale ? mat_scale[e] : 1.0f);
+        const unsigned ra_ = row0 + g, rb_ = row0 + g + 8u;
+#pragma unroll
+        for (unsigned j = 0; j < NT; ++j) {
+            if (j >= tiles) continue;
+            float v[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) v[q] = (red[0][lane][4 * j + q] + red[1][lane][4 * j + q] + red[2][lane][4 * j + q] + red[3][lane][4 * j + q]) * post;
+            const unsigned t0 = 8u * j + tg * 2u, t1 = t0 + 1u;
+            if (ra_ < N && ok0[j]) y[(u64)yrow(t0) * N + ra_] = v[0];
+            if (ra_ < N && ok1[j]) y[(u64)yrow(t1) * N + ra_] = v[1];
+            if (rb_ < N && ok0[j]) y[(u64)yrow(t0) * N + rb_] = v[2];
+            if (rb_ < N && ok1[j]) y[(u64)yrow(t1) * N + rb_] = v[3];
+        }
+    }
+#endif
+}
+
+#define GMMA_ENTRY(NAME, WT, NT, U)                                                                                 \
+    extern "C" __global__ void __launch_bounds__(128) NAME(                                                         \
+        const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq,                  \
+        const float* __restrict__ xd, float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux,       \
+        const int* __restrict__ ids, unsigned x_shared, const unsigned* __restrict__ items,                         \
+        const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned x_rows, unsigned y_rows,     \
+        const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT();                                         \
+        gmma_q<WT, NT, U>(qs, aux, xq, xd, y, N, K, mat_qs, mat_aux, ids, x_shared, items, xidx, yidx, x_rows,      \
+                          y_rows, mat_scale, n_mats);                                                               \
+    }
+GMMA_ENTRY(astral_gmma_q8_0_n1, 2, 1, 4)
+GMMA_ENTRY(astral_gmma_q8_0_n2, 2, 2, 4)
+GMMA_ENTRY(astral_gmma_q8_0_n4, 2, 4, 2)
+GMMA_ENTRY(astral_gmma_q8_0_n8, 2, 8, 2)
+GMMA_ENTRY(astral_gmma_nvfp4_n1, 3, 1, 8)
+GMMA_ENTRY(astral_gmma_nvfp4_n2, 3, 2, 8)
+GMMA_ENTRY(astral_gmma_nvfp4_n4, 3, 4, 4)
+GMMA_ENTRY(astral_gmma_nvfp4_n8, 3, 8, 2)
+
+// =============================================================================================
+// Small-batch decode form of gemm_mma2 (the int8 path): the same work items and, for every
+// output, exactly the same arithmetic (K in ascending scale blocks, acc = fma(c, d_w * d_x,
+// acc), one final scale), so a token gets the same result here as in a large batch on
+// gemm_mma2. No shared memory: a warp owns 16 weight rows over the whole K; each lane loads
+// 16 bytes per row per chunk of K and the mma fragments are gathered with warp shuffles.
+// Up to 8 * NT tokens per item. grid = (N / 64, n_items), 128 threads; N % 64 == 0,
+// K % 128 == 0.
+template <int WT, unsigned NT, unsigned U>
+__device__ __forceinline__ void gemm_mma_dec(const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq,
+                                             const float* __restrict__ xd, float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs,
+                                             u64 mat_aux, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx,
+                                             const unsigned* __restrict__ yidx, unsigned idx_len, unsigned x_rows, unsigned y_rows,
+                                             const float* __restrict__ mat_scale, unsigned n_mats) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned* it = items + 3u * blockIdx.y;
+    const unsigned e = min(it[0], n_mats - 1u);
+    const unsigned start = min(it[1], idx_len);
+    const unsigned count = min(min(it[2], 8u * NT), idx_len - start);
+    const unsigned row0 = blockIdx.x * 64u + warp * 16u;
+    if (count == 0 || row0 >= N) return;
+    const unsigned ntiles = (count + 7u) >> 3, kb32 = K >> 5;
+    const signed char* xb[NT];
+    const float* xs0[NT];
+    const float* xs1[NT];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        const unsigned cb = min(8u * j + g, count - 1u), c0 = min(8u * j + 2u * t, count - 1u), c1 = min(8u * j + 2u * t + 1u, count - 1u);
+        xb[j] = xq + (u64)min(xidx[start + cb], x_rows - 1u) * K + 4u * t;
+        xs0[j] = xd + (u64)min(xidx[start + c0], x_rows - 1u) * kb32;
+        xs1[j] = xd + (u64)min(xidx[start + c1], x_rows - 1u) * kb32;
+    }
+    const unsigned rlo = row0 + g, rhi = row0 + g + 8u;
+    const u64 rq = WT == 2 ? (u64)K : (u64)(K >> 1);
+    const u8* wlo = qs + e * mat_qs + (u64)rlo * rq;
+    const u8* whi = qs + e * mat_qs + (u64)rhi * rq;
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    const unsigned src0 = lane & ~3u;
+    // A chunk is 128 values of K: NVFP4 64 bytes (8 blocks of 16), Q8_0 128 bytes (4 blocks of
+    // 32). Lane t of a row group loads bytes [16 t, 16 t + 16) (NVFP4) or [32 t, 32 t + 32)
+    // (Q8_0) of each of its two rows.
+    const unsigned nch = K >> 7;
+    for (unsigned ch0 = 0; ch0 < nch; ch0 += U) {
+        uint4 wl[U][WT == 2 ? 2 : 1], wh[U][WT == 2 ? 2 : 1];
+        unsigned long long sl[U], sh[U];
+#pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            const unsigned ch = min(ch0 + u, nch - 1u);
+            if constexpr (WT == 2) {
+                wl[u][0] = __ldg(reinterpret_cast<const uint4*>(wlo + ch * 128u + 32u * t));
+                wl[u][1] = __ldg(reinterpret_cast<const uint4*>(wlo + ch * 128u + 32u * t + 16u));
+                wh[u][0] = __ldg(reinterpret_cast<const uint4*>(whi + ch * 128u + 32u * t));
+                wh[u][1] = __ldg(reinterpret_cast<const uint4*>(whi + ch * 128u + 32u * t + 16u));
+                // 4 f16 scales per row and chunk.
+                sl[u] = __ldg(reinterpret_cast<const unsigned long long*>(aux + e * mat_aux + ((u64)rlo * kb32 + ch * 4u) * 2u));
+                sh[u] = __ldg(reinterpret_cast<const unsigned long long*>(aux + e * mat_aux + ((u64)rhi * kb32 + ch * 4u) * 2u));
+            } else {
+                wl[u][0] = __ldg(reinterpret_cast<const uint4*>(wlo + ch * 64u + 16u * t));
+                wh[u][0] = __ldg(reinterpret_cast<const uint4*>(whi + ch * 64u + 16u * t));
+                // 8 UE4M3 scales per row and chunk.
+                sl[u] = __ldg(reinterpret_cast<const unsigned long long*>(aux + e * mat_aux + (u64)rlo * (K >> 4) + ch * 8u));
+                sh[u] = __ldg(reinterpret_cast<const unsigned long long*>(aux + e * mat_aux + (u64)rhi * (K >> 4) + ch * 8u));
+            }
+        }
+#pragma unroll
+        for (unsigned u = 0; u < U; ++u) {
+            if (ch0 + u >= nch) break;
+            const unsigned ch = ch0 + u;
+            if constexpr (WT == 2) {
+#pragma unroll
+                for (unsigned kb = 0; kb < 4; ++kb) {
+                    // Block kb of the chunk is lane kb's 32 bytes: words t and 4 + t.
+                    const unsigned src = src0 | kb;
+                    const unsigned w0[4] = {wl[u][0].x, wl[u][0].y, wl[u][0].z, wl[u][0].w};
+                    const unsigned w1[4] = {wl[u][1].x, wl[u][1].y, wl[u][1].z, wl[u][1].w};
+                    const unsigned h0[4] = {wh[u][0].x, wh[u][0].y, wh[u][0].z, wh[u][0].w};
+                    const unsigned h1[4] = {wh[u][1].x, wh[u][1].y, wh[u][1].z, wh[u][1].w};
+                    unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+#pragma unroll
+                    for (unsigned q = 0; q < 4; ++q) {
+                        // Each lane sends word q; the receiver with t == q keeps it.
+                        const unsigned r0 = __shfl_sync(0xffffffffu, w0[q], src), r1 = __shfl_sync(0xffffffffu, h0[q], src);
+                        const unsigned r2 = __shfl_sync(0xffffffffu, w1[q], src), r3 = __shfl_sync(0xffffffffu, h1[q], src);
+                        if (t == q) { a0 = r0; a1 = r1; a2 = r2; a3 = r3; }
+                    }
+                    const float d_lo = __half2float(__ushort_as_half((unsigned short)(sl[u] >> (16u * kb))));
+                    const float d_hi = __half2float(__ushort_as_half((unsigned short)(sh[u] >> (16u * kb))));
+                    const unsigned k32 = ch * 4u + kb;
+#pragma unroll
+                    for (unsigned j = 0; j < NT; ++j) {
+                        if (j < ntiles) {
+                            const unsigned b0 = __ldg(reinterpret_cast<const unsigned*>(xb[j] + k32 * 32u));
+                            const unsigned b1 = __ldg(reinterpret_cast<const unsigned*>(xb[j] + k32 * 32u + 16u));
+                            int c[4];
+                            mma_k32(c, a0, a1, a2, a3, b0, b1);
+                            const float x0 = __ldg(xs0[j] + k32), x1 = __ldg(xs1[j] + k32);
+                            acc[j][0] = fmaf((float)c[0], d_lo * x0, acc[j][0]);
+                            acc[j][1] = fmaf((float)c[1], d_lo * x1, acc[j][1]);
+                            acc[j][2] = fmaf((float)c[2], d_hi * x0, acc[j][2]);
+                            acc[j][3] = fmaf((float)c[3], d_hi * x1, acc[j][3]);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (unsigned sb = 0; sb < 8; ++sb) {
+                    // Block sb of the chunk: 8 bytes in lane sb / 2's load (words 0-1 or 2-3);
+                    // this lane needs word (t & 1) of it.
+                    const unsigned src = src0 | (sb >> 1);
+                    const unsigned l0 = __shfl_sync(0xffffffffu, (sb & 1u) ? wl[u][0].z : wl[u][0].x, src);
+                    const unsigned l1 = __shfl_sync(0xffffffffu, (sb & 1u) ? wl[u][0].w : wl[u][0].y, src);
+                    const unsigned m0 = __shfl_sync(0xffffffffu, (sb & 1u) ? wh[u][0].z : wh[u][0].x, src);
+                    const unsigned m1 = __shfl_sync(0xffffffffu, (sb & 1u) ? wh[u][0].w : wh[u][0].y, src);
+                    const int2 tl = table16((int)((t & 1u) ? l1 : l0), k_e2m1x2), th = table16((int)((t & 1u) ? m1 : m0), k_e2m1x2);
+                    const unsigned a0 = (unsigned)(t < 2u ? tl.x : tl.y), a1 = (unsigned)(t < 2u ? th.x : th.y);
+                    const float d_lo = __half2float(__ushort_as_half((unsigned short)(((unsigned)(sl[u] >> (8u * sb)) & 0xffu) << 7)));
+                    const float d_hi = __half2float(__ushort_as_half((unsigned short)(((unsigned)(sh[u] >> (8u * sb)) & 0xffu) << 7)));
+                    const unsigned k16 = ch * 8u + sb, kb = k16 >> 1;
+#pragma unroll
+                    for (unsigned j = 0; j < NT; ++j) {
+                        if (j < ntiles) {
+                            const unsigned b0 = __ldg(reinterpret_cast<const unsigned*>(xb[j] + k16 * 16u));
+                            int c[4];
+                            mma_k16(c, a0, a1, b0);
+                            const float x0 = __ldg(xs0[j] + kb), x1 = __ldg(xs1[j] + kb);
+                            acc[j][0] = fmaf((float)c[0], d_lo * x0, acc[j][0]);
+                            acc[j][1] = fmaf((float)c[1], d_lo * x1, acc[j][1]);
+                            acc[j][2] = fmaf((float)c[2], d_hi * x0, acc[j][2]);
+                            acc[j][3] = fmaf((float)c[3], d_hi * x1, acc[j][3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (WT != 2) {
+#pragma unroll
+        for (unsigned j = 0; j < NT; ++j) { acc[j][0] *= 128.0f; acc[j][1] *= 128.0f; acc[j][2] *= 128.0f; acc[j][3] *= 128.0f; }
+    }
+    const float ms = mat_scale ? mat_scale[e] : 1.0f;
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        if (j < ntiles) {
+            const unsigned j0 = j * 8u + 2u * t, j1 = j0 + 1u;
+            if (j0 < count) {
+                float* yr = y + (u64)min(yidx[start + j0], y_rows - 1u) * N;
+                yr[rlo] = acc[j][0] * ms;
+                yr[rhi] = acc[j][2] * ms;
+            }
+            if (j1 < count) {
+                float* yr = y + (u64)min(yidx[start + j1], y_rows - 1u) * N;
+                yr[rlo] = acc[j][1] * ms;
+                yr[rhi] = acc[j][3] * ms;
+            }
+        }
+    }
+#endif
+}
+
+#define GEMM_DEC_ENTRY(NAME, WT, NT, U)                                                                             \
+    extern "C" __global__ void __launch_bounds__(128) NAME(                                                         \
+        const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq,                  \
+        const float* __restrict__ xd, float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux,       \
+        const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,   \
+        unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT(); \
+        gemm_mma_dec<WT, NT, U>(qs, aux, xq, xd, y, N, K, mat_qs, mat_aux, items, xidx, yidx, idx_len, x_rows,    \
+                                y_rows, mat_scale, n_mats);                                                         \
+    }
+GEMM_DEC_ENTRY(astral_gemm_q8_0_dec1, 2, 1, 3)
+GEMM_DEC_ENTRY(astral_gemm_q8_0_dec2, 2, 2, 2)
+GEMM_DEC_ENTRY(astral_gemm_nvfp4_dec1, 3, 1, 6)
+GEMM_DEC_ENTRY(astral_gemm_nvfp4_dec2, 3, 2, 4)

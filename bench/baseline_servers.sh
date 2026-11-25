@@ -14,6 +14,10 @@
 #   qwen38-mxfp4       vLLM/SGLang only: RedHatAI/Qwen3.8-27B-MXFP4
 #   qwen38-fp8         vLLM/SGLang only: Qwen/Qwen3.8-27B-FP8
 #
+# Engines: llamacpp, vllm, sglang and astral (`astral serve` from ASTRAL_BIN, default
+# $W/astral/target/release/astral, with ASTRAL_ARGS). VLLM_ARGS and SGL_ARGS add server flags
+# (for example a speculative-decoding config). Results go to $W/results/<stamp>-servers-$MODEL$TAG.
+#
 # Usage: MODEL=qwen38 bench/baseline_servers.sh [engines...]   (default engines: llamacpp vllm sglang)
 set -uo pipefail
 
@@ -46,7 +50,11 @@ OUTL=${OUT_LEN:-128}
 CONCURRENCY=${CONCURRENCY:-"1 2 4 8 16 32"}
 CTX=${CTX:-8192}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT="$W/results/$STAMP-servers-$MODEL"
+OUT="$W/results/$STAMP-servers-$MODEL${TAG:-}"
+ASTRAL_BIN=${ASTRAL_BIN:-$W/astral/target/release/astral}
+ASTRAL_ARGS=${ASTRAL_ARGS:-}
+VLLM_EXTRA="$VLLM_EXTRA ${VLLM_ARGS:-}"
+SGL_EXTRA="$SGL_EXTRA ${SGL_ARGS:-}"
 mkdir -p "$OUT"
 ENGINES=${*:-llamacpp vllm sglang}
 
@@ -61,7 +69,9 @@ digest() { sudo -n docker image inspect "$1" --format '{{index .RepoDigests 0}}'
   echo "  \"vllm_image\": \"$(digest "$VLLM_IMG")\","
   echo "  \"sglang_image\": \"$(digest "$SGL_IMG")\","
   echo "  \"gguf\": \"$GGUF\","
-  echo "  \"native_checkpoint\": \"$NATIVE\""
+  echo "  \"native_checkpoint\": \"$NATIVE\","
+  echo "  \"astral\": \"$("$ASTRAL_BIN" version 2>/dev/null | head -1)\","
+  echo "  \"astral_args\": \"$ASTRAL_ARGS\", \"vllm_args\": \"$VLLM_EXTRA\", \"sglang_args\": \"$SGL_EXTRA\""
   echo "}"
 } > "$OUT/env.json"
 
@@ -79,6 +89,7 @@ wait_ready() { # url tries [container]: stop waiting as soon as the server proce
 stop_all() {
   sudo -n docker rm -f astral-vllm astral-sglang >/dev/null 2>&1 || true
   pkill -f "llama-server .*--port 8080" 2>/dev/null || true
+  pkill -f "^$ASTRAL_BIN serve" 2>/dev/null || true
   sleep 3
 }
 
@@ -98,7 +109,7 @@ run_client() { # engine base_url served_model_name backend
 }
 
 warm_gpu() { # same time-based warm-up rule as `astral hw --bench`
-  "$W/astral/target/release/astral" hw --bench-fresh > "$OUT/astral_hw_$1.json" 2>&1 || true
+  "$ASTRAL_BIN" hw --bench-fresh > "$OUT/astral_hw_$1.json" 2>&1 || true
 }
 
 for eng in $ENGINES; do
@@ -125,6 +136,11 @@ for eng in $ENGINES; do
       if wait_ready http://127.0.0.1:30000/health 600 astral-sglang; then warm_gpu sglang; run_client sglang http://127.0.0.1:30000 model openai
       else echo "   SGLang did not become ready" | tee "$OUT/sglang-FAILED"; fi
       sudo -n docker logs astral-sglang > "$OUT/sglang-server.log" 2>&1 ;;
+    astral)
+      # shellcheck disable=SC2086
+      "$ASTRAL_BIN" serve "$GGUF" --checkpoint "$NATIVE" --name model --host 127.0.0.1 --port 8001 $ASTRAL_ARGS > "$OUT/astral-server.log" 2>&1 &
+      if wait_ready http://127.0.0.1:8001/health 600; then warm_gpu astral; run_client astral http://127.0.0.1:8001 model openai
+      else echo "   astral did not become ready" | tee "$OUT/astral-FAILED"; fi ;;
   esac
 done
 stop_all

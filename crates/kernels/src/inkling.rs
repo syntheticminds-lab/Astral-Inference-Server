@@ -67,6 +67,9 @@ pub struct InklingOps {
     argmax: Function,
     rms_q8: Function,
     attn_prep: Function,
+    sum_splits: Function,
+    ctrl_down3_t: Function,
+    ctrl_combine3_t: Function,
     ctrl_down: Function,
     ctrl_combine: Function,
     gate_q8: Function,
@@ -128,6 +131,25 @@ pub struct AttnPrep<'a> {
     pub log_floor: f32,
     pub log_alpha: f32,
     pub capacity: u32,
+    /// Batched decode rows (one sequence per row), or `None` for consecutive tokens.
+    pub rows: Option<SeqRows<'a>>,
+}
+
+/// Rows of a batched decode pass: row `t` is one token of sequence `seq[t]` at position
+/// `pos[t]` (the `pos` buffer then holds one position per row). Each of the `n_seqs` sequences
+/// owns `capacity` positions of every KV cache buffer and `conv_stride` floats of every conv
+/// state buffer, back to back.
+#[derive(Clone, Copy)]
+pub struct SeqRows<'a> {
+    pub seq: &'a dyn Dev<i32>,
+    pub n_seqs: u32,
+    pub conv_stride: u32,
+}
+
+impl SeqRows<'_> {
+    fn parts(r: Option<&Self>) -> (DevicePtr, u32, u32) {
+        r.map_or((0, 1, 0), |r| (r.seq.dptr(), r.n_seqs.max(1), r.conv_stride))
+    }
 }
 
 /// Attention geometry of one layer.
@@ -167,6 +189,9 @@ impl InklingOps {
             argmax: f("astral_ink_argmax")?,
             rms_q8: f("astral_ink_rms_q8")?,
             attn_prep: f("astral_ink_attn_prep")?,
+            sum_splits: f("astral_ink_sum_splits")?,
+            ctrl_down3_t: f("astral_ink_ctrl_down3_t")?,
+            ctrl_combine3_t: f("astral_ink_ctrl_combine3_t")?,
             ctrl_down: f("astral_ink_ctrl_down")?,
             ctrl_combine: f("astral_ink_ctrl_combine")?,
             gate_q8: f("astral_ink_gate_q8")?,
@@ -587,7 +612,7 @@ impl InklingOps {
     pub fn attn_prep(&self, s: &Stream, a: AttnPrep) -> Result<()> {
         let (h, kh, hd, nr, nt) = (a.heads as usize, a.kv_heads as usize, a.head_dim as usize, a.n_rel as usize, a.ntok as usize);
         let width = kh * hd;
-        if hd > 256 || nr > 256 || kh == 0 || a.capacity == 0 || nt == 0 || (a.kdyn.is_some() != a.vdyn.is_some()) || (a.kdyn.is_some() && (!a.conv || nt != 1)) {
+        if hd > 256 || nr > 256 || kh == 0 || a.capacity == 0 || nt == 0 || (a.kdyn.is_some() != a.vdyn.is_some()) || (a.kdyn.is_some() && (!a.conv || (nt != 1 && a.rows.is_none()))) {
             return Err(invalid(format!("attn_prep: unsupported shape hd {hd} n_rel {nr} kv_heads {kh} tokens {nt}")));
         }
         need("prep q", a.q.dlen(), nt * h * hd)?;
@@ -603,11 +628,19 @@ impl InklingOps {
             if a.dyn_heads == 0 || !width.is_multiple_of(a.dyn_heads as usize) {
                 return Err(invalid(format!("attn_prep: {width} channels not divisible by {} tap heads", a.dyn_heads)));
             }
-            need("prep taps", t.dlen(), 4 * a.dyn_heads as usize)?;
+            need("prep taps", t.dlen(), 4 * a.dyn_heads as usize * if a.rows.is_some() { nt } else { 1 })?;
         }
-        need("prep k cache", a.kc.dlen(), width * a.capacity as usize)?;
-        need("prep v cache", a.vc.dlen(), width * a.capacity as usize)?;
-        need("prep pos", a.pos.dlen(), 1)?;
+        let seqs = a.rows.map_or(1, |r| r.n_seqs.max(1) as usize);
+        need("prep k cache", a.kc.dlen(), seqs * width * a.capacity as usize)?;
+        need("prep v cache", a.vc.dlen(), seqs * width * a.capacity as usize)?;
+        need("prep pos", a.pos.dlen(), if a.rows.is_some() { nt } else { 1 })?;
+        if let Some(r) = &a.rows {
+            need("prep seq", r.seq.dlen(), nt)?;
+            need("prep conv state", a.conv_kv.dlen(), (seqs - 1) * r.conv_stride as usize + 6 * width)?;
+            if !a.conv {
+                return Err(invalid("attn_prep: batched rows need the per-token conv".into()));
+            }
+        }
         let (mut pq, mut pr, mut pk, mut pv) = (a.q.dptr(), a.r.dptr(), a.k.dptr(), a.v.dptr());
         let (mut qs, mut rs, mut cs, mut kw, mut vw) = (a.q_scale.dptr(), a.r_scale.dptr(), a.conv_kv.dptr(), a.k_conv.dptr(), a.v_conv.dptr());
         let (mut kd, mut vd, mut dh) = (a.kdyn.map_or(0, |b| b.dptr()), a.vdyn.map_or(0, |b| b.dptr()), if a.kdyn.is_some() { a.dyn_heads } else { 0 });
@@ -615,6 +648,7 @@ impl InklingOps {
         let (mut hh, mut khh, mut hdd, mut nrr) = (a.heads, a.kv_heads, a.head_dim, a.n_rel);
         let (mut tq, mut tr, mut ep, mut gl, mut fl, mut al, mut cap) = (a.thr_qk, a.thr_rel, a.eps, a.global as u32, a.log_floor, a.log_alpha, a.capacity);
         let mut dc = a.conv as u32;
+        let (mut sq, mut ns, mut cst) = SeqRows::parts(a.rows.as_ref());
         let mut p = [
             param(&mut pq),
             param(&mut pr),
@@ -643,6 +677,9 @@ impl InklingOps {
             param(&mut al),
             param(&mut cap),
             param(&mut dc),
+            param(&mut sq),
+            param(&mut ns),
+            param(&mut cst),
         ];
         let jobs = 2 * (a.heads + a.kv_heads);
         Self::go(&self.attn_prep, s, LaunchConfig { grid: (jobs, a.ntok, 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
@@ -748,6 +785,16 @@ impl InklingOps {
         }
         let (mut xs, mut ms, mut dd) = (x_stride as u32, msg_stride as u32, dim);
         let mut c2 = Ctrl3 { wd: c.wd, wgf: c.wgf, x: c.x, msg: c.msg, cd: c.cd, out: c.out };
+        if ntok > 1 && rank <= 64 {
+            // Several tokens: 8 per block, each weight load shared (same per-token arithmetic).
+            let tb = ntok.div_ceil(8);
+            let mut nt1 = ntok;
+            let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1)];
+            Self::go(&self.ctrl_down3_t, s, LaunchConfig { grid: (rank, tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            let (mut xs2, mut ms2, mut dd2, mut r, mut nt2) = (x_stride as u32, msg_stride as u32, dim, rank, ntok);
+            let mut p2 = [param(&mut c2), param(&mut xs2), param(&mut ms2), param(&mut dd2), param(&mut r), param(&mut nt2)];
+            return Self::go(&self.ctrl_combine3_t, s, LaunchConfig { grid: (dim.div_ceil(8), tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p2);
+        }
         let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd)];
         Self::go(&self.ctrl_down3, s, LaunchConfig { grid: (rank, ntok, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
         let (mut xs2, mut ms2, mut dd2, mut r) = (x_stride as u32, msg_stride as u32, dim, rank);
@@ -861,6 +908,7 @@ impl InklingOps {
         cur: &mut dyn DevMut<f32>,
         bank_row: Option<&mut dyn DevMut<f32>>,
         channels: u32,
+        rows: Option<SeqRows>,
     ) -> Result<()> {
         let (c, nt) = (channels as usize, ntok as usize);
         let slots = moe.map_or(1, |m| m.1);
@@ -871,7 +919,13 @@ impl InklingOps {
         if let Some((w, _)) = moe {
             need("conv_residual moe weights", w.dlen(), nt * slots as usize)?;
         }
-        need("conv_residual state", state.dlen(), 3 * c)?;
+        match &rows {
+            Some(r) => {
+                need("conv_residual seq", r.seq.dlen(), nt)?;
+                need("conv_residual state", state.dlen(), (r.n_seqs.max(1) as usize - 1) * r.conv_stride as usize + 3 * c)?;
+            }
+            None => need("conv_residual state", state.dlen(), 3 * c)?,
+        }
         need("conv_residual weight", weight.dlen(), 4 * c)?;
         need("conv_residual cur", cur.dlen(), nt * c)?;
         let pb = match bank_row {
@@ -882,8 +936,15 @@ impl InklingOps {
             None => 0,
         };
         let (mut px, mut pm, mut sl, mut nn, mut ps, mut pw, mut pc, mut pb, mut ch) = (x.dptr(), moe.map_or(0, |m| m.0.dptr()), slots, ntok, state.dptr(), weight.dptr(), cur.dptr(), pb, channels);
-        let mut p = [param(&mut px), param(&mut pm), param(&mut sl), param(&mut nn), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch)];
-        let cfg = if nt == 1 { elementwise(channels) } else { LaunchConfig { grid: (channels.div_ceil(128), 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 } };
+        let (mut sq, mut ns, mut cst) = SeqRows::parts(rows.as_ref());
+        let mut p = [param(&mut px), param(&mut pm), param(&mut sl), param(&mut nn), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut sq), param(&mut ns), param(&mut cst)];
+        let cfg = if rows.is_some() {
+            LaunchConfig { grid: (channels.div_ceil(256), ntok, 1), block: (256, 1, 1), shared_mem_bytes: 0 }
+        } else if nt == 1 {
+            elementwise(channels)
+        } else {
+            LaunchConfig { grid: (channels.div_ceil(128), 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 }
+        };
         Self::go(&self.conv_residual, s, cfg, &mut p)
     }
     /// Split-K (flash-decode) attention for `ntok` causal queries at positions `pos[0]..`;
@@ -907,6 +968,7 @@ impl InklingOps {
         max_splits: u32,
         chunk_loop: bool,
         gate: Option<(&dyn Dev<f32>, &mut QAct)>,
+        rows: Option<SeqRows>,
     ) -> Result<()> {
         if a.head_dim != 128 || a.n_rel > 32 || a.kv_heads == 0 || !a.heads.is_multiple_of(a.kv_heads) || a.capacity == 0 || a.capacity > MAX_CTX || ntok == 0 || max_splits == 0 {
             return Err(invalid(format!("attn split: unsupported shape {a:?} (head_dim 128, n_rel <= 32, capacity <= {MAX_CTX})")));
@@ -915,12 +977,18 @@ impl InklingOps {
         need("attn q", q.dlen(), nt * (a.heads * a.head_dim) as usize)?;
         need("attn r", r.dlen(), nt * (a.heads * a.n_rel) as usize)?;
         need("attn sink", sink.dlen(), nt * a.heads as usize)?;
-        need("attn k cache", kc.dlen(), width * a.capacity as usize)?;
-        need("attn v cache", vc.dlen(), width * a.capacity as usize)?;
+        let seqs = rows.as_ref().map_or(1, |r| r.n_seqs.max(1) as usize);
+        need("attn k cache", kc.dlen(), seqs * width * a.capacity as usize)?;
+        need("attn v cache", vc.dlen(), seqs * width * a.capacity as usize)?;
         need("attn rel bias", rel_bias.dlen(), (a.extent * a.n_rel) as usize)?;
         need("attn work", work.dlen(), attn_workspace(ntok, a.heads, a.head_dim, max_splits))?;
         need("attn out", out.dlen(), nt * (a.heads * a.head_dim) as usize)?;
-        need("attn pos", pos.dlen(), 1)?;
+        need("attn pos", pos.dlen(), if rows.is_some() { nt } else { 1 })?;
+        if let Some(r) = &rows {
+            need("attn seq", r.seq.dlen(), nt)?;
+        }
+        let (mut sq, mut ns, _) = SeqRows::parts(rows.as_ref());
+        let mut sq2 = sq;
         let (mut pq, mut pr, mut ps, mut pk, mut pv, mut pb, mut pw, mut pp) = (q.dptr(), r.dptr(), sink.dptr(), kc.dptr(), vc.dptr(), rel_bias.dptr(), work.dptr(), pos.dptr());
         let (mut h, mut kh, mut nr, mut ex, mut win, mut cap, mut ms) = (a.heads, a.kv_heads, a.n_rel, a.extent, a.window, a.capacity, max_splits);
         let mut scale = 1.0f32 / (a.head_dim as f32).sqrt();
@@ -941,11 +1009,15 @@ impl InklingOps {
             param(&mut scale),
             param(&mut cap),
             param(&mut ms),
+            param(&mut sq),
+            param(&mut ns),
         ];
         // One chunk per split (decode, exact-size prefill splits) or splits looping over chunks
         // (graph-captured multi-token passes with a capped split count).
         let f = if chunk_loop { &self.attn_split } else { &self.attn_split1 };
-        Self::go(f, s, LaunchConfig { grid: (a.heads, max_splits, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        // One-chunk splits: blocks loop over splits, so many rows need fewer (mostly idle) blocks.
+        let gy = if chunk_loop { max_splits } else { (max_splits * 8).div_ceil(ntok).clamp(1, max_splits) };
+        Self::go(f, s, LaunchConfig { grid: (a.heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
         let (mut pw2, mut po, mut pp2, mut win2, mut cap2, mut ms2) = (work.dptr(), out.dptr(), pos.dptr(), a.window, a.capacity, max_splits);
         let cfg = LaunchConfig { grid: (a.heads, ntok, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
         match gate {
@@ -957,11 +1029,11 @@ impl InklingOps {
                 }
                 let (mut pq, mut pd, mut ph) = qa.planes_for(ntok)?;
                 let mut pg = g.dptr();
-                let mut p2 = [param(&mut pw2), param(&mut po), param(&mut pp2), param(&mut win2), param(&mut cap2), param(&mut ms2), param(&mut pg), param(&mut pq), param(&mut pd), param(&mut ph)];
+                let mut p2 = [param(&mut pw2), param(&mut po), param(&mut pp2), param(&mut win2), param(&mut cap2), param(&mut ms2), param(&mut pg), param(&mut pq), param(&mut pd), param(&mut ph), param(&mut sq2)];
                 Self::go(&self.attn_merge_q8, s, cfg, &mut p2)
             }
             None => {
-                let mut p2 = [param(&mut pw2), param(&mut po), param(&mut pp2), param(&mut win2), param(&mut cap2), param(&mut ms2)];
+                let mut p2 = [param(&mut pw2), param(&mut po), param(&mut pp2), param(&mut win2), param(&mut cap2), param(&mut ms2), param(&mut sq2)];
                 Self::go(&self.attn_merge, s, cfg, &mut p2)
             }
         }
@@ -1129,12 +1201,18 @@ impl InklingOps {
         let (mut px, mut xs, mut pm, mut ms, mut pr, mut dd) = (x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, rms.dptr(), dim);
         let mut p = [param(&mut px), param(&mut xs), param(&mut pm), param(&mut ms), param(&mut pr), param(&mut dd)];
         Self::go(&self.rms2, s, LaunchConfig { grid: (ntok, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
-        cd.zero_async(s)?;
-        // cd = concat(rx x, rm msg) . W_down^T, K = 2 dim split 8 ways.
+        // cd = concat(rx x, rm msg) . W_down^T, K = 2 dim split 8 ways: per-split partials in gf
+        // (free until the next GEMM), summed in a fixed order (deterministic).
         let k = 2 * dim;
         let splits = 8u32;
         let kps = k.div_ceil(splits).next_multiple_of(32);
-        self.sgemm(s, x.dptr(), msg.dptr(), x_stride as u32, msg_stride as u32, dim, rms.dptr(), wd.qs.device_ptr(), k, cd.device_ptr(), rank, ntok, rank, k, kps, true)?;
+        let splits = k.div_ceil(kps);
+        need("ctrl_t split partials", gf.dlen(), (splits * ntok * rank) as usize)?;
+        self.sgemm_mode(s, x.dptr(), msg.dptr(), x_stride as u32, msg_stride as u32, dim, rms.dptr(), wd.qs.device_ptr(), k, gf.dptr(), rank, ntok, rank, k, kps, 2)?;
+        let n = ntok * rank;
+        let (mut pp, mut po, mut nn, mut sp) = (gf.dptr(), cd.device_ptr(), n, splits);
+        let mut p = [param(&mut pp), param(&mut po), param(&mut nn), param(&mut sp)];
+        Self::go(&self.sum_splits, s, LaunchConfig { grid: (n.div_ceil(256).min(1024), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
         // gf = cd . W_gf^T (gain rows then forget rows).
         self.sgemm(s, cd.device_ptr(), 0, rank, rank, rank, 0, wgf.qs.device_ptr(), rank, gf.dptr(), 2 * dim, ntok, 2 * dim, rank, rank.next_multiple_of(32), false)?;
         let (mut pg, mut px, mut xs, mut pm, mut ms, mut po, mut dd, mut n) = (gf.dptr(), x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, out.dptr(), dim, ntok);
@@ -1145,15 +1223,36 @@ impl InklingOps {
     /// `c[m][n] = sum_k a[m][k] * w[n][k]` in f32 (`a` rows `lda` apart, `w` an F32 matrix,
     /// `c` rows of `w.n`): small dense GEMMs (prefill projections kept in high precision).
     /// K is split 8 ways (atomic adds into `c`, which is zeroed first) to fill the GPU.
-    pub fn gemm_f32(&self, s: &Stream, a: &dyn Dev<f32>, lda: usize, w: &GemvMatrix, c: &mut crate::DeviceBufferF32, m: u32) -> Result<()> {
+    pub fn gemm_f32(&self, s: &Stream, a: &dyn Dev<f32>, lda: usize, w: &GemvMatrix, c: &mut dyn DevMut<f32>, m: u32) -> Result<()> {
         if w.ty != GemvType::F32 || w.n_mats != 1 || m == 0 || lda < w.k as usize {
             return Err(invalid(format!("gemm_f32: need one F32 matrix, m > 0, lda >= k (got {:?}, m {m}, lda {lda})", w.ty)));
         }
         need("gemm_f32 a", a.dlen(), (m as usize - 1) * lda + w.k as usize)?;
-        need("gemm_f32 c", c.len(), (m * w.n) as usize)?;
-        c.zero_async(s)?;
-        let kps = w.k.div_ceil(8).next_multiple_of(32);
-        self.sgemm(s, a.dptr(), 0, lda as u32, lda as u32, w.k, 0, w.qs.device_ptr(), w.k, c.device_ptr(), w.n, m, w.n, w.k, kps, true)
+        need("gemm_f32 c", c.dlen(), (m * w.n) as usize)?;
+        // K is not split (a split would add partials atomically, in timing-dependent order).
+        self.sgemm(s, a.dptr(), 0, lda as u32, lda as u32, w.k, 0, w.qs.device_ptr(), w.k, c.dptr(), w.n, m, w.n, w.k, w.k.next_multiple_of(32), false)
+    }
+
+    /// [`InklingOps::gemm_f32`] with K split across blocks when the grid would be small: the
+    /// per-split partials go to `ws` and are summed in a fixed order (deterministic).
+    pub fn gemm_f32_ws(&self, s: &Stream, a: &dyn Dev<f32>, lda: usize, w: &GemvMatrix, c: &mut dyn DevMut<f32>, m: u32, ws: &mut dyn DevMut<f32>) -> Result<()> {
+        let tiles = w.n.div_ceil(32) * m.div_ceil(32);
+        let splits = (256u32.div_ceil(tiles)).clamp(1, 8).min(w.k.div_ceil(32));
+        if splits == 1 || ws.dlen() < (splits * m * w.n) as usize {
+            return self.gemm_f32(s, a, lda, w, c, m);
+        }
+        if w.ty != GemvType::F32 || w.n_mats != 1 || m == 0 || lda < w.k as usize {
+            return Err(invalid(format!("gemm_f32_ws: need one F32 matrix, m > 0, lda >= k (got {:?}, m {m}, lda {lda})", w.ty)));
+        }
+        need("gemm_f32 a", a.dlen(), (m as usize - 1) * lda + w.k as usize)?;
+        need("gemm_f32 c", c.dlen(), (m * w.n) as usize)?;
+        let kps = w.k.div_ceil(splits).next_multiple_of(32);
+        let splits = w.k.div_ceil(kps);
+        self.sgemm_mode(s, a.dptr(), 0, lda as u32, lda as u32, w.k, 0, w.qs.device_ptr(), w.k, ws.dptr(), w.n, m, w.n, w.k, kps, 2)?;
+        let n = m * w.n;
+        let (mut pp, mut po, mut nn, mut sp) = (ws.dptr(), c.dptr(), n, splits);
+        let mut p = [param(&mut pp), param(&mut po), param(&mut nn), param(&mut sp)];
+        Self::go(&self.sum_splits, s, LaunchConfig { grid: (n.div_ceil(256).min(1024), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
     /// Raw launch of astral_ink_sgemm_tn; callers have checked every extent.
@@ -1177,8 +1276,32 @@ impl InklingOps {
         k_per_split: u32,
         atomic: bool,
     ) -> Result<()> {
+        self.sgemm_mode(s, a0, a1, lda, lda1, k_split, row_scale, w, ldw, c, ldc, m, n, k, k_per_split, atomic as u32)
+    }
+
+    /// [`InklingOps::sgemm`] with the kernel's split mode: 0 plain, 1 atomic adds, 2 per-split partials.
+    #[allow(clippy::too_many_arguments)]
+    fn sgemm_mode(
+        &self,
+        s: &Stream,
+        a0: DevicePtr,
+        a1: DevicePtr,
+        lda: u32,
+        lda1: u32,
+        k_split: u32,
+        row_scale: DevicePtr,
+        w: DevicePtr,
+        ldw: u32,
+        c: DevicePtr,
+        ldc: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        k_per_split: u32,
+        mode: u32,
+    ) -> Result<()> {
         let (mut pa0, mut pa1, mut la, mut la1, mut ks, mut prs, mut pw, mut lw, mut pc, mut lc, mut mm, mut nn, mut kk, mut kps, mut at) =
-            (a0, a1, lda, lda1, k_split, row_scale, w, ldw, c, ldc, m, n, k, k_per_split, atomic as u32);
+            (a0, a1, lda, lda1, k_split, row_scale, w, ldw, c, ldc, m, n, k, k_per_split, mode);
         let mut p = [
             param(&mut pa0),
             param(&mut pa1),

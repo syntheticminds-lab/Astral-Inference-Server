@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Synthetic Minds LTD
-//! The engine thread: owns the GPU session (and the DSpark draft), runs one request at a
-//! time from a bounded queue and streams tokens back over a per-request channel. A dropped
-//! receiver cancels its request at the next token or round.
+//! The engine thread: owns the GPU session (and the DSpark draft) and runs requests with
+//! continuous batching. Every running request owns one sequence slot of the session (its KV
+//! cache and short-conv state). Between decode steps the engine admits waiting requests
+//! (prefilling each into a free slot), then decodes one token for every running request in a
+//! single batched pass, and retires requests that hit a stop token, their length limit, or
+//! whose client went away (a dropped receiver cancels its request at the next token).
+//!
+//! Speculative decoding runs when a request is alone: it starts with the DSpark draft if no
+//! other request is running or waiting, and falls back to plain batched decoding for the rest
+//! of its life as soon as another request arrives.
 
 use astral_core::{AstralError, Result};
-use astral_model::inkling::{Session, Weights};
+use astral_model::inkling::{DecodeRow, Session, Weights};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -17,10 +25,12 @@ pub struct EngineConfig {
     pub draft: Option<PathBuf>,
     /// Drafted tokens verified per round.
     pub k: usize,
-    /// Context capacity (positions) of the session.
+    /// Context capacity (positions) of each sequence.
     pub ctx: u32,
-    /// Requests waiting beyond the running one.
+    /// Requests waiting beyond the running ones.
     pub queue: usize,
+    /// Requests decoded together (sequence slots); 0 picks as many as fit in GPU memory, up to 64.
+    pub max_seqs: usize,
 }
 
 pub enum Event {
@@ -45,13 +55,20 @@ pub struct Engine {
     pub capacity: u32,
     pub draft: bool,
     pub k: usize,
+    /// Requests decoded together.
+    pub max_seqs: usize,
 }
+
+/// Most sequence slots picked automatically.
+const AUTO_MAX_SEQS: usize = 64;
+/// GPU memory left free for scratch buffers, graphs and the allocator when sizing slots.
+const RESERVE_BYTES: usize = 6 << 30;
 
 impl Engine {
     /// Loads the model on a new engine thread and returns once it is ready to serve.
     pub fn start(cfg: EngineConfig) -> Result<Arc<Engine>> {
         let (tx, rx) = mpsc::sync_channel::<Job>(cfg.queue.max(1));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, bool)>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, bool, usize)>>();
         let k = cfg.k;
         std::thread::Builder::new()
             .name("astral-engine".into())
@@ -63,12 +80,12 @@ impl Engine {
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok((s.capacity(), s.spec_enabled())));
-                run(&mut s, rx);
+                let _ = ready_tx.send(Ok((s.capacity(), s.spec_enabled(), s.n_seqs())));
+                Scheduler::new(&mut s, rx).run();
             })
             .map_err(|e| AstralError::Invalid(format!("engine thread: {e}")))?;
-        let (capacity, draft) = ready_rx.recv().map_err(|_| AstralError::Invalid("engine thread died while loading".into()))??;
-        Ok(Arc::new(Engine { tx, capacity, draft, k }))
+        let (capacity, draft, max_seqs) = ready_rx.recv().map_err(|_| AstralError::Invalid("engine thread died while loading".into()))??;
+        Ok(Arc::new(Engine { tx, capacity, draft, k, max_seqs }))
     }
 
     /// Queues a request; `Err` when the queue is full (the caller answers 503).
@@ -97,16 +114,26 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
     let t = std::time::Instant::now();
     let w = Weights::load(&ctx, &g)?;
     eprintln!("astral: loaded {:.2} GB of weights in {:.1} s", w.bytes as f64 / 1e9, t.elapsed().as_secs_f64());
-    let mut s = Session::new(&ctx, w, cfg.ctx)?;
+    let per_seq = astral_model::inkling::seq_bytes(&w.cfg, cfg.ctx);
+    let (free, _) = ctx.mem_info()?;
+    // The draft's weights and buffers come out of the same memory.
+    let reserve = RESERVE_BYTES + if cfg.draft.is_some() { 2 << 30 } else { 0 };
+    let fit = free.saturating_sub(reserve) / per_seq.max(1);
+    let seqs = if cfg.max_seqs == 0 { fit.clamp(1, AUTO_MAX_SEQS) } else { cfg.max_seqs };
+    if seqs > fit.max(1) {
+        eprintln!("astral: warning: {seqs} sequences of {} positions need {:.1} GB; {:.1} GB are free", cfg.ctx, (seqs * per_seq) as f64 / 1e9, free as f64 / 1e9);
+    }
+    let t = std::time::Instant::now();
+    let mut s = Session::with_seqs(&ctx, w, cfg.ctx, seqs, seqs)?;
     if let Some(dir) = &cfg.draft {
         s.enable_spec(dir, cfg.k)?;
     }
     // Warm-up: capture the decode / speculative graphs before the first request.
     let warm = [200028u32, 760, 6511, 314];
     s.prefill(&warm)?;
-    let mut t = 0;
+    let mut t1 = 0;
     for _ in 0..4 {
-        t = s.step(t)?;
+        t1 = s.step(t1)?;
     }
     s.reset()?;
     if s.spec_enabled() {
@@ -116,72 +143,251 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
         }
         s.reset()?;
     }
+    // Batched decode: one graph per batch size, exercised once on every slot.
+    for n in 1..=s.max_batch() {
+        s.capture_batch(n)?;
+    }
+    for q in 0..seqs {
+        s.reset_seq(q)?;
+        s.prefill_seq(q, 0, &warm)?;
+    }
+    let rows: Vec<DecodeRow> = (0..seqs).map(|q| DecodeRow { seq: q, pos: warm.len() as u32, token: warm[0] }).collect();
+    s.decode_batch(&rows)?;
+    s.decode_batch(&rows[..1])?;
+    for q in 0..seqs {
+        s.reset_seq(q)?;
+    }
+    eprintln!("astral: {seqs} sequence slots of {} positions ({:.1} GB), batch graphs ready in {:.1} s", cfg.ctx, (seqs * per_seq) as f64 / 1e9, t.elapsed().as_secs_f64());
     Ok(s)
 }
 
-fn run(s: &mut Session, rx: Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
-        if let Err(e) = run_job(s, &job) {
-            let _ = job.tx.send(Event::Error(e.to_string()));
+/// A running request.
+struct Active {
+    job: Job,
+    /// Its sequence slot.
+    seq: usize,
+    /// Positions written so far (the next input goes to this position).
+    pos: u32,
+    /// The last generated token: the next input.
+    last: u32,
+    /// Tokens sent to the client.
+    sent: usize,
+    /// Decoding with speculative rounds (sequence 0, alone).
+    spec: bool,
+}
+
+/// Why a request ended, if it did.
+enum Emit {
+    More,
+    Finished(&'static str),
+    Cancelled,
+}
+
+impl Active {
+    /// Sends one generated token; reports whether the request is over.
+    fn emit(&mut self, t: u32) -> Emit {
+        if self.job.stop_ids.contains(&t) {
+            return Emit::Finished("stop");
         }
+        if self.job.tx.send(Event::Token(t)).is_err() {
+            return Emit::Cancelled;
+        }
+        self.sent += 1;
+        self.last = t;
+        if self.sent >= self.job.max_tokens {
+            return Emit::Finished("length");
+        }
+        Emit::More
     }
 }
 
-fn run_job(s: &mut Session, job: &Job) -> Result<()> {
-    if job.prompt.is_empty() || job.max_tokens == 0 {
-        let _ = job.tx.send(Event::Done { finish: "length" });
-        return Ok(());
+struct Scheduler<'a> {
+    s: &'a mut Session,
+    rx: Receiver<Job>,
+    waiting: VecDeque<Job>,
+    active: Vec<Active>,
+    free: Vec<bool>,
+    closed: bool,
+}
+
+impl<'a> Scheduler<'a> {
+    fn new(s: &'a mut Session, rx: Receiver<Job>) -> Self {
+        let n = s.n_seqs();
+        Self { s, rx, waiting: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false }
     }
-    s.reset()?;
-    let mut n = 0usize;
-    // Emits one token; false when the request is over (stop token, length or a cancel).
-    let mut emit = |t: u32| -> Option<&'static str> {
-        if job.stop_ids.contains(&t) {
-            return Some("stop");
-        }
-        if job.tx.send(Event::Token(t)).is_err() {
-            return Some("cancelled");
-        }
-        n += 1;
-        if n >= job.max_tokens {
-            return Some("length");
-        }
-        None
-    };
-    let finish = if job.use_draft && s.spec_enabled() {
-        let first = s.spec_begin(&job.prompt)?;
-        let mut fin = emit(first);
-        while fin.is_none() {
-            let r = s.spec_next()?;
-            if r.is_empty() {
-                fin = Some("length");
-                break;
+
+    fn run(&mut self) {
+        loop {
+            // Block for work when idle; otherwise take whatever has arrived.
+            if self.active.is_empty() && self.waiting.is_empty() {
+                match self.rx.recv() {
+                    Ok(j) => self.waiting.push_back(j),
+                    Err(_) => return,
+                }
             }
-            for t in r {
-                fin = emit(t);
-                if fin.is_some() {
+            self.drain();
+            if self.closed && self.active.is_empty() && self.waiting.is_empty() {
+                return;
+            }
+            self.admit();
+            if let Err(e) = self.step() {
+                // A failed step poisons every running request; the session is still usable.
+                let msg = e.to_string();
+                for a in self.active.drain(..) {
+                    let _ = a.job.tx.send(Event::Error(msg.clone()));
+                    self.free[a.seq] = true;
+                }
+            }
+        }
+    }
+
+    fn drain(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(j) => self.waiting.push_back(j),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.closed = true;
                     break;
                 }
             }
         }
-        fin
-    } else {
-        let mut t = s.prefill(&job.prompt)?;
-        let mut fin = emit(t);
-        while fin.is_none() {
-            if s.pos >= s.capacity() {
-                fin = Some("length");
-                break;
-            }
-            t = s.step(t)?;
-            fin = emit(t);
-        }
-        fin
-    };
-    if let Some(f) = finish
-        && f != "cancelled"
-    {
-        let _ = job.tx.send(Event::Done { finish: f });
     }
-    Ok(())
+
+    /// Starts waiting requests while sequence slots are free (lowest slot first, so a request
+    /// that starts alone gets slot 0, the one speculative decoding runs on). The new prompts are
+    /// prefilled together in packed passes.
+    fn admit(&mut self) {
+        let mut batch: Vec<(Job, usize)> = Vec::new();
+        while let Some(job) = self.waiting.pop_front() {
+            if job.prompt.is_empty() || job.max_tokens == 0 {
+                let _ = job.tx.send(Event::Done { finish: "length" });
+                continue;
+            }
+            let Some(seq) = self.free.iter().position(|&f| f) else {
+                self.waiting.push_front(job);
+                break;
+            };
+            let alone = self.active.is_empty() && self.waiting.is_empty() && batch.is_empty();
+            if alone && seq == 0 && job.use_draft && self.s.spec_enabled() {
+                match self.s.reset().and_then(|_| self.s.spec_begin(&job.prompt)) {
+                    Ok(first) => self.start(job, seq, first, true),
+                    Err(e) => {
+                        let _ = job.tx.send(Event::Error(e.to_string()));
+                    }
+                }
+                continue;
+            }
+            self.free[seq] = false;
+            batch.push((job, seq));
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let firsts = batch
+            .iter()
+            .try_for_each(|(_, q)| self.s.reset_seq(*q))
+            .and_then(|_| {
+                let jobs: Vec<(usize, &[u32])> = batch.iter().map(|(j, q)| (*q, j.prompt.as_slice())).collect();
+                self.s.prefill_many(&jobs)
+            });
+        match firsts {
+            Ok(f) => {
+                for ((job, seq), first) in batch.into_iter().zip(f) {
+                    self.free[seq] = true;
+                    self.start(job, seq, first, false);
+                }
+            }
+            Err(e) => {
+                for (job, seq) in batch {
+                    let _ = job.tx.send(Event::Error(e.to_string()));
+                    self.free[seq] = true;
+                }
+            }
+        }
+    }
+
+    /// A request whose prompt is in slot `seq` and whose first token is `first`.
+    fn start(&mut self, job: Job, seq: usize, first: u32, spec: bool) {
+        self.free[seq] = false;
+        let mut a = Active { pos: job.prompt.len() as u32, job, seq, last: first, sent: 0, spec };
+        match a.emit(first) {
+            Emit::More => self.active.push(a),
+            end => self.retire(a, end),
+        }
+    }
+
+    fn retire(&mut self, a: Active, end: Emit) {
+        if let Emit::Finished(f) = end {
+            let _ = a.job.tx.send(Event::Done { finish: f });
+        }
+        self.free[a.seq] = true;
+    }
+
+    /// One decode step for every running request.
+    fn step(&mut self) -> Result<()> {
+        if self.active.is_empty() {
+            return Ok(());
+        }
+        // A lone speculative request runs one round; anything else decodes in a batch.
+        if self.active.len() == 1 && self.active[0].spec {
+            let toks = self.s.spec_next()?;
+            let mut a = self.active.pop().expect("one active request");
+            a.pos = self.s.pos;
+            if toks.is_empty() {
+                self.retire(a, Emit::Finished("length"));
+                return Ok(());
+            }
+            let mut end = Emit::More;
+            for t in toks {
+                end = a.emit(t);
+                if !matches!(end, Emit::More) {
+                    break;
+                }
+            }
+            match end {
+                Emit::More => self.active.push(a),
+                e => self.retire(a, e),
+            }
+            return Ok(());
+        }
+        for a in &mut self.active {
+            a.spec = false;
+        }
+        let cap = self.s.capacity();
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].pos >= cap {
+                let a = self.active.swap_remove(i);
+                self.retire(a, Emit::Finished("length"));
+            } else {
+                i += 1;
+            }
+        }
+        let mb = self.s.max_batch();
+        let mut start = 0;
+        while start < self.active.len() {
+            let end = (start + mb).min(self.active.len());
+            let rows: Vec<DecodeRow> = self.active[start..end].iter().map(|a| DecodeRow { seq: a.seq, pos: a.pos, token: a.last }).collect();
+            let next = self.s.decode_batch(&rows)?;
+            for (a, t) in self.active[start..end].iter_mut().zip(next) {
+                a.pos += 1;
+                a.last = t;
+            }
+            start = end;
+        }
+        // Emit after the pass (a retire reorders `active`).
+        let mut i = 0;
+        while i < self.active.len() {
+            let t = self.active[i].last;
+            match self.active[i].emit(t) {
+                Emit::More => i += 1,
+                end => {
+                    let a = self.active.swap_remove(i);
+                    self.retire(a, end);
+                }
+            }
+        }
+        Ok(())
+    }
 }

@@ -343,6 +343,32 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 }
             }
         }
+        "verify" => {
+            // Cost of a pass where each of n sequences feeds v tokens (v = 1..=4), the shape
+            // of a batched speculative verification.
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let toks: Vec<Vec<u32>> = (0..n).map(|q| (0..4).map(|j| (1000 + (q * 4 + j) * 7919 % 150000) as u32).collect()).collect();
+            let per = (t_end - std::time::Instant::now()).as_secs_f64() / 4.0;
+            for v in 1..=4usize {
+                let parts: Vec<(usize, u32, &[u32])> = (0..n).map(|q| (q, 600u32, &toks[q][..v])).collect();
+                s.step_mixed(&parts)?;
+                if std::env::var("ASTRAL_PROFILE").ok().and_then(|x| x.parse::<usize>().ok()) == Some(v) {
+                    astral_gpu::profiler(true)?;
+                    s.step_mixed(&parts)?;
+                    astral_gpu::profiler(false)?;
+                    return Ok(true);
+                }
+                let (t0, mut c) = (std::time::Instant::now(), 0usize);
+                while t0.elapsed().as_secs_f64() < per {
+                    s.step_mixed(&parts)?;
+                    c += 1;
+                }
+                println!("verify {n} x {v}: {:.2} ms per pass", t0.elapsed().as_secs_f64() * 1e3 / c as f64);
+            }
+        }
         "mixcheck" => {
             // Greedy picks of n - 1 sequences decoded 8 steps by decode_batch, then again by
             // step_mixed passes that also prefill a prompt into sequence n - 1.
@@ -391,7 +417,8 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 s.prefill_seq(q, 0, &long[..64])?;
             }
             let budget = s.token_budget();
-            let chunk: Vec<u32> = (0..budget - (n - 1)).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
+            let clen = std::env::var("ASTRAL_MIX_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(budget - (n - 1));
+            let chunk: Vec<u32> = (0..clen).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
             let one = [1000u32];
             while std::time::Instant::now() < t_end {
                 s.reset_seq(n - 1)?;

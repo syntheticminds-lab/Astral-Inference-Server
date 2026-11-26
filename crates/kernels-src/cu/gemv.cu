@@ -2969,6 +2969,17 @@ __device__ __forceinline__ void wgmma_m64n32k16(float (&d)[16], const unsigned (
 }
 #endif
 #define FW_STAGES 5
+// The SITU activation (situ_act in inkling.cu) with the hardware tanh and exp approximations
+// (relative error about 2^-11, the f16 rounding the result gets anyway).
+__device__ __forceinline__ float tanh_fast(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float situ_act(float g, float u, float beta, float lb) {
+    const float a = beta * tanh_fast(g * (1.0f / beta)) * __frcp_rn(1.0f + __expf(-g));
+    return a * (lb > 0.0f ? lb * tanh_fast(u * (1.0f / lb)) : u);
+}
 template <unsigned BT>
 struct __align__(1024) FWStage {
     __half b[BT * 64];    // activations, 128-byte swizzle (BT * 128 bytes)
@@ -2980,7 +2991,8 @@ template <unsigned BT>
 __device__ __forceinline__ void nvfp4_ws256(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) {
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, __half* __restrict__ act,
+    float beta, float lb) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     extern __shared__ __align__(1024) unsigned char fwsmem[];
     FWStage<BT>* sm = reinterpret_cast<FWStage<BT>*>(fwsmem);
@@ -3087,6 +3099,23 @@ __device__ __forceinline__ void nvfp4_ws256(
     if (i < KC) step(i, a0);
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     const float ms = (mat_scale ? mat_scale[e] : 1.0f) * 16384.0f;
+    if (act) {
+        // Fused SITU (gate_up rows interleaved by eight: row g of each 16 is a gate, row g + 8
+        // its up): f16 activations act[yrow][N / 2] for the down projection.
+        const unsigned nff = N / 2u;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            const float* d = h ? d1 : d0;
+            const unsigned c = (row0 + h * 128u + warp * 16u) / 2u + g;
+#pragma unroll
+            for (unsigned nt = 0; nt < BT / 8u; ++nt) {
+                const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
+                if (j0 < count) act[(u64)min(yidx[start + j0], y_rows - 1u) * nff + c] = __float2half_rn(situ_act(d[4 * nt] * ms, d[4 * nt + 2] * ms, beta, lb));
+                if (j1 < count) act[(u64)min(yidx[start + j1], y_rows - 1u) * nff + c] = __float2half_rn(situ_act(d[4 * nt + 1] * ms, d[4 * nt + 3] * ms, beta, lb));
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (unsigned h = 0; h < 2; ++h) {
         const float* d = h ? d1 : d0;
@@ -3113,15 +3142,15 @@ __device__ __forceinline__ void nvfp4_ws256(
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<128>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb) { PDL_WAIT(); nvfp4_ws256<128>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb); }
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t64(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<64>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb) { PDL_WAIT(); nvfp4_ws256<64>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb); }
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t32(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<32>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb) { PDL_WAIT(); nvfp4_ws256<32>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb); }
 
 // =============================================================================================
 // Dense Q8_0 products for batched decode (T <= 64 tokens), tiled through shared memory: a block

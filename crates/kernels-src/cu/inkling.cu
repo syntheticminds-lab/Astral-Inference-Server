@@ -683,6 +683,12 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_argmax(const float
 // launch; the arithmetic per element is unchanged, so results match the unfused path up to
 // summation order. Mirrored by the `fused` launchers in crates/kernels/src/inkling.rs.
 
+// The SITU activation of one channel from its gate and up values.
+__device__ __forceinline__ float situ_act(float g, float u, float beta, float lb) {
+    const float a = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
+    return a * (lb > 0.0f ? lb * tanhf(u / lb) : u);
+}
+
 // int8 quantisation of one 32-value block held one value per lane (llama.cpp q8_1 scheme,
 // as astral_quantize_x_q8 in gemv.cu).
 __device__ __forceinline__ void q8_store(float v, signed char* __restrict__ xq, float* __restrict__ xd, unsigned blk, unsigned lane,
@@ -1141,7 +1147,9 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_gate_q8(float* __re
     q8_store(v, xq, xd, b, lane, xh);
 }
 
-// SITU over `slots` gate_up rows, quantised to int8 per 32 values (n_ff % 32 == 0).
+// SITU over `slots` gate_up rows, quantised to int8 per 32 values (n_ff % 32 == 0). Expert
+// gate_up rows are interleaved by eight at load (see situ_act): channel c's gate is row
+// 16 (c / 8) + c % 8 and its up row the one 8 after it.
 extern "C" __global__ void __launch_bounds__(256) astral_ink_situ_q8(const float* __restrict__ gu, signed char* __restrict__ xq,
                                                                      float* __restrict__ xd, __half* __restrict__ xh, unsigned n_ff,
                                                                      unsigned slots, float beta, float lb) { PDL_WAIT();
@@ -1149,10 +1157,8 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_situ_q8(const float
     if (b >= slots * (n_ff >> 5)) return;
     const unsigned i = b * 32u + lane;
     const unsigned s = i / n_ff, c = i - s * n_ff;
-    const float g = gu[(u64)s * 2 * n_ff + c];
-    const float u = gu[(u64)s * 2 * n_ff + n_ff + c];
-    const float a = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
-    q8_store(a * (lb > 0.0f ? lb * tanhf(u / lb) : u), xq, xd, b, lane, xh);
+    const u64 gi = (u64)s * 2 * n_ff + (c >> 3) * 16u + (c & 7u);
+    q8_store(situ_act(gu[gi], gu[gi + 8u], beta, lb), xq, xd, b, lane, xh);
 }
 
 // One token of astral_ink_conv_residual for channel c, with every rounding explicit (no
@@ -1603,32 +1609,41 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ src, unsigned
     return t >= 0 ? src[(u64)t * stride + c] : state[c * 3 + (unsigned)(3 + t)];
 }
 
-// dst[t*dst_stride + c] = (x_t + conv + taps) * norm; optional per-token dynamic taps.
+// dst[t*dst_stride + c] = (x_t + conv + taps) * norm; optional per-token dynamic taps. One
+// thread per channel and CONV_T consecutive tokens (blockIdx.y), the window in registers.
+#define CONV_T 8
 __device__ __forceinline__ void astral_ink_conv_par_body(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
                                                unsigned dst_stride, unsigned ntok, const float* __restrict__ state,
                                                const float* __restrict__ weight, const float* __restrict__ dyn, unsigned dyn_stride,
                                                unsigned dyn_heads, unsigned channels, float* __restrict__ hist) {
     const float norm = rsqrtf(dyn ? 9.0f : 5.0f);
     const unsigned per_head = dyn_heads ? channels / dyn_heads : 1u;
-    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
-    if (c >= channels || t >= ntok) return;
-    const int ti = (int)t;
-    const float in0 = conv_in(src, src_stride, state, ti - 3, c), in1 = conv_in(src, src_stride, state, ti - 2, c);
-    const float in2 = conv_in(src, src_stride, state, ti - 1, c), cur = src[(u64)t * src_stride + c];
-    if (hist) hist[(u64)t * channels + c] = cur;   // verify passes: the conv input, for the rollback
-    const float* w = weight + (u64)c * 4;
-    float out = in0 * w[0];
-    out += in1 * w[1];
-    out += in2 * w[2];
-    out += cur * w[3];
-    if (dyn) {
-        const float* tp = dyn + (u64)t * dyn_stride + (u64)(c / per_head) * 4;
-        out += cur * tp[0];
-        out += in2 * tp[1];
-        out += in1 * tp[2];
-        out += in0 * tp[3];
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * CONV_T;
+    if (c >= channels || t0 >= ntok) return;
+    const int ti = (int)t0;
+    float in0 = conv_in(src, src_stride, state, ti - 3, c), in1 = conv_in(src, src_stride, state, ti - 2, c);
+    float in2 = conv_in(src, src_stride, state, ti - 1, c);
+    const float4 w = *reinterpret_cast<const float4*>(weight + (u64)c * 4);
+    const unsigned t1 = min(t0 + CONV_T, ntok);
+    for (unsigned t = t0; t < t1; ++t) {
+        const float cur = src[(u64)t * src_stride + c];
+        if (hist) hist[(u64)t * channels + c] = cur;   // verify passes: the conv input, for the rollback
+        float out = in0 * w.x;
+        out += in1 * w.y;
+        out += in2 * w.z;
+        out += cur * w.w;
+        if (dyn) {
+            const float* tp = dyn + (u64)t * dyn_stride + (u64)(c / per_head) * 4;
+            out += cur * tp[0];
+            out += in2 * tp[1];
+            out += in1 * tp[2];
+            out += in0 * tp[3];
+        }
+        dst[(u64)t * dst_stride + c] = (cur + out) * norm;
+        in0 = in1;
+        in1 = in2;
+        in2 = cur;
     }
-    dst[(u64)t * dst_stride + c] = (cur + out) * norm;
 }
 extern "C" __global__ void astral_ink_conv_par(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
                                                unsigned dst_stride, unsigned ntok, const float* __restrict__ state,
@@ -1638,29 +1653,37 @@ extern "C" __global__ void astral_ink_conv_par(const float* __restrict__ src, un
 }
 
 
-// Residual form: y = conv(src); bank_row ? (bank_row = cur, cur = y) : (cur += y). Token-major.
+// Residual form: y = conv(src); bank_row ? (bank_row = cur, cur = y) : (cur += y). Token-major;
+// one thread per channel and CONV_T consecutive tokens.
 __device__ __forceinline__ void astral_ink_conv_res_par_body(const float* __restrict__ src, unsigned ntok, const float* __restrict__ state,
                                                    const float* __restrict__ weight, float* __restrict__ cur,
                                                    float* __restrict__ bank_row, unsigned channels, float* __restrict__ hist) {
     const float norm = rsqrtf(5.0f);
-    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
-    if (c >= channels || t >= ntok) return;
-    const int ti = (int)t;
-    const float in0 = conv_in(src, channels, state, ti - 3, c), in1 = conv_in(src, channels, state, ti - 2, c);
-    const float in2 = conv_in(src, channels, state, ti - 1, c), x = src[(u64)t * channels + c];
-    if (hist) hist[(u64)t * channels + c] = x;   // verify passes: the conv input, for the rollback
-    const float* w = weight + (u64)c * 4;
-    float out = in0 * w[0];
-    out += in1 * w[1];
-    out += in2 * w[2];
-    out += x * w[3];
-    const float y = (x + out) * norm;
-    const u64 o = (u64)t * channels + c;
-    if (bank_row) {
-        bank_row[o] = cur[o];
-        cur[o] = y;
-    } else {
-        cur[o] = cur[o] + y;
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * CONV_T;
+    if (c >= channels || t0 >= ntok) return;
+    const int ti = (int)t0;
+    float in0 = conv_in(src, channels, state, ti - 3, c), in1 = conv_in(src, channels, state, ti - 2, c);
+    float in2 = conv_in(src, channels, state, ti - 1, c);
+    const float4 w = *reinterpret_cast<const float4*>(weight + (u64)c * 4);
+    const unsigned t1 = min(t0 + CONV_T, ntok);
+    for (unsigned t = t0; t < t1; ++t) {
+        const float x = src[(u64)t * channels + c];
+        if (hist) hist[(u64)t * channels + c] = x;   // verify passes: the conv input, for the rollback
+        float out = in0 * w.x;
+        out += in1 * w.y;
+        out += in2 * w.z;
+        out += x * w.w;
+        const float y = (x + out) * norm;
+        const u64 o = (u64)t * channels + c;
+        if (bank_row) {
+            bank_row[o] = cur[o];
+            cur[o] = y;
+        } else {
+            cur[o] = cur[o] + y;
+        }
+        in0 = in1;
+        in1 = in2;
+        in2 = x;
     }
 }
 extern "C" __global__ void astral_ink_conv_res_par(const float* __restrict__ src, unsigned ntok, const float* __restrict__ state,
@@ -1932,6 +1955,86 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_tgemm_tn(const floa
 #endif
 }
 
+// Loop-controller output for many tokens in one kernel: gain/forget = cd . W_gf^T (bf16 tensor
+// cores, K = rank) and out[t][n] = x - tanh(f) x + tanh(g) msg (as astral_ink_ctrl_apply), so
+// gf never goes through memory. Block = 64 tokens x 32 channels; each warp's 32 columns are
+// 16 gain rows then the 16 forget rows of the same channels. grid = (dim / 32, ceil(ntok / 64)),
+// 128 threads; rank % 32 == 0, dim % 32 == 0.
+extern "C" __global__ void __launch_bounds__(128) astral_ink_ctrl_gf_apply(const float* __restrict__ cd, unsigned rank,
+                                                                           const float* __restrict__ w, const float* __restrict__ x,
+                                                                           unsigned x_stride, const float* __restrict__ msg,
+                                                                           unsigned msg_stride, float* __restrict__ out, unsigned dim,
+                                                                           unsigned ntok) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr unsigned RS = 20;
+    __shared__ unsigned As[64 * RS], Ws[64 * RS];
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned m0 = blockIdx.y * 64u, c0 = blockIdx.x * 32u;
+    const unsigned wm = (warp & 1u) * 32u, wn = (warp >> 1) * 32u;
+    float acc[2][4][4];
+#pragma unroll
+    for (unsigned i = 0; i < 2; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+    for (unsigned k0 = 0; k0 < rank; k0 += 32u) {
+#pragma unroll
+        for (unsigned q = 0; q < 4; ++q) {
+            const unsigned i = tid + q * 128u, r = i >> 3, c4 = i & 7u, k = k0 + c4 * 4u;
+            float4 av = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const unsigned m = m0 + r;
+            if (m < ntok) av = __ldg(reinterpret_cast<const float4*>(cd + (u64)m * rank + k));
+            // Smem row r: warp column block r / 32, within it 16 gain then 16 forget rows.
+            const unsigned j = r & 31u, ch = c0 + (r >> 5) * 16u + (j & 15u);
+            const float4 wv = __ldg(reinterpret_cast<const float4*>(w + (u64)(ch + (j >= 16u ? dim : 0u)) * rank + k));
+            As[r * RS + c4 * 2u] = bf16x2(av.x, av.y);
+            As[r * RS + c4 * 2u + 1u] = bf16x2(av.z, av.w);
+            Ws[r * RS + c4 * 2u] = bf16x2(wv.x, wv.y);
+            Ws[r * RS + c4 * 2u + 1u] = bf16x2(wv.z, wv.w);
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned ks = 0; ks < 2; ++ks) {
+            unsigned a[2][4], b[4][2];
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const unsigned r = wm + mt * 16u + g;
+                a[mt][0] = As[r * RS + ks * 8u + t];
+                a[mt][1] = As[(r + 8u) * RS + ks * 8u + t];
+                a[mt][2] = As[r * RS + ks * 8u + 4u + t];
+                a[mt][3] = As[(r + 8u) * RS + ks * 8u + 4u + t];
+            }
+#pragma unroll
+            for (unsigned nt = 0; nt < 4; ++nt) {
+                const unsigned r = wn + nt * 8u + g;
+                b[nt][0] = Ws[r * RS + ks * 8u + t];
+                b[nt][1] = Ws[r * RS + ks * 8u + 4u + t];
+            }
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (unsigned nt = 0; nt < 4; ++nt) mma_bf16_16816(acc[mt][nt], a[mt], b[nt][0], b[nt][1]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (unsigned nt = 0; nt < 2; ++nt) {
+#pragma unroll
+            for (unsigned e = 0; e < 4; ++e) {
+                const unsigned m = m0 + wm + mt * 16u + g + (e >> 1) * 8u;
+                const unsigned n = c0 + (wn >> 1) + nt * 8u + 2u * t + (e & 1u);
+                if (m < ntok) {
+                    const float gg = acc[mt][nt][e], ff = acc[mt][nt + 2u][e];
+                    const float c = x[(u64)m * x_stride + n];
+                    out[(u64)m * dim + n] = (c - tanhf(ff) * c) + tanhf(gg) * msg[(u64)m * msg_stride + n];
+                }
+            }
+        }
+    }
+#endif
+}
+
 // out[i] = ((p[0][i] + p[1][i]) + p[2][i]) + ... over `splits` partials of n values each.
 extern "C" __global__ void astral_ink_sum_splits(const float* __restrict__ p, float* __restrict__ out, unsigned n, unsigned splits) { PDL_WAIT();
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
@@ -1970,6 +2073,10 @@ template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile(
 #define FA_Q 64
 #define FA_K 64
 #define FA_ROW 136   // halves per smem row: 128 + 8 pad (conflict-free fragment / ldmatrix reads)
+#define FA_TB 80     // relative-bias columns per warp and key tile: 16 queries + 64 keys - 1, padded
+// Dynamic shared memory of the prefill attention kernels: K and V tiles, then per warp the
+// relative-bias table of the current key tile.
+#define FA_SMEM (2 * FA_K * FA_ROW * 2 + 4 * 16 * FA_TB * 4)
 
 __device__ __forceinline__ void mma_f16(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -1987,8 +2094,9 @@ __device__ __forceinline__ void attn_prefill_body(
     float* __restrict__ out, const int* __restrict__ pos_p, unsigned ntok, unsigned heads, unsigned kv_heads,
     unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) {
     constexpr unsigned HD = 128;
-    __shared__ __align__(16) __half Ks[FA_K * FA_ROW];
-    __shared__ __align__(16) __half Vs[FA_K * FA_ROW];
+    extern __shared__ __align__(16) unsigned char fa_smem[];
+    __half* Ks = reinterpret_cast<__half*>(fa_smem);
+    __half* Vs = Ks + FA_K * FA_ROW;
     const unsigned h = blockIdx.y, qt = blockIdx.x;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     const unsigned kvh = h / (heads / kv_heads), width = kv_heads * HD;
@@ -2013,12 +2121,22 @@ __device__ __forceinline__ void attn_prefill_body(
             qa[ks][3] = pack_h2(qrb[c + 8], qrb[c + 9]);
         }
     }
-    float ra[16], rb[16];
-#pragma unroll
-    for (unsigned i = 0; i < 16; ++i) {
-        ra[i] = i < n_rel ? r[((u64)la * heads + h) * n_rel + i] : 0.0f;
-        rb[i] = i < n_rel ? r[((u64)lb * heads + h) * n_rel + i] : 0.0f;
+    // Relative-bias query fragments (A operand, n_rel zero-padded to 16): the bias of every
+    // (query, key) of a tile comes from one 16 x 80 tensor-core product T = R B^T per warp,
+    // T[i][j] = r_i . bias_row(dmin + j), read back from shared memory by distance.
+    unsigned rq[4];
+    {
+        const float* rra = r + ((u64)la * heads + h) * n_rel;
+        const float* rrb = r + ((u64)lb * heads + h) * n_rel;
+        const unsigned c0 = 2u * t, c1 = 2u * t + 8u;
+        auto rv = [&](const float* rr, unsigned c) { return c < n_rel ? rr[c] : 0.0f; };
+        rq[0] = pack_h2(rv(rra, c0), rv(rra, c0 + 1u));
+        rq[1] = pack_h2(rv(rrb, c0), rv(rrb, c0 + 1u));
+        rq[2] = pack_h2(rv(rra, c1), rv(rra, c1 + 1u));
+        rq[3] = pack_h2(rv(rrb, c1), rv(rrb, c1 + 1u));
     }
+    float* Tw = reinterpret_cast<float*>(Vs + FA_K * FA_ROW) + warp * (16u * FA_TB);
+    const int pw = (int)(pos0 + qt * FA_Q + warp * 16u);
     const float ska = sink[(u64)la * heads + h], skb = sink[(u64)lb * heads + h];
     // Key range of the whole block.
     const unsigned first = min(pos0 + qt * FA_Q, cap - 1u);
@@ -2053,6 +2171,29 @@ __device__ __forceinline__ void attn_prefill_body(
                 mma_f16(s[nt], qa[ks], b0, b1);
             }
         }
+        // This warp's bias table for the tile: column j is distance dmin + j.
+        {
+            const int dmin = pw - (int)(kb + FA_K - 1u);
+#pragma unroll
+            for (unsigned nb = 0; nb < FA_TB / 8u; ++nb) {
+                const int d = dmin + (int)(nb * 8u + g);
+                unsigned b0 = 0u, b1 = 0u;
+                if (d >= 0 && d < (int)extent) {
+                    const float* br = rel_bias + (u64)d * n_rel;
+                    const unsigned c0 = 2u * t, c1 = 2u * t + 8u;
+                    b0 = pack_h2(c0 < n_rel ? br[c0] : 0.0f, c0 + 1u < n_rel ? br[c0 + 1u] : 0.0f);
+                    b1 = pack_h2(c1 < n_rel ? br[c1] : 0.0f, c1 + 1u < n_rel ? br[c1 + 1u] : 0.0f);
+                }
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma_f16(c, rq, b0, b1);
+                const unsigned col = nb * 8u + 2u * t;
+                Tw[g * FA_TB + col] = c[0];
+                Tw[g * FA_TB + col + 1u] = c[1];
+                Tw[(g + 8u) * FA_TB + col] = c[2];
+                Tw[(g + 8u) * FA_TB + col + 1u] = c[3];
+            }
+            __syncwarp();
+        }
         // Logits with bias, sink and masks; tile row maxima.
         float tma = -INFINITY, tmb = -INFINITY;
 #pragma unroll
@@ -2065,22 +2206,9 @@ __device__ __forceinline__ void attn_prefill_body(
                 const bool valid = (rowb ? okb : oka) && key <= qp && (!window || qp - key < window);
                 float l = -INFINITY;
                 if (valid) {
-                    const unsigned dist = qp - key;
-                    float bias = 0.0f;
-                    if (dist < extent) {
-                        const float4* br = reinterpret_cast<const float4*>(rel_bias + (u64)dist * n_rel);
-                        const float* rr = rowb ? rb : ra;
-#pragma unroll
-                        for (unsigned v = 0; v < 4; ++v) {
-                            if (v * 4u < n_rel) {
-                                const float4 b4 = __ldg(br + v);
-                                bias = fmaf(b4.x, rr[4 * v], bias);
-                                bias = fmaf(b4.y, rr[4 * v + 1], bias);
-                                bias = fmaf(b4.z, rr[4 * v + 2], bias);
-                                bias = fmaf(b4.w, rr[4 * v + 3], bias);
-                            }
-                        }
-                    }
+                    // Valid rows sit at pw + local, so the table column is local + 63 - key offset.
+                    const unsigned local = rowb ? g + 8u : g;
+                    const float bias = Tw[local * FA_TB + local + (FA_K - 1u) - (nt * 8u + 2u * t + (i & 1u))];
                     l = fmaf(scale, s[nt][i], bias) - (rowb ? skb : ska);
                 }
                 s[nt][i] = l;
@@ -2170,56 +2298,81 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill_segs(
 // Tokens per GEMM work item: `chunk` (64 = MMA_TOK of the mma.sync kernels, 128 for wgmma).
 // MoE grouping on the GPU (prefill): sorts the P = ntok * k (token, expert) picks by expert and
 // writes the tensor-core GEMM work items for gate_up (activation row = token) and down
-// (activation row = pair), so no host sync is needed. Items are [e, start, count <= 64];
+// (activation row = pair), so no host sync is needed. Items are [e, start, count <= chunk];
 // entries past the last real item get count 0 (the GEMM skips them), so the GEMM grid can
-// be the fixed maximum `max_items`. Order within an expert follows atomics (each output row
-// is computed independently, so results do not depend on it). One block of 1024 threads;
-// n_expert <= 256.
+// be the fixed maximum `max_items`. One block per expert (grid = n_expert, 1024 threads,
+// n_expert <= 256): every block builds the full histogram (warp-private counters) for the
+// offsets, then places its own expert's picks in pick order (deterministic). The down lists'
+// row indices are written only when they are separate buffers from yidx_gu (all three equal p).
 extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group(const int* __restrict__ ids, unsigned P, unsigned k,
                                                                         unsigned n_expert, unsigned* __restrict__ items_gu,
                                                                         unsigned* __restrict__ xidx_gu, unsigned* __restrict__ yidx_gu,
                                                                         unsigned* __restrict__ items_dn, unsigned* __restrict__ xidx_dn,
                                                                         unsigned* __restrict__ yidx_dn, unsigned max_items, unsigned chunk) { PDL_WAIT();
-    __shared__ unsigned cnt[256], off[256], ibase[256], cur[256];
-    const unsigned tid = threadIdx.x;
-    for (unsigned e = tid; e < 256u; e += blockDim.x) { cnt[e] = 0u; cur[e] = 0u; }
+    __shared__ unsigned hist[32][256];
+    __shared__ unsigned cnt[256];
+    __shared__ unsigned wsum[32];
+    __shared__ unsigned sh_off, sh_ibase, sh_total;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, me = blockIdx.x;
+    for (unsigned i = tid; i < 32u * 256u; i += blockDim.x) (&hist[0][0])[i] = 0u;
     __syncthreads();
-    for (unsigned p = tid; p < P; p += blockDim.x) atomicAdd(&cnt[min((unsigned)max(ids[p], 0), n_expert - 1u)], 1u);
+    for (unsigned p = tid; p < P; p += blockDim.x) atomicAdd(&hist[warp][min((unsigned)max(ids[p], 0), n_expert - 1u)], 1u);
+    __syncthreads();
+    for (unsigned e = tid; e < n_expert; e += blockDim.x) {
+        unsigned c = 0;
+        for (unsigned w = 0; w < 32u; ++w) c += hist[w][e];
+        cnt[e] = c;
+    }
     __syncthreads();
     if (tid == 0) {
-        unsigned o = 0, ib = 0;
+        unsigned o = 0, ib = 0, off = 0, ibase = 0;
         for (unsigned e = 0; e < n_expert; ++e) {
-            off[e] = o;
-            ibase[e] = ib;
+            if (e == me) { off = o; ibase = ib; }
             o += cnt[e];
             ib += (cnt[e] + chunk - 1u) / chunk;
         }
-        cur[255] = ib;   // total items (stashed; cur[e] for e < n_expert <= 255 restarts at 0)
+        sh_off = off;
+        sh_ibase = ibase;
+        sh_total = ib;
     }
     __syncthreads();
-    const unsigned total_items = cur[255];
-    __syncthreads();
-    if (tid == 0) cur[255] = 0u;
-    __syncthreads();
-    for (unsigned p = tid; p < P; p += blockDim.x) {
-        const unsigned e = min((unsigned)max(ids[p], 0), n_expert - 1u);
-        const unsigned slot = off[e] + atomicAdd(&cur[e], 1u);
-        xidx_gu[slot] = p / k;
-        yidx_gu[slot] = p;
-        xidx_dn[slot] = p;
-        yidx_dn[slot] = p;
-    }
-    for (unsigned e = tid; e < n_expert; e += blockDim.x) {
-        const unsigned chunks = (cnt[e] + chunk - 1u) / chunk;
-        for (unsigned c = 0; c < chunks; ++c) {
-            const unsigned i = ibase[e] + c;
-            if (i >= max_items) break;
-            const unsigned st = off[e] + c * chunk, n = min(chunk, cnt[e] - c * chunk);
-            items_gu[3 * i] = e; items_gu[3 * i + 1] = st; items_gu[3 * i + 2] = n;
-            items_dn[3 * i] = e; items_dn[3 * i + 1] = st; items_dn[3 * i + 2] = n;
+    const unsigned off = sh_off, total_items = sh_total, n_me = cnt[me];
+    const bool dn_rows = xidx_dn != yidx_gu;
+    // This expert's picks in order: ballot ranks within a warp, warp prefix across the block.
+    unsigned base = off;
+    for (unsigned p0 = 0; p0 < P && base < off + n_me; p0 += blockDim.x) {
+        const unsigned p = p0 + tid;
+        const bool hit = p < P && min((unsigned)max(ids[p], 0), n_expert - 1u) == me;
+        const unsigned bal = __ballot_sync(0xffffffffu, hit);
+        if (lane == 0) wsum[warp] = __popc(bal);
+        __syncthreads();
+        unsigned before = 0, all = 0;
+        for (unsigned w = 0; w < 32u; ++w) {
+            const unsigned c = wsum[w];
+            before += w < warp ? c : 0u;
+            all += c;
         }
+        if (hit) {
+            const unsigned slot = base + before + __popc(bal & ((1u << lane) - 1u));
+            xidx_gu[slot] = p / k;
+            yidx_gu[slot] = p;
+            if (dn_rows) {
+                xidx_dn[slot] = p;
+                yidx_dn[slot] = p;
+            }
+        }
+        base += all;
+        __syncthreads();
     }
-    for (unsigned i = total_items + tid; i < max_items; i += blockDim.x) {
+    const unsigned chunks = (n_me + chunk - 1u) / chunk;
+    for (unsigned c = tid; c < chunks; c += blockDim.x) {
+        const unsigned i = sh_ibase + c;
+        if (i >= max_items) break;
+        const unsigned st = off + c * chunk, n = min(chunk, n_me - c * chunk);
+        items_gu[3 * i] = me; items_gu[3 * i + 1] = st; items_gu[3 * i + 2] = n;
+        items_dn[3 * i] = me; items_dn[3 * i + 1] = st; items_dn[3 * i + 2] = n;
+    }
+    for (unsigned i = total_items + me * blockDim.x + tid; i < max_items; i += gridDim.x * blockDim.x) {
         items_gu[3 * i] = 0u; items_gu[3 * i + 1] = 0u; items_gu[3 * i + 2] = 0u;
         items_dn[3 * i] = 0u; items_dn[3 * i + 1] = 0u; items_dn[3 * i + 2] = 0u;
     }
@@ -2288,7 +2441,7 @@ extern "C" __global__ void astral_ink_conv_par_segs(const float* __restrict__ sr
                                                     const unsigned* __restrict__ seg) { PDL_WAIT();
     const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
     const unsigned r0 = sg[0], n = sg[1];
-    if (blockIdx.y >= n) return;
+    if (blockIdx.y * CONV_T >= n) return;
     astral_ink_conv_par_body(src + (u64)r0 * src_stride, src_stride, dst + (u64)r0 * dst_stride, dst_stride, n, state + sg[4], weight,
                              dyn ? dyn + (u64)r0 * dyn_stride : nullptr, dyn_stride, dyn_heads, channels, nullptr);
 }
@@ -2302,10 +2455,13 @@ extern "C" __global__ void astral_ink_conv_res_par_segs(const float* __restrict_
                                                         unsigned channels, const unsigned* __restrict__ seg) { PDL_WAIT();
     const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
     const unsigned r0 = sg[0], n = sg[1];
-    if (blockIdx.y >= n) return;
+    if (blockIdx.y * CONV_T >= n) return;
     const u64 o = (u64)r0 * channels;
     astral_ink_conv_res_par_body(src + o, n, state + sg[4], weight, cur + o, bank_row ? bank_row + o : nullptr, channels, nullptr);
 }
+// Attention prep of every segment of a packed pass (convs already applied): one warp per
+// (token, job), four jobs per block, four channels per lane (head_dim and n_rel multiples of 4,
+// head_dim <= 128). Same maths as astral_ink_attn_prep_body with do_conv = 0.
 extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep_segs(
     float* __restrict__ q, float* __restrict__ r, float* __restrict__ k, float* __restrict__ v,
     const float* __restrict__ q_scale, const float* __restrict__ r_scale,
@@ -2314,12 +2470,48 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep_segs(
     unsigned heads, unsigned kv_heads, unsigned hd, unsigned n_rel, float thr_qk, float thr_rel, float eps,
     unsigned global, float floor_len, float alpha, unsigned capacity, const unsigned* __restrict__ seg) { PDL_WAIT();
     const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
-    const u64 r0 = sg[0];
-    if (blockIdx.y >= sg[1]) return;
-    const u64 kvw = (u64)kv_heads * hd;
-    astral_ink_attn_prep_body(q + r0 * heads * hd, r + r0 * heads * n_rel, k + r0 * kvw, v + r0 * kvw, q_scale, r_scale, conv_kv + sg[4],
-                              k_conv_w, v_conv_w, nullptr, nullptr, 0u, kc + sg[2], vc + sg[2], pos_p + sg[3], heads, kv_heads, hd, n_rel,
-                              thr_qk, thr_rel, eps, global, floor_len, alpha, capacity, 0u, nullptr, 0u, 0u);
+    const unsigned tok = blockIdx.y;
+    if (tok >= sg[1]) return;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned job = blockIdx.x * 4u + warp;
+    if (job >= 2u * (heads + kv_heads)) return;
+    const u64 row = (u64)sg[0] + tok;
+    const unsigned width = kv_heads * hd;
+    const int posi = pos_p[sg[3]] + (int)tok;
+    const unsigned i = 4u * lane;
+    if (job < 2u * heads) {
+        const bool is_r = job >= heads;
+        const unsigned h = is_r ? job - heads : job, n = is_r ? n_rel : hd;
+        float* xh = is_r ? r + (row * heads + h) * n_rel : q + (row * heads + h) * hd;
+        const float* sc = (is_r ? r_scale : q_scale) + (u64)h * n;
+        float4 x4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (i < n) {
+            const float4 a4 = *reinterpret_cast<const float4*>(xh + i), s4 = *reinterpret_cast<const float4*>(sc + i);
+            x4 = make_float4(a4.x * s4.x, a4.y * s4.y, a4.z * s4.z, a4.w * s4.w);
+        }
+        const float ss = warp_sum(x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w);
+        const float tau = 1.0f + alpha * logf(fmaxf(((float)posi + 1.0f) / floor_len, 1.0f));
+        const float f = fminf(fmaxf((is_r ? thr_rel : thr_qk) / (sqrtf(ss) + 1e-6f), 0.0f), 1.0f) * (global ? tau : 1.0f);
+        if (i < n) *reinterpret_cast<float4*>(xh + i) = make_float4(x4.x * f, x4.y * f, x4.z * f, x4.w * f);
+        return;
+    }
+    const bool is_v = job >= 2u * heads + kv_heads;
+    const unsigned h = job - 2u * heads - (is_v ? kv_heads : 0u);
+    float* x = (is_v ? v : k) + row * width + (u64)h * hd;
+    float4 x4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i < hd) x4 = *reinterpret_cast<const float4*>(x + i);
+    const float ss = warp_sum(x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w);
+    const float f = is_v ? rsqrtf(ss / (float)hd + eps) : fminf(fmaxf(thr_qk / (sqrtf(ss) + 1e-6f), 0.0f), 1.0f);
+    if (i < hd) {
+        const float4 o = make_float4(x4.x * f, x4.y * f, x4.z * f, x4.w * f);
+        *reinterpret_cast<float4*>(x + i) = o;
+        __half* cache = (is_v ? vc : kc) + sg[2] + (u64)min((unsigned)posi, capacity - 1u) * width + (u64)h * hd + i;
+        const __half2 lo = __floats2half2_rn(o.x, o.y), hi = __floats2half2_rn(o.z, o.w);
+        uint2 pk;
+        pk.x = *reinterpret_cast<const unsigned*>(&lo);
+        pk.y = *reinterpret_cast<const unsigned*>(&hi);
+        *reinterpret_cast<uint2*>(cache) = pk;
+    }
 }
 
 // Loop controllers for many tokens on bf16 tensor cores. ctrl_norms: per (token, job) the RMS

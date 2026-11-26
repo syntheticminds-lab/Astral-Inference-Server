@@ -982,6 +982,7 @@ impl Gemv {
         xidx: &DeviceBuffer<u32>,
         yidx: &DeviceBuffer<u32>,
         idx_len: u32,
+        situ: Option<(&mut QAct, f32, f32)>,
     ) -> Result<()> {
         let Some(h) = x.h.as_ref() else { return Err(invalid("launch_ws256: activations have no f16 copy".into())) };
         let Some((fq, fs)) = m.frag.as_ref() else { return Err(invalid("launch_ws256: matrix has no fragment layout".into())) };
@@ -1003,6 +1004,15 @@ impl Gemv {
         let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
         let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
         let (mut nm, mut unused) = (m.n_mats, 0u32);
+        // Fused SITU: f16 activations [y_rows][n / 2] instead of y (gate_up rows interleaved).
+        let (mut pact, mut beta, mut lb) = (0u64, 0f32, 0f32);
+        if let Some((a, b, l)) = situ {
+            if a.k * 2 != m.n || a.max_slots < y_rows {
+                return Err(invalid(format!("launch_ws256: SITU output k {} for n {}", a.k, m.n)));
+            }
+            pact = a.f16_ptr()?;
+            (beta, lb) = (b, l);
+        }
         let mut params = [
             param(&mut pq),
             param(&mut pa),
@@ -1019,6 +1029,9 @@ impl Gemv {
             param(&mut psc),
             param(&mut nm),
             param(&mut unused),
+            param(&mut pact),
+            param(&mut beta),
+            param(&mut lb),
         ];
         let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: 5 * stage };
         // SAFETY: params match astral_gemm_nvfp4_ws256*; the fragment planes hold n_mats * n * k

@@ -48,6 +48,12 @@ struct DepthIdx {
     v: [u32; MAX_DEPTH],
 }
 
+/// Dynamic shared memory of the prefill attention kernels (`FA_SMEM` in inkling.cu).
+/// Tokens per thread of the parallel short-conv kernels (`CONV_T` in inkling.cu).
+const CONV_T: u32 = 8;
+
+const FA_SMEM: u32 = 2 * 64 * 136 * 2 + 4 * 16 * 80 * 4;
+
 pub struct InklingOps {
     embed: Function,
     clip: Function,
@@ -92,6 +98,7 @@ pub struct InklingOps {
     tgemm_tn: Function,
     sgemm_tn: Function,
     ctrl_apply: Function,
+    ctrl_gf_apply: Function,
     attn_prefill: Function,
     attn_prefill_segs: Function,
     moe_group: Function,
@@ -261,8 +268,17 @@ impl InklingOps {
             sgemm_tn: f("astral_ink_sgemm_tn")?,
             tgemm_tn: f("astral_ink_tgemm_tn")?,
             ctrl_apply: f("astral_ink_ctrl_apply")?,
-            attn_prefill: f("astral_ink_attn_prefill")?,
-            attn_prefill_segs: f("astral_ink_attn_prefill_segs")?,
+            ctrl_gf_apply: f("astral_ink_ctrl_gf_apply")?,
+            attn_prefill: {
+                let k = f("astral_ink_attn_prefill")?;
+                k.set_max_dynamic_shared(FA_SMEM)?;
+                k
+            },
+            attn_prefill_segs: {
+                let k = f("astral_ink_attn_prefill_segs")?;
+                k.set_max_dynamic_shared(FA_SMEM)?;
+                k
+            },
             moe_group: f("astral_ink_moe_group")?,
             moe_group_q: f("astral_ink_moe_group_q")?,
             attn_split: f("astral_ink_attn_split")?,
@@ -693,7 +709,7 @@ impl InklingOps {
     /// append. Rows, caches and conv states are those of row 0 / sequence 0; the segment table
     /// (8 words per segment, see `astral_ink_conv_par_segs`) places each segment.
     pub fn attn_inputs_segs(&self, s: &Stream, a: SegAttnInputs) -> Result<()> {
-        if a.n_seg == 0 || a.max_rows == 0 || a.head_dim != 128 || a.kv_heads == 0 {
+        if a.n_seg == 0 || a.max_rows == 0 || a.head_dim != 128 || a.kv_heads == 0 || a.n_rel > 128 || !a.n_rel.is_multiple_of(4) {
             return Err(invalid(format!("attn_inputs_segs: {} segments of up to {} rows", a.n_seg, a.max_rows)));
         }
         need("segs table", a.seg.dlen(), 8 * a.n_seg as usize)?;
@@ -706,7 +722,7 @@ impl InklingOps {
                 None => (0, 0, 0),
             };
             let mut p = [param(&mut px), param(&mut xs), param(&mut po), param(&mut os), param(&mut ps), param(&mut pw), param(&mut pd), param(&mut ds), param(&mut dh), param(&mut ch), param(&mut pt)];
-            Self::go(&self.segs[0], s, ct(a.max_rows), &mut p)?;
+            Self::go(&self.segs[0], s, ct(a.max_rows.div_ceil(CONV_T)), &mut p)?;
             let (mut px, mut xs, mut ps, mut ch, mut pt) = (src, width, a.conv + 4 * off, width, a.seg.dptr());
             let mut p = [param(&mut px), param(&mut xs), param(&mut ps), param(&mut ch), param(&mut pt)];
             Self::go(&self.segs[1], s, LaunchConfig { grid: (width.div_ceil(128), 1, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
@@ -741,7 +757,7 @@ impl InklingOps {
             param(&mut pt),
         ];
         let jobs = 2 * a.heads + 2 * a.kv_heads;
-        Self::go(&self.segs[3], s, LaunchConfig { grid: (jobs, a.max_rows, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+        Self::go(&self.segs[3], s, LaunchConfig { grid: (jobs.div_ceil(4), a.max_rows, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
     /// [`InklingOps::conv_res_par`] and [`InklingOps::conv_state`] for every segment of a packed
@@ -752,7 +768,7 @@ impl InklingOps {
         need("segs table", seg.dlen(), 8 * n_seg as usize)?;
         let (mut px, mut ps, mut pw, mut pc, mut pb, mut ch, mut pt) = (src, state, weight, cur, bank_row.unwrap_or(0), channels, seg.dptr());
         let mut p = [param(&mut px), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut pt)];
-        Self::go(&self.segs[2], s, LaunchConfig { grid: (channels.div_ceil(128), max_rows, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        Self::go(&self.segs[2], s, LaunchConfig { grid: (channels.div_ceil(128), max_rows.div_ceil(CONV_T), n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
         let (mut px, mut xs, mut ps, mut ch, mut pt) = (src, channels, state, channels, seg.dptr());
         let mut p = [param(&mut px), param(&mut xs), param(&mut ps), param(&mut ch), param(&mut pt)];
         Self::go(&self.segs[1], s, LaunchConfig { grid: (channels.div_ceil(128), 1, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
@@ -1280,7 +1296,7 @@ impl InklingOps {
             param(&mut ch),
             param(&mut phist),
         ];
-        Self::go(&self.conv_par, s, Self::grid_ct(channels, ntok), &mut p)
+        Self::go(&self.conv_par, s, Self::grid_ct(channels, ntok.div_ceil(CONV_T)), &mut p)
     }
 
     /// Prefill residual conv (token-major, width `channels`): `y = conv(src)`, then
@@ -1321,7 +1337,7 @@ impl InklingOps {
         };
         let (mut px, mut nt, mut ps, mut pw, mut pc, mut pb, mut ch) = (src.dptr(), ntok, state.dptr(), weight.dptr(), cur.dptr(), pb, channels);
         let mut p = [param(&mut px), param(&mut nt), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut phist)];
-        Self::go(&self.conv_res_par, s, Self::grid_ct(channels, ntok), &mut p)
+        Self::go(&self.conv_res_par, s, Self::grid_ct(channels, ntok.div_ceil(CONV_T)), &mut p)
     }
 
     /// Conv state after `ntok` inputs of `src` (row t at `t * src_stride`).
@@ -1399,6 +1415,12 @@ impl InklingOps {
             let (mut xs1, mut ms1, mut dd1, mut nt1, mut psc) = (x_stride as u32, msg_stride as u32, dim, ntok, rms.dptr());
             let mut p = [param(&mut c), param(&mut xs1), param(&mut ms1), param(&mut dd1), param(&mut nt1), param(&mut psc)];
             Self::go(&self.ctrl_tc[1], s, LaunchConfig { grid: (2 * dim / 128, 1, ntok.div_ceil(64)), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            // Gain/forget GEMM and apply fused (ASTRAL_CTRL_UNFUSED=1: through gf).
+            if dim.is_multiple_of(32) && std::env::var_os("ASTRAL_CTRL_UNFUSED").is_none() {
+                let (mut pc, mut rk, mut pw, mut px, mut xs, mut pm, mut ms, mut po, mut dd, mut n) = (cd.device_ptr(), rank, wgf.qs.device_ptr(), x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, out.dptr(), dim, ntok);
+                let mut p = [param(&mut pc), param(&mut rk), param(&mut pw), param(&mut px), param(&mut xs), param(&mut pm), param(&mut ms), param(&mut po), param(&mut dd), param(&mut n)];
+                return Self::go(&self.ctrl_gf_apply, s, LaunchConfig { grid: (dim / 32, ntok.div_ceil(64), 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p);
+            }
             self.sgemm(s, cd.device_ptr(), 0, rank, rank, rank, 0, wgf.qs.device_ptr(), rank, gf.dptr(), 2 * dim, ntok, 2 * dim, rank, rank.next_multiple_of(32), false)?;
             let (mut pg, mut px, mut xs, mut pm, mut ms, mut po, mut dd, mut n) = (gf.dptr(), x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, out.dptr(), dim, ntok);
             let mut p = [param(&mut pg), param(&mut px), param(&mut xs), param(&mut pm), param(&mut ms), param(&mut po), param(&mut dd), param(&mut n)];
@@ -1588,7 +1610,7 @@ impl InklingOps {
             param(&mut cap),
         ];
         // The caller wrote the table for these caches (offsets + capacity * width stay inside).
-        Self::go(&self.attn_prefill_segs, s, LaunchConfig { grid: (max_rows.div_ceil(64), a.heads, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+        Self::go(&self.attn_prefill_segs, s, LaunchConfig { grid: (max_rows.div_ceil(64), a.heads, n_seg), block: (128, 1, 1), shared_mem_bytes: FA_SMEM }, &mut p)
     }
 
     pub fn attn_prefill(
@@ -1638,7 +1660,7 @@ impl InklingOps {
             param(&mut scale),
             param(&mut cap),
         ];
-        Self::go(&self.attn_prefill, s, LaunchConfig { grid: (ntok.div_ceil(64), a.heads, 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+        Self::go(&self.attn_prefill, s, LaunchConfig { grid: (ntok.div_ceil(64), a.heads, 1), block: (128, 1, 1), shared_mem_bytes: FA_SMEM }, &mut p)
     }
 
     /// Groups the `p = ntok * k` router picks in `ids` by expert into tensor-core GEMM work
@@ -1672,7 +1694,7 @@ impl InklingOps {
         let (mut a0, mut a1, mut a2, mut b0, mut b1, mut b2, mut mi) = (gu.0.dptr(), gu.1.dptr(), gu.2.dptr(), dn.0.dptr(), dn.1.dptr(), dn.2.dptr(), max_items);
         let mut ch = chunk;
         let mut prm = [param(&mut pi), param(&mut pp), param(&mut kk), param(&mut ne), param(&mut a0), param(&mut a1), param(&mut a2), param(&mut b0), param(&mut b1), param(&mut b2), param(&mut mi), param(&mut ch)];
-        Self::go(&self.moe_group, s, LaunchConfig { grid: (1, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 }, &mut prm)
+        Self::go(&self.moe_group, s, LaunchConfig { grid: (n_expert, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 }, &mut prm)
     }
 
     /// Groups the `p = ntok * k` router picks in `ids` by expert into [`crate::ops::QItem`]

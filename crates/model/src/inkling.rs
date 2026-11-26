@@ -186,6 +186,34 @@ pub struct Weights {
     pub bytes: usize,
 }
 
+/// Reorders the rows of each `[n][..]` matrix of `raw` (gate rows then up rows, `n / 2` each)
+/// to the interleaved order: row `16 b + i` is gate row `8 b + i`, row `16 b + 8 + i` up row
+/// `8 b + i`. Rows are whole quantisation blocks, so this is type-agnostic.
+/// The expert activation in the gate_up GEMM's epilogue (`ASTRAL_FUSE_SITU=0` turns it off).
+fn fuse_situ() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_FUSE_SITU").map_or(true, |v| v != "0"))
+}
+
+fn interleave_gate_up(raw: &mut [u8], n: usize, mats: usize) -> std::result::Result<(), String> {
+    let total = n * mats;
+    if !n.is_multiple_of(16) || total == 0 || !raw.len().is_multiple_of(total) {
+        return Err(format!("gate_up rows {n} x {mats} do not interleave"));
+    }
+    let row = raw.len() / total;
+    let half = n / 2;
+    let mut tmp = vec![0u8; n * row];
+    for m in raw.chunks_exact_mut(n * row) {
+        for r in 0..n {
+            let (b, i) = (r / 16, r % 16);
+            let src = if i < 8 { 8 * b + i } else { half + 8 * b + i - 8 };
+            tmp[r * row..(r + 1) * row].copy_from_slice(&m[src * row..(src + 1) * row]);
+        }
+        m.copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
 struct Loader<'a> {
     g: &'a Gguf,
     ctx: &'a Arc<Context>,
@@ -205,7 +233,13 @@ impl Loader<'_> {
             [k, n, m] => (*k, *n, *m),
             d => return Err(bad(format!("{name}: unexpected dims {d:?}"))),
         };
-        let raw = self.g.read_tensor(&t)?;
+        let mut raw = self.g.read_tensor(&t)?;
+        // Expert gate_up: rows interleaved by eight (row 16 b + i is gate row 8 b + i, row
+        // 16 b + 8 + i its up row), so one 16-row MMA tile holds both halves of eight channels
+        // and the activation can be applied in the GEMM epilogue.
+        if name.contains("ffn_gate_up_exps") {
+            interleave_gate_up(&mut raw, n as usize, mats as usize).map_err(|e| bad(format!("{name}: {e}")))?;
+        }
         let (ty, qs, aux) = match t.ty {
             GgmlType::F32 => (GemvType::F32, raw, Vec::new()),
             GgmlType::Bf16 => (GemvType::Bf16, raw, Vec::new()),
@@ -2636,19 +2670,24 @@ fn layer(
                 let (_, tm) = m.w16.as_ref().expect("checked");
                 ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa[0].f16_ptr()?, nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else if ws {
-                ex.gemv.launch_ws256(st, chunk, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+                // SITU in the GEMM epilogue: the down GEMM reads only the f16 activations
+                // (ASTRAL_FUSE_SITU=0: the separate kernel).
+                let situ = fuse_situ().then_some((&mut s.qa_ff, cfg.situ_beta, cfg.situ_lb));
+                ex.gemv.launch_ws256(st, chunk, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32, situ)?;
             } else if wg(&l.gate_up) {
                 ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else {
                 ex.gemv.launch_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             }
-            ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            if !ws || !fuse_situ() || (tma(&l.gate_up) && chunk == 128) {
+                ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            }
             if tma(&l.down) && chunk == 128 {
                 let m = &l.down;
                 let (_, tm) = m.w16.as_ref().expect("checked");
                 ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa_ff.f16_ptr()?, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else if ws {
-                ex.gemv.launch_ws256(st, chunk, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+                ex.gemv.launch_ws256(st, chunk, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32, None)?;
             } else if wg(&l.down) {
                 ex.gemv.launch_mma5(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else {

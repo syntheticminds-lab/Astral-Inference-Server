@@ -2946,31 +2946,51 @@ __device__ __forceinline__ void g10_dequant(const uint4 wq, const uint2 sb, unsi
     }
 }
 #endif
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+__device__ __forceinline__ void wgmma_m64n64k16(float (&d)[32], const unsigned (&a)[4], unsigned long long db) {
+    asm volatile("{\n"
+                 "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, {%32,%33,%34,%35}, %36, 1, 1, 1, 0;\n"
+                 "}\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db));
+}
+__device__ __forceinline__ void wgmma_m64n32k16(float (&d)[16], const unsigned (&a)[4], unsigned long long db) {
+    asm volatile("{\n"
+                 "wgmma.mma_async.sync.aligned.m64n32k16.f32.f16.f16 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, {%16,%17,%18,%19}, %20, 1, 1, 1, 0;\n"
+                 "}\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db));
+}
+#endif
 #define FW_STAGES 5
+template <unsigned BT>
 struct __align__(1024) FWStage {
-    __half b[128 * 64];   // activations, 128-byte swizzle (16 KB)
+    __half b[BT * 64];    // activations, 128-byte swizzle (BT * 128 bytes)
     uint4 a[16 * 32];     // 16 row tiles x 32 lanes (8 KB)
     uint2 sc[16 * 8];     // 1 KB
 };
 
-extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
+template <unsigned BT>
+__device__ __forceinline__ void nvfp4_ws256(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT();
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     extern __shared__ __align__(1024) unsigned char fwsmem[];
-    FWStage* sm = reinterpret_cast<FWStage*>(fwsmem);
+    FWStage<BT>* sm = reinterpret_cast<FWStage<BT>*>(fwsmem);
     __shared__ __align__(8) unsigned long long full[FW_STAGES], empty[FW_STAGES];
-    __shared__ unsigned xrow[128];
+    __shared__ unsigned xrow[BT];
     const unsigned tid = threadIdx.x, wg = tid >> 7;
     const unsigned* it = items + 3u * blockIdx.y;
     const unsigned e = min(it[0], n_mats - 1u);
     const unsigned start = min(it[1], idx_len);
-    const unsigned count = min(min(it[2], 128u), idx_len - start);
+    const unsigned count = min(min(it[2], BT), idx_len - start);
     const unsigned row0 = blockIdx.x * 256u;
     if (count == 0 || row0 >= N) return;
     const unsigned KC = K / 64u, NT = N / 16u;
-    if (tid < 128) xrow[tid] = min(xidx[start + min(tid, count - 1u)], x_rows - 1u);
+    if (tid < BT) xrow[tid] = min(xidx[start + min(tid, count - 1u)], x_rows - 1u);
     if (tid == 0) {
         for (unsigned s = 0; s < FW_STAGES; ++s) {
             tf_mbar_init(&full[s], 128);
@@ -2994,10 +3014,11 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
             a_dst[q] = idx;
         }
         const uint4* s_src = reinterpret_cast<const uint4*>(fs + (u64)((lt & 63u) >> 2) * KC * 8u) + (lt & 3u);
-        const __half* b_src[8];
-        unsigned b_dst[8];
+        constexpr unsigned PB = BT * 8u / 128u;   // 16-byte activation pieces per loader thread
+        const __half* b_src[PB];
+        unsigned b_dst[PB];
 #pragma unroll
-        for (unsigned q = 0; q < 8; ++q) {
+        for (unsigned q = 0; q < PB; ++q) {
             const unsigned c = lt + q * 128u, j = c >> 3, part = c & 7u;
             b_src[q] = xh + (u64)xrow[j] * K + part * 8u;
             b_dst[q] = j * 64u + ((part ^ (j & 7u)) * 8u);
@@ -3005,13 +3026,13 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
         for (unsigned i = 0; i < KC; ++i) {
             const unsigned s = i % FW_STAGES;
             if (i >= FW_STAGES) tf_mbar_wait(&empty[s], ((i / FW_STAGES) - 1u) & 1u);
-            FWStage& S = sm[s];
+            FWStage<BT>& S = sm[s];
 #pragma unroll
             for (unsigned q = 0; q < 4; ++q) cp_async16(&S.a[a_dst[q]], a_src[q] + i * 32u);
             if (lt < 64) cp_async16(reinterpret_cast<uint4*>(S.sc) + lt, s_src + i * 2u);
             const unsigned k0 = i * 64u;
 #pragma unroll
-            for (unsigned q = 0; q < 8; ++q) cp_async16(S.b + b_dst[q], b_src[q] + k0);
+            for (unsigned q = 0; q < PB; ++q) cp_async16(S.b + b_dst[q], b_src[q] + k0);
             tf_mbar_cp_async_arrive(&full[s]);
         }
         return;
@@ -3020,23 +3041,32 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
     asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");   // two accumulator tiles + two A sets
     const unsigned ct = tid - 128u, warp = ct >> 5, lane = ct & 31u, t = lane & 3u, g = lane >> 2;
     // Warp w of the consumers: row tiles w (rows 16w) and w + 8 (rows 128 + 16w).
-    float d0[64], d1[64];
+    constexpr unsigned ND = BT / 2u;
+    float d0[ND], d1[ND];
 #pragma unroll
-    for (unsigned i = 0; i < 64; ++i) { d0[i] = 0.0f; d1[i] = 0.0f; }
+    for (unsigned i = 0; i < ND; ++i) { d0[i] = 0.0f; d1[i] = 0.0f; }
     unsigned a0[2][4][4], a1[2][4][4];
     auto step = [&](unsigned i, unsigned (&a)[2][4][4]) {
         const unsigned s = i % FW_STAGES;
         tf_mbar_wait(&full[s], (i / FW_STAGES) & 1u);
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        const FWStage& S = sm[s];
+        const FWStage<BT>& S = sm[s];
         g10_dequant(S.a[warp * 32u + lane], S.sc[warp * 8u + g], a[0]);
         g10_dequant(S.a[(warp + 8u) * 32u + lane], S.sc[(warp + 8u) * 8u + g], a[1]);
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         const unsigned long long db = wgmma_desc(S.b);
 #pragma unroll
         for (unsigned ks = 0; ks < 4; ++ks) {
-            wgmma_m64n128k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
-            wgmma_m64n128k16(d1, a[1][ks], db + (unsigned long long)(ks * 2u));
+            if constexpr (BT == 128) {
+                wgmma_m64n128k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
+                wgmma_m64n128k16(d1, a[1][ks], db + (unsigned long long)(ks * 2u));
+            } else if constexpr (BT == 64) {
+                wgmma_m64n64k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
+                wgmma_m64n64k16(d1, a[1][ks], db + (unsigned long long)(ks * 2u));
+            } else {
+                wgmma_m64n32k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
+                wgmma_m64n32k16(d1, a[1][ks], db + (unsigned long long)(ks * 2u));
+            }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
         asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
@@ -3058,7 +3088,7 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
         const float* d = h ? d1 : d0;
         const unsigned r_lo = row0 + h * 128u + warp * 16u + g, r_hi = r_lo + 8u;
 #pragma unroll
-        for (unsigned nt = 0; nt < 16; ++nt) {
+        for (unsigned nt = 0; nt < BT / 8u; ++nt) {
             const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
             if (j0 < count) {
                 float* yr = y + (u64)min(yidx[start + j0], y_rows - 1u) * N;
@@ -3076,6 +3106,18 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
     __trap();
 #endif
 }
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
+    const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
+    unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<128>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t64(
+    const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
+    unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<64>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t32(
+    const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
+    unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused) { PDL_WAIT(); nvfp4_ws256<32>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
 
 // =============================================================================================
 // Dense Q8_0 products for batched decode (T <= 64 tokens), tiled through shared memory: a block

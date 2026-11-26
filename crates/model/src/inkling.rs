@@ -2612,12 +2612,21 @@ fn layer(
         } else if use_mma() && !host_group() {
             // Group the (token, expert) pairs by expert on the GPU: no host sync.
             // Few tokens (verify passes): launch only as many items as can be used.
-            let max_items = ((s.work[1].items.len() / 3) as u32).min((p32.div_ceil(64) + cfg.n_expert as u32).min(p32));
-            let [_, w1, w2] = &mut s.work;
-            // Hopper with fragment-layout experts: 128-token items fill the warpgroup-MMA tile.
+            // Hopper with fragment-layout experts: the warp-specialised GEMM, with 64-token items
+            // when experts average few tokens (mixed decode + prompt passes: one item per expert
+            // without padding a 128-token tile) and 128-token items otherwise.
             let wg = |m: &GemvMatrix| m.frag.is_some() && Gemv::has_wgmma(st);
             let tma = |m: &GemvMatrix| m.w16.is_some() && Gemv::has_wgmma(st);
-            let chunk = if (wg(&l.gate_up) && wg(&l.down)) || (tma(&l.gate_up) && tma(&l.down)) { 128 } else { 64 };
+            let ws = wg(&l.gate_up) && wg(&l.down) && l.gate_up.n.is_multiple_of(256) && l.down.n.is_multiple_of(256) && std::env::var_os("ASTRAL_NO_WS256").is_none();
+            let avg = pairs / cfg.n_expert.max(1);
+            let tile: u32 = match std::env::var("ASTRAL_MOE_TILE").ok().and_then(|v| v.parse().ok()) {
+                Some(t @ (32 | 64 | 128)) => t,
+                _ if avg <= 96 => 64,
+                _ => 128,
+            };
+            let chunk = if ws { tile } else if (wg(&l.gate_up) && wg(&l.down)) || (tma(&l.gate_up) && tma(&l.down)) { 128 } else { 64 };
+            let max_items = ((s.work[1].items.len() / 3) as u32).min((p32.div_ceil(chunk.min(64)) + cfg.n_expert as u32).min(p32));
+            let [_, w1, w2] = &mut s.work;
             ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items, chunk)?;
             let (w1, w2) = (&s.work[1], &s.work[2]);
             // Experts with a fragment layout: the warpgroup-MMA GEMM (Hopper).
@@ -2625,6 +2634,8 @@ fn layer(
                 let m = &l.gate_up;
                 let (_, tm) = m.w16.as_ref().expect("checked");
                 ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa[0].f16_ptr()?, nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+            } else if ws {
+                ex.gemv.launch_ws256(st, chunk, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else if wg(&l.gate_up) {
                 ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else {
@@ -2635,6 +2646,8 @@ fn layer(
                 let m = &l.down;
                 let (_, tm) = m.w16.as_ref().expect("checked");
                 ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa_ff.f16_ptr()?, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+            } else if ws {
+                ex.gemv.launch_ws256(st, chunk, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else if wg(&l.down) {
                 ex.gemv.launch_mma5(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else {

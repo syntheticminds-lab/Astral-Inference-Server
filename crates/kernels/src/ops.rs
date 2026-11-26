@@ -455,7 +455,7 @@ pub struct Gemv {
     /// TMA-fed grouped f16 GEMM ([`Gemv::launch_gemm_f16_tma`]).
     gemm_tma: [Function; 2],
     /// Warp-specialised 256-row NVFP4 expert GEMM (Hopper prefill).
-    ws256: Function,
+    ws256: [Function; 3],
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
     rows_t: [Function; 2],
     /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
@@ -688,9 +688,13 @@ impl Gemv {
                 fw
             },
             ws256: {
-                let fw = f("astral_gemm_nvfp4_ws256")?;
-                let _ = fw.set_max_dynamic_shared(WS256_SMEM);
-                fw
+                let a = f("astral_gemm_nvfp4_ws256")?;
+                let b = f("astral_gemm_nvfp4_ws256_t64")?;
+                let c = f("astral_gemm_nvfp4_ws256_t32")?;
+                for k in [&a, &b, &c] {
+                    let _ = k.set_max_dynamic_shared(WS256_SMEM);
+                }
+                [a, b, c]
             },
             gemm_tma: {
                 let a = f("astral_gemm_f16_tma")?;
@@ -961,6 +965,68 @@ impl Gemv {
         unsafe { self.mma4.launch(cfg, stream, &mut params) }
     }
 
+    /// The warp-specialised NVFP4 expert GEMM (Hopper, fragment layout, `m.n % 256 == 0`) with
+    /// items of up to `tile` tokens (32, 64 or 128; the work lists must be chunked to match).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ws256(
+        &self,
+        stream: &Stream,
+        tile: u32,
+        m: &GemvMatrix,
+        x: &QAct,
+        x_rows: u32,
+        y: &mut dyn DevMut<f32>,
+        y_rows: u32,
+        items: &DeviceBuffer<u32>,
+        n_items: u32,
+        xidx: &DeviceBuffer<u32>,
+        yidx: &DeviceBuffer<u32>,
+        idx_len: u32,
+    ) -> Result<()> {
+        let Some(h) = x.h.as_ref() else { return Err(invalid("launch_ws256: activations have no f16 copy".into())) };
+        let Some((fq, fs)) = m.frag.as_ref() else { return Err(invalid("launch_ws256: matrix has no fragment layout".into())) };
+        if !m.n.is_multiple_of(256) || !m.k.is_multiple_of(64) || m.k != x.k || n_items == 0 || x_rows == 0 || y_rows == 0 || idx_len == 0 || x_rows > x.max_slots {
+            return Err(invalid(format!("launch_ws256: n {} k {} (activations k {})", m.n, m.k, x.k)));
+        }
+        let plane = m.n_mats as usize * m.n as usize * m.k as usize;
+        if fq.len() < plane / 2 || fs.len() < plane / 16 || items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize || y.dlen() < y_rows as usize * m.n as usize {
+            return Err(invalid("launch_ws256: planes, work lists or y too small".into()));
+        }
+        let (f, stage) = match tile {
+            128 => (&self.ws256[0], 25600u32),
+            64 => (&self.ws256[1], 17408),
+            32 => (&self.ws256[2], 13312),
+            _ => return Err(invalid(format!("launch_ws256: tile {tile}"))),
+        };
+        let (mut pq, mut pa, mut ph, mut py) = (fq.device_ptr(), fs.device_ptr(), h.device_ptr(), y.dptr());
+        let (mut n, mut k) = (m.n, m.k);
+        let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
+        let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
+        let (mut nm, mut unused) = (m.n_mats, 0u32);
+        let mut params = [
+            param(&mut pq),
+            param(&mut pa),
+            param(&mut ph),
+            param(&mut py),
+            param(&mut n),
+            param(&mut k),
+            param(&mut pi),
+            param(&mut pxi),
+            param(&mut pyi),
+            param(&mut il),
+            param(&mut xr),
+            param(&mut yr),
+            param(&mut psc),
+            param(&mut nm),
+            param(&mut unused),
+        ];
+        let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: 5 * stage };
+        // SAFETY: params match astral_gemm_nvfp4_ws256*; the fragment planes hold n_mats * n * k
+        // values (checked), the f16 activations x_rows rows of k, the work lists cover n_items /
+        // idx_len (items of <= tile tokens), y covers y_rows; the kernel clamps every index.
+        unsafe { f.launch(cfg, stream, &mut params) }
+    }
+
     /// Tensor-core GEMM on the fragment layout ([`GemvMatrix::add_frag`]) for prefill: items of
     /// up to 128 tokens ([`MmaWork::push_chunked`]); `m.n % 128 == 0`, `m.k % 64 == 0`,
     /// activations with an f16 copy.
@@ -1038,7 +1104,7 @@ impl Gemv {
         if hopper && splits == 1 && m.n.is_multiple_of(256) && std::env::var_os("ASTRAL_NO_WGMMA").is_none() && std::env::var_os("ASTRAL_NO_WS256").is_none() {
             let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: WS256_SMEM };
             // SAFETY: as for the kernels below (same parameters); one K split.
-            return unsafe { self.ws256.launch(cfg, stream, &mut params) };
+            return unsafe { self.ws256[0].launch(cfg, stream, &mut params) };
         }
         let (f, smem) = if hopper && std::env::var_os("ASTRAL_NO_WGMMA").is_none() {
             if std::env::var_os("ASTRAL_WGMMA1").is_some() {
@@ -1457,7 +1523,9 @@ impl Gemv {
         // Split K when the grid is too small to fill the GPU (batched decode).
         let kc = k / 64;
         let blocks = (n / 128) * n_items;
-        let splits = if blocks >= 200 { 1 } else { 400u32.div_ceil(blocks).min(kc / 4).clamp(1, 8) };
+        // (Prefill-sized calls run unsplit: the zeroing launches and atomics cost more than the
+        // idle SMs; ASTRAL_TMA_SPLIT=1 splits K when the grid is small.)
+        let splits = if blocks >= 200 || std::env::var_os("ASTRAL_TMA_SPLIT").is_none() { 1 } else { 400u32.div_ceil(blocks).min(kc / 4).clamp(1, 8) };
         let mut kcps = kc.div_ceil(splits);
         let splits = kc.div_ceil(kcps);
         if splits > 1 {

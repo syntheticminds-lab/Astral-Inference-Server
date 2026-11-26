@@ -2637,11 +2637,27 @@ struct __align__(1024) G9Stage {
     uint4 a[G5_ROWS / 16 * 32 * 4];   // 16 KB: 8 row tiles x 32 lanes x 64 bytes
 };
 
+// Up to 8 matrices with the same K in one launch: blockIdx.x runs over every matrix's row blocks
+// (start[i] = first block of matrix i).
+struct F16Multi {
+    const uint4* frag[8];
+    const __half* xh[8];
+    float* y[8];
+    unsigned n[8];
+    unsigned start[9];
+    unsigned count;
+};
 extern "C" __global__ void __launch_bounds__(256) astral_gemm_f16_wgmma(
-    const uint4* __restrict__ frag, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
+    F16Multi mm, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
     unsigned x_rows, unsigned y_rows, unsigned kc_per_split) { PDL_WAIT();
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    unsigned mi = 0;
+    while (mi + 1 < mm.count && blockIdx.x >= mm.start[mi + 1]) ++mi;
+    const uint4* __restrict__ frag = mm.frag[mi];
+    const __half* __restrict__ xh = mm.xh[mi];
+    float* __restrict__ y = mm.y[mi];
+    const unsigned N = mm.n[mi], bx = blockIdx.x - mm.start[mi];
     extern __shared__ __align__(1024) unsigned char g9smem[];
     G9Stage* sm = reinterpret_cast<G9Stage*>(g9smem);
     __shared__ unsigned xrow[G5_TOK];
@@ -2649,7 +2665,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemm_f16_wgmma(
     const unsigned* it = items + 3u * blockIdx.y;
     const unsigned start = min(it[1], idx_len);
     const unsigned count = min(min(it[2], (unsigned)G5_TOK), idx_len - start);
-    const unsigned row0 = blockIdx.x * G5_ROWS;
+    const unsigned row0 = bx * G5_ROWS;
     if (count == 0 || row0 >= N) return;
     if (tid < G5_TOK) xrow[tid] = min(xidx[start + min(tid, count - 1u)], x_rows - 1u);
     __syncthreads();
@@ -2658,7 +2674,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemm_f16_wgmma(
     if (kc0 >= KC) return;
     const unsigned KCS = min(kc_per_split, KC - kc0);
     const bool split = gridDim.z > 1;
-    const uint4* fa = frag + (u64)blockIdx.x * 8u * KC * 128u;   // 8 row tiles of KC stages x 128 uint4
+    const uint4* fa = frag + (u64)bx * 8u * KC * 128u;   // 8 row tiles of KC stages x 128 uint4
     auto load = [&](unsigned stage, unsigned kcl) {
         G9Stage& S = sm[stage];
         const unsigned kc = kc0 + kcl;

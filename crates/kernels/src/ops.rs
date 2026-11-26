@@ -1265,17 +1265,16 @@ impl Gemv {
         }
     }
 
-    /// Dense prefill GEMM on Hopper warpgroup MMA with the f16 fragment copy
-    /// ([`GemvMatrix::add_frag16`]): `y[yidx[j]] = W x[xidx[j]]` over items of up to 128 tokens
-    /// ([`MmaWork::push_chunked`] with 128), f16 activations. Check [`Gemv::has_wgmma`] first.
+    /// Dense prefill GEMMs on Hopper warpgroup MMA with the f16 fragment copies
+    /// ([`GemvMatrix::add_frag16`]), up to 8 matrices with the same `k` in one launch:
+    /// `y_i[yidx[j]] = W_i x_i[xidx[j]]` over items of up to 128 tokens ([`MmaWork::push_chunked`]
+    /// with 128), f16 activations. Check [`Gemv::has_wgmma`] first.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_wgmma_f16(
         &self,
         stream: &Stream,
-        m: &GemvMatrix,
-        x: &QAct,
+        prods: &mut [MultiItem],
         x_rows: u32,
-        y: &mut dyn DevMut<f32>,
         y_rows: u32,
         items: &DeviceBuffer<u32>,
         n_items: u32,
@@ -1283,48 +1282,60 @@ impl Gemv {
         yidx: &DeviceBuffer<u32>,
         idx_len: u32,
     ) -> Result<()> {
-        let Some(h) = x.h.as_ref() else { return Err(invalid("launch_wgmma_f16: activations have no f16 copy".into())) };
-        let Some(fr) = m.frag16.as_ref() else { return Err(invalid("launch_wgmma_f16: matrix has no f16 fragment layout".into())) };
-        if !m.n.is_multiple_of(128) || !m.k.is_multiple_of(64) || m.k != x.k || n_items == 0 || x_rows == 0 || y_rows == 0 || idx_len == 0 || x_rows > x.max_slots {
-            return Err(invalid(format!("launch_wgmma_f16: n {} k {} (activations k {})", m.n, m.k, x.k)));
+        #[repr(C)]
+        struct F16Multi {
+            frag: [DevicePtr; 8],
+            xh: [DevicePtr; 8],
+            y: [DevicePtr; 8],
+            n: [u32; 8],
+            start: [u32; 9],
+            count: u32,
         }
-        if fr.len() < (m.n * m.k) as usize || items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize || y.dlen() < y_rows as usize * m.n as usize {
-            return Err(invalid("launch_wgmma_f16: planes, work lists or y too small".into()));
+        let k = prods.first().map_or(0, |p| p.m.k);
+        if prods.is_empty() || prods.len() > 8 || !k.is_multiple_of(64) || n_items == 0 || x_rows == 0 || y_rows == 0 || idx_len == 0 {
+            return Err(invalid(format!("launch_wgmma_f16: {} products, k {k}", prods.len())));
         }
-        let (mut pf, mut ph, mut py) = (fr.device_ptr(), h.device_ptr(), y.dptr());
-        let (mut n, mut k) = (m.n, m.k);
-        let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
-        let kc = m.k / 64;
-        let blocks = (m.n / 128) * n_items;
+        if items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize {
+            return Err(invalid("launch_wgmma_f16: work lists too small".into()));
+        }
+        let mut mm = F16Multi { frag: [0; 8], xh: [0; 8], y: [0; 8], n: [0; 8], start: [0; 9], count: prods.len() as u32 };
+        let mut blocks = 0u32;
+        for (i, p) in prods.iter().enumerate() {
+            let m = p.m;
+            let Some(h) = p.x.h.as_ref() else { return Err(invalid("launch_wgmma_f16: activations have no f16 copy".into())) };
+            let Some(fr) = m.frag16.as_ref() else { return Err(invalid("launch_wgmma_f16: matrix has no f16 fragment layout".into())) };
+            if !m.n.is_multiple_of(128) || m.k != k || p.x.k != k || x_rows > p.x.max_slots || fr.len() < (m.n * m.k) as usize || p.y.dlen() < y_rows as usize * m.n as usize {
+                return Err(invalid(format!("launch_wgmma_f16: product {i}: n {} k {} (activations k {})", m.n, m.k, p.x.k)));
+            }
+            mm.frag[i] = fr.device_ptr();
+            mm.xh[i] = h.device_ptr();
+            mm.y[i] = p.y.dptr();
+            mm.n[i] = m.n;
+            mm.start[i] = blocks;
+            blocks += m.n / 128;
+        }
+        mm.start[prods.len()] = blocks;
+        let (mut kk, mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (k, items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
+        let kc = k / 64;
+        let total = blocks * n_items;
         // Split K when the grid is too small to fill the GPU.
-        let splits = if blocks >= 264 || !split_k() { 1 } else { 400u32.div_ceil(blocks).min(kc / 4).clamp(1, 8) };
+        let splits = if total >= 264 || !split_k() { 1 } else { 400u32.div_ceil(total).min(kc / 4).clamp(1, 8) };
         let mut kcps = kc.div_ceil(splits);
         let splits = kc.div_ceil(kcps);
         if splits > 1 {
-            let (mut pz, mut nz) = (y.dptr(), (y_rows as u64) * m.n as u64);
-            let mut zp = [param(&mut pz), param(&mut nz)];
-            let zc = LaunchConfig { grid: ((nz as u32).div_ceil(256).min(4096), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
-            // SAFETY: y holds at least y_rows * n floats (checked above).
-            unsafe { self.zero.launch(zc, stream, &mut zp) }?;
+            for p in prods.iter_mut() {
+                let (mut pz, mut nz) = (p.y.dptr(), (y_rows as u64) * p.m.n as u64);
+                let mut zp = [param(&mut pz), param(&mut nz)];
+                let zc = LaunchConfig { grid: ((nz as u32).div_ceil(256).min(4096), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+                // SAFETY: y holds at least y_rows * n floats (checked above).
+                unsafe { self.zero.launch(zc, stream, &mut zp) }?;
+            }
         }
-        let mut params = [
-            param(&mut pf),
-            param(&mut ph),
-            param(&mut py),
-            param(&mut n),
-            param(&mut k),
-            param(&mut pi),
-            param(&mut pxi),
-            param(&mut pyi),
-            param(&mut il),
-            param(&mut xr),
-            param(&mut yr),
-            param(&mut kcps),
-        ];
-        let cfg = LaunchConfig { grid: (m.n / 128, n_items, splits), block: (256, 1, 1), shared_mem_bytes: WGMMA_F16_SMEM };
-        // SAFETY: params match astral_gemm_f16_wgmma; the fragment plane holds n * k halves
-        // (checked), the f16 activations x_rows rows of k, the work lists cover n_items /
-        // idx_len, y covers y_rows; the kernel clamps every index.
+        let mut params = [param(&mut mm), param(&mut kk), param(&mut pi), param(&mut pxi), param(&mut pyi), param(&mut il), param(&mut xr), param(&mut yr), param(&mut kcps)];
+        let cfg = LaunchConfig { grid: (blocks, n_items, splits), block: (256, 1, 1), shared_mem_bytes: WGMMA_F16_SMEM };
+        // SAFETY: F16Multi mirrors gemv.cu; every fragment plane holds n * k halves, the f16
+        // activations x_rows rows of k and each y y_rows * n values (checked), the work lists
+        // cover n_items / idx_len; the kernel clamps every index.
         unsafe { self.wgmma_f16.launch(cfg, stream, &mut params) }
     }
 

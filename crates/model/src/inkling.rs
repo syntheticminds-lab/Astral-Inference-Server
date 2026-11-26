@@ -505,7 +505,7 @@ impl Exec<'_> {
         }
         if m.frag16.is_some() && Gemv::has_wgmma(self.st) {
             let n = ntok as u32;
-            return self.gemv.launch_wgmma_f16(self.st, m, qa, n, y, n, &work128.items, work128.n_items, &work128.xidx, &work128.yidx, work128.idx_len);
+            return self.gemv.launch_wgmma_f16(self.st, &mut [MultiItem { m, x: qa, y }], n, n, &work128.items, work128.n_items, &work128.xidx, &work128.yidx, work128.idx_len);
         }
         if use_mma() && m.n.is_multiple_of(16) {
             let n = ntok as u32;
@@ -956,59 +956,96 @@ impl Session {
         let mut done = vec![0usize; jobs.len()];
         loop {
             let tmax = self.s.tmax;
-            let (mut segs, mut owners, mut rows) = (Vec::new(), Vec::new(), 0usize);
+            let (mut parts, mut owners, mut rows) = (Vec::new(), Vec::new(), 0usize);
             for (i, &(q, t)) in jobs.iter().enumerate() {
-                if done[i] < t.len() && rows < tmax && segs.len() < self.max_batch {
+                if done[i] < t.len() && rows < tmax && parts.len() < self.max_batch {
                     let n = (t.len() - done[i]).min(tmax - rows);
-                    segs.push(Seg { seq: q, row0: rows, len: n, pos0: done[i] as u32 });
+                    parts.push((q, done[i] as u32, &t[done[i]..done[i] + n]));
                     owners.push(i);
                     rows += n;
                 }
             }
-            if segs.is_empty() {
+            if parts.is_empty() {
                 return Ok(out);
             }
-            let mut tok = vec![0i32; tmax];
-            for (sg, &i) in segs.iter().zip(&owners) {
-                for (r, &x) in jobs[i].1[sg.pos0 as usize..sg.pos0 as usize + sg.len].iter().enumerate() {
-                    tok[sg.row0 + r] = x as i32;
-                }
-            }
-            let mut sp = vec![0i32; 5 * self.max_batch];
-            let kv_span = self.capacity as usize * self.w.cfg.kv_width();
-            for (k, sg) in segs.iter().enumerate() {
-                sp[k] = sg.pos0 as i32;
-                let t = self.max_batch + 4 * k;
-                sp[t..t + 4].copy_from_slice(&[sg.row0 as i32, sg.len as i32, (sg.seq * kv_span) as i32, k as i32]);
-            }
-            self.set_dense(rows)?;
-            self.s.token.copy_from_slice(&tok)?;
-            self.b.seg_pos.copy_from_slice(&sp)?;
-            self.captured.clear();
-            let conv_stride = self.w.cfg.conv_len() as u32;
-            let n_seqs = self.n_seqs as u32;
-            {
-                let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, .. } = self;
-                let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos } = b;
-                let cap = *capacity;
-                // One-off graph (as in prefill): PDL off for the large prefill kernels.
-                let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
-                let g = stream.capture(|st| {
-                    let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
-                    forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
-                });
-                stream.context().set_pdl(prev);
-                g?.launch(stream)?;
-                stream.synchronize()?;
-            }
-            let next = self.b.next.to_vec()?;
-            for (k, (sg, &i)) in segs.iter().zip(&owners).enumerate() {
-                done[i] += sg.len;
+            let next = self.step_mixed(&parts)?;
+            for ((&(_, _, t), &i), n) in parts.iter().zip(&owners).zip(next) {
+                done[i] += t.len();
                 if done[i] == jobs[i].1.len() {
-                    out[i] = next[k] as u32;
+                    out[i] = n;
                 }
             }
         }
+    }
+
+    /// Rows one [`Session::step_mixed`] pass can hold.
+    pub fn token_budget(&self) -> usize {
+        self.s.tmax
+    }
+
+    /// One forward pass over several sequences at once: `parts[i] = (sequence, position,
+    /// tokens)` feeds `tokens` to that sequence from `position` (a prompt chunk, or one token of
+    /// a sequence that is decoding), and returns the greedy next token after each part's last
+    /// token. The parts must name distinct sequences, hold at most [`Session::token_budget`]
+    /// tokens in all and be at most [`Session::max_batch`]; each sequence must already hold its
+    /// first `position` tokens. No draft context is stored.
+    pub fn step_mixed(&mut self, parts: &[(usize, u32, &[u32])]) -> Result<Vec<u32>> {
+        let tmax = self.s.tmax;
+        let rows: usize = parts.iter().map(|p| p.2.len()).sum();
+        if parts.is_empty() || parts.len() > self.max_batch || rows > tmax {
+            return Err(bad(format!("step_mixed: {} parts of {rows} tokens (at most {} parts, {tmax} tokens)", parts.len(), self.max_batch)));
+        }
+        let mut segs = Vec::with_capacity(parts.len());
+        let mut tok = vec![0i32; tmax];
+        let mut row0 = 0usize;
+        for &(q, pos, t) in parts {
+            if q >= self.n_seqs || t.is_empty() || pos as usize + t.len() > self.capacity as usize {
+                return Err(bad(format!("step_mixed: sequence {q}, {} tokens at {pos} (sequences {}, context {})", t.len(), self.n_seqs, self.capacity)));
+            }
+            for (r, &x) in t.iter().enumerate() {
+                tok[row0 + r] = x as i32;
+            }
+            segs.push(Seg { seq: q, row0, len: t.len(), pos0: pos });
+            row0 += t.len();
+        }
+        let mut sp = vec![0i32; 5 * self.max_batch];
+        let kv_span = self.capacity as usize * self.w.cfg.kv_width();
+        for (k, sg) in segs.iter().enumerate() {
+            sp[k] = sg.pos0 as i32;
+            let t = self.max_batch + 4 * k;
+            sp[t..t + 4].copy_from_slice(&[sg.row0 as i32, sg.len as i32, (sg.seq * kv_span) as i32, k as i32]);
+        }
+        // Leading one-token parts (decoding sequences) run on the batched decode kernels, which
+        // read each row's sequence and position from the batch buffers.
+        let (mut sq, mut ps) = (vec![0i32; self.max_batch], vec![0i32; self.max_batch]);
+        for (i, sg) in segs.iter().enumerate().take_while(|(i, sg)| sg.len == 1 && sg.row0 == *i) {
+            sq[i] = sg.seq as i32;
+            ps[i] = sg.pos0 as i32;
+        }
+        self.b.seq.copy_from_slice(&sq)?;
+        self.b.pos.copy_from_slice(&ps)?;
+        self.set_dense(rows)?;
+        self.s.token.copy_from_slice(&tok)?;
+        self.b.seg_pos.copy_from_slice(&sp)?;
+        self.captured.clear();
+        let conv_stride = self.w.cfg.conv_len() as u32;
+        let n_seqs = self.n_seqs as u32;
+        {
+            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, .. } = self;
+            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos } = b;
+            let cap = *capacity;
+            // One-off graph (as in prefill): PDL off for the large prefill kernels.
+            let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
+            let g = stream.capture(|st| {
+                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
+            });
+            stream.context().set_pdl(prev);
+            g?.launch(stream)?;
+            stream.synchronize()?;
+        }
+        let next = self.b.next.to_vec()?;
+        Ok(next[..segs.len()].iter().map(|&t| t as u32).collect())
     }
 
     /// Prefills `tokens` into sequence `seq` from position `pos` (0 for a new sequence, after
@@ -1450,6 +1487,16 @@ fn forward(
     let cfg = &w.cfg;
     // Packed prefill (segs) reuses the batch buffers only for its outputs.
     let brows = if segs.is_some() { None } else { batch.as_deref().map(|b| BatchRows { rows: b.rows, pos: b.pos }) };
+    // Packed passes: leading one-token segments (sequences that are decoding) take the batched
+    // decode kernels, one launch for all of them; their sequences and positions are in the batch
+    // buffers.
+    let dec = match (segs, batch.as_deref()) {
+        (Some((list, _)), Some(b)) => {
+            let n = list.iter().enumerate().take_while(|(i, sg)| sg.len == 1 && sg.row0 == *i).count();
+            (n > 0).then_some((BatchRows { rows: b.rows, pos: b.pos }, n))
+        }
+        _ => None,
+    };
     let d = cfg.dim;
     let td = ntok * d;
     let rs = s.tmax * d;
@@ -1474,7 +1521,7 @@ fn forward(
         }
         visit += 1;
         let mut hist = io.hist.as_deref_mut().map(|h| Hist { buf: &mut h[slot], rows: hist_rows });
-        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs)?;
+        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs, dec)?;
         if let Some(c) = captured.as_deref_mut() {
             ex.st.synchronize()?;
             let mut v = s.cur.to_vec()?;
@@ -1546,7 +1593,19 @@ fn forward(
     // batch output buffers, row i for segment i).
     if let (Some((list, _)), Some(b)) = (segs, batch.as_deref_mut()) {
         let vp = w.output.n as usize;
-        for (i, sg) in list.iter().enumerate() {
+        // Leading one-token segments: their rows are the first rows, so one batched LM head.
+        let nd = dec.as_ref().map_or(0, |d| d.1);
+        if nd > 0 && w.output.ty == GemvType::Q8_0 {
+            ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, nd as u32)?;
+            ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], nd as u32, cfg.rms_eps)?;
+            ex.gemv.launch_q_dense(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], nd as u32)?;
+            if cfg.softcap != 0.0 {
+                ex.ops.softcap(ex.st, &mut *b.logits, (vp * nd) as u32, cfg.softcap)?;
+            }
+            b.dops.argmax_rows(ex.st, &*b.logits, vp as u32, cfg.vocab as u32, nd as u32, &mut *b.part_v, &mut *b.part_i, &mut *b.next)?;
+        }
+        let skip = if w.output.ty == GemvType::Q8_0 { nd } else { 0 };
+        for (i, sg) in list.iter().enumerate().skip(skip) {
             let last = (sg.row0 + sg.len - 1) * d;
             {
                 let bank = s.bank.view(last, s.bank.len() - last)?;
@@ -1728,9 +1787,11 @@ fn layer(
     seq: usize,
     batch: Option<BatchRows>,
     segs: Option<(&[Seg], &DeviceBuffer<i32>)>,
+    dec: Option<(BatchRows, usize)>,
 ) -> Result<()> {
     let cfg = &w.cfg;
     let l = &w.layers[ip];
+    let n_dec = dec.as_ref().map_or(0, |d| d.1);
     // One sequence's cache and conv state, or (batched decode) every sequence's, rows indexed.
     let (kv_span, conv_span) = (capacity as usize * cfg.kv_width(), cfg.conv_len());
     let (kv_off, conv_off) = if batch.is_some() { (0, 0) } else { (seq * kv_span, seq * conv_span) };
@@ -1927,6 +1988,17 @@ fn layer(
             side_fused = true;
         }
         ex.gemv.launch_q_dense(st, &mut items, nt)?;
+    } else if prefill && Gemv::has_wgmma(st) && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.frag16.is_some()) {
+        // Prefill on Hopper: Q, gate, R, K and V in one warpgroup-MMA launch.
+        let mut prods = [
+            MultiItem { m: &l.wq, x: &s.qa[0], y: &mut s.q },
+            MultiItem { m: &l.wgate, x: &s.qa[0], y: &mut s.gate },
+            MultiItem { m: &l.wrel, x: &s.qa[0], y: &mut s.r },
+            MultiItem { m: &l.wk, x: &s.qa[ik], y: &mut s.k },
+            MultiItem { m: &l.wv, x: &s.qa[iv], y: &mut s.v },
+        ];
+        let w = &s.work128;
+        ex.gemv.launch_wgmma_f16(st, &mut prods, nt, nt, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)?;
     } else {
         ex.mm_any(&l.wq, &s.qa[0], &mut s.q, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
         ex.mm_any(&l.wgate, &s.qa[0], &mut s.gate, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
@@ -1976,7 +2048,56 @@ fn layer(
         };
         let packed = segs.is_some();
         let (q_w, r_w, dyn_w) = ((heads * hd) as usize, (heads * n_rel) as usize, kp.map_or(0, |m| m.n as usize));
+        if let Some((dr, nd)) = dec.as_ref() {
+            // Decoding sequences: conv, clips, value norm and KV append per row, one launch.
+            let nd = *nd;
+            let (q_w, r_w, dyn_w) = ((heads * hd) as usize, (heads * n_rel) as usize, kp.map_or(0, |m| m.n as usize));
+            let kl = kc_all.len();
+            let cl = conv_all.len();
+            let mut kcv = kc_all.view_mut(0, kl)?;
+            let mut vcv = vc_all.view_mut(0, kl)?;
+            let mut cv = conv_all.view_mut(0, cl)?;
+            let kd = s.kdyn.view(0, nd * dyn_w.max(1))?;
+            let vd = s.vdyn.view(0, nd * dyn_w.max(1))?;
+            ex.ops.attn_prep(
+                st,
+                AttnPrep {
+                    q: &mut s.q.view_mut(0, nd * q_w)?,
+                    r: &mut s.r.view_mut(0, nd * r_w)?,
+                    k: &mut s.k.view_mut(0, nd * kvw)?,
+                    v: &mut s.v.view_mut(0, nd * kvw)?,
+                    q_scale: &l.q_clip,
+                    r_scale: &l.rel_clip,
+                    conv_kv: &mut cv,
+                    k_conv: &l.k_conv,
+                    v_conv: &l.v_conv,
+                    kdyn: kp.map(|_| &kd as &dyn Dev<f32>),
+                    vdyn: vp.map(|_| &vd as &dyn Dev<f32>),
+                    dyn_heads,
+                    ntok: nd as u32,
+                    conv: true,
+                    kc: &mut kcv,
+                    vc: &mut vcv,
+                    pos: dr.pos,
+                    heads,
+                    kv_heads: kvh,
+                    head_dim: hd,
+                    n_rel,
+                    thr_qk: cfg.qk_clip,
+                    thr_rel: cfg.rel_clip,
+                    eps: cfg.rms_eps,
+                    global: !l.swa,
+                    log_floor: cfg.log_floor,
+                    log_alpha: cfg.log_alpha,
+                    capacity,
+                    rows: Some(dr.rows),
+                },
+            )?;
+        }
         for (si, sg) in list.iter().enumerate() {
+            if si < n_dec {
+                continue;
+            }
             let (r0, n) = (sg.row0, sg.len);
             let nn = n as u32;
             let (ko, co) = (sg.seq * kv_span, sg.seq * conv_span);
@@ -2056,14 +2177,21 @@ fn layer(
         tap!("sinks", sinks);
         // Packed prefill: every segment's attention in one launch.
         let all_flash = list.iter().all(|sg| prefill && hd == 128 && n_rel <= 16 && n_rel.is_multiple_of(4) && !split_prefill() && sg.len > 0);
-        let one_launch = packed && list.len() > 1 && all_flash && (sg_max_kv(list, kv_span) < i32::MAX as usize) && std::env::var_os("ASTRAL_ATTN_PER_SEG").is_none();
+        let one_launch = packed && (list.len() > 1 || n_dec > 0) && all_flash && (sg_max_kv(list, kv_span) < i32::MAX as usize) && std::env::var_os("ASTRAL_ATTN_PER_SEG").is_none();
         if one_launch {
-            let sp = seg_pos.expect("packed segments carry positions");
-            let nb = sp.len() / 5;
-            let table = sp.view(nb, 4 * list.len())?;
-            let max_rows = list.iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
-            let (q, r, sk) = (&s.q, &s.r, &s.sinks);
-            ex.ops.attn_prefill_segs(st, q, r, sk, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn, &sp.view(0, nb)?, &table, list.len() as u32, max_rows, nt, shape)?;
+            if let Some((dr, nd)) = dec.as_ref() {
+                // Decoding sequences: the batched decode attention over each row's own cache.
+                let splits = capacity.div_ceil(ATT_CHUNK);
+                ex.ops.attn_decode_split(st, &s.q, &s.r, &s.sinks, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn_work, &mut s.attn, dr.pos, shape, *nd as u32, splits, false, None, Some(dr.rows))?;
+            }
+            if list.len() > n_dec {
+                let sp = seg_pos.expect("packed segments carry positions");
+                let nb = sp.len() / 5;
+                let table = sp.view(nb + 4 * n_dec, 4 * (list.len() - n_dec))?;
+                let max_rows = list[n_dec..].iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
+                let (q, r, sk) = (&s.q, &s.r, &s.sinks);
+                ex.ops.attn_prefill_segs(st, q, r, sk, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn, &sp.view(0, nb)?, &table, (list.len() - n_dec) as u32, max_rows, nt, shape)?;
+            }
         }
         for (si, sg) in list.iter().enumerate() {
             if one_launch {
@@ -2186,7 +2314,19 @@ fn layer(
             let mut conv = conv_all.view_mut(conv_off, conv_len)?;
             ex.ops.conv_residual(st, &s.o, None, nt, &mut conv.view_mut(2 * kvw * 3, conv_len - 2 * kvw * 3)?, &l.attn_post_conv, &mut s.cur, br, du, rows)?;
         } else {
-            for sg in seg_list.iter() {
+            if let Some((dr, nd)) = dec.as_ref() {
+                // Decoding sequences: the post conv into the residual stream, one launch.
+                let nd = *nd;
+                let cl = conv_all.len();
+                let o = s.o.view(0, nd * d)?;
+                let mut cur = s.cur.view_mut(0, nd * d)?;
+                let mut bv = match bank_row.as_mut() {
+                    Some(b) => Some(b.view_mut(0, nd * d)?),
+                    None => None,
+                };
+                ex.ops.conv_residual(st, &o, None, nd as u32, &mut conv_all.view_mut(2 * kvw * 3, cl - 2 * kvw * 3)?, &l.attn_post_conv, &mut cur, bv.as_mut().map(|v| v as &mut dyn DevMut<f32>), du, Some(dr.rows))?;
+            }
+            for sg in seg_list.iter().skip(n_dec) {
                 let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
                 let (r0, n) = (sg.row0 * d, sg.len * d);
                 let mut ha = match (hist.as_mut(), hoff) {
@@ -2361,7 +2501,14 @@ fn layer(
         ex.ops.conv_residual(st, &s.y, Some((&wv as &dyn Dev<f32>, k)), nt, &mut conv.view_mut(st_off, conv_len - st_off)?, &l.ffn_post_conv, &mut s.cur, None, du, rows)
     } else {
         ex.ops.moe_combine_t(st, &s.y, &wv, &mut s.o, du, k, nt)?;
-        for sg in seg_list.iter() {
+        if let Some((dr, nd)) = dec.as_ref() {
+            let nd = *nd;
+            let cl = conv_all.len();
+            let o = s.o.view(0, nd * d)?;
+            let mut cur = s.cur.view_mut(0, nd * d)?;
+            ex.ops.conv_residual(st, &o, None, nd as u32, &mut conv_all.view_mut(st_off, cl - st_off)?, &l.ffn_post_conv, &mut cur, None, du, Some(dr.rows))?;
+        }
+        for sg in seg_list.iter().skip(n_dec) {
             let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
             let (r0, n) = (sg.row0 * d, sg.len * d);
             let mut hf = match (hist.as_mut(), hoff) {

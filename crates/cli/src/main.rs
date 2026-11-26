@@ -310,6 +310,76 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 }
             }
         }
+        "mixcheck" => {
+            // Greedy picks of n - 1 sequences decoded 8 steps by decode_batch, then again by
+            // step_mixed passes that also prefill a prompt into sequence n - 1.
+            let prompts: Vec<Vec<u32>> = (0..n - 1).map(|q| (0..40 + 7 * q).map(|j| ((j * 7919 + q * 104729) % 150000 + 1000) as u32).collect()).collect();
+            let run = |s: &mut Session, mixed: bool| -> Result<Vec<Vec<u32>>> {
+                let mut last = Vec::new();
+                for (q, p) in prompts.iter().enumerate() {
+                    s.reset_seq(q)?;
+                    last.push(s.prefill_seq(q, 0, p)?);
+                }
+                let mut picks = vec![Vec::new(); n - 1];
+                let extra: Vec<u32> = (0..300).map(|j| (j * 31 % 150000 + 2000) as u32).collect();
+                s.reset_seq(n - 1)?;
+                for k in 0..8u32 {
+                    let next = if mixed {
+                        let toks: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+                        let mut parts: Vec<(usize, u32, &[u32])> = (0..n - 1).map(|q| (q, prompts[q].len() as u32 + k, &toks[q][..])).collect();
+                        parts.push((n - 1, 30 * k, &extra[(30 * k) as usize..(30 * k + 30) as usize]));
+                        let mut v = s.step_mixed(&parts)?;
+                        v.truncate(n - 1);
+                        v
+                    } else {
+                        let rows: Vec<DecodeRow> = (0..n - 1).map(|q| DecodeRow { seq: q, pos: prompts[q].len() as u32 + k, token: last[q] }).collect();
+                        s.decode_batch(&rows)?
+                    };
+                    for q in 0..n - 1 {
+                        picks[q].push(next[q]);
+                    }
+                    last = next;
+                }
+                Ok(picks)
+            };
+            let a = run(&mut s, false)?;
+            let b = run(&mut s, true)?;
+            let same = a.iter().zip(&b).filter(|(x, y)| x == y).count();
+            println!("mixcheck: {same} / {} sequences give the same 8 tokens", n - 1);
+            for (q, (x, y)) in a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).take(4) {
+                println!("  seq {q}: batch {x:?} mixed {y:?}");
+            }
+            return Ok(same == n - 1);
+        }
+        "mixed" => {
+            // n - 1 decoding sequences (one token each) plus one prompt chunk filling the budget.
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let budget = s.token_budget();
+            let chunk: Vec<u32> = (0..budget - (n - 1)).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
+            let one = [1000u32];
+            while std::time::Instant::now() < t_end {
+                s.reset_seq(n - 1)?;
+                let mut parts: Vec<(usize, u32, &[u32])> = (0..n - 1).map(|q| (q, 600u32, &one[..])).collect();
+                parts.push((n - 1, 0, &chunk[..]));
+                let prof = cnt == 0 && std::env::var_os("ASTRAL_PROFILE").is_some();
+                if prof {
+                    astral_gpu::profiler(true)?;
+                }
+                s.step_mixed(&parts)?;
+                if prof {
+                    astral_gpu::profiler(false)?;
+                    return Ok(true);
+                }
+                cnt += 1;
+                if tick.elapsed().as_secs_f64() >= 1.0 {
+                    println!("mixed {} + {}: {:.1} ms per pass", n - 1, chunk.len(), tick.elapsed().as_secs_f64() * 1e3 / cnt as f64);
+                    (cnt, tick) = (0, std::time::Instant::now());
+                }
+            }
+        }
         _ => {
             let jobs: Vec<(usize, &[u32])> = (0..n).map(|i| (i, long.as_slice())).collect();
             while std::time::Instant::now() < t_end {

@@ -201,10 +201,20 @@ impl Active {
     }
 }
 
+/// A request whose prompt is still being processed, a chunk per step.
+struct Pending {
+    job: Job,
+    seq: usize,
+    /// Prompt tokens already in the sequence.
+    done: usize,
+}
+
 struct Scheduler<'a> {
     s: &'a mut Session,
     rx: Receiver<Job>,
     waiting: VecDeque<Job>,
+    /// Admitted requests still prefilling, oldest first.
+    prefilling: VecDeque<Pending>,
     active: Vec<Active>,
     free: Vec<bool>,
     closed: bool,
@@ -213,20 +223,20 @@ struct Scheduler<'a> {
 impl<'a> Scheduler<'a> {
     fn new(s: &'a mut Session, rx: Receiver<Job>) -> Self {
         let n = s.n_seqs();
-        Self { s, rx, waiting: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false }
+        Self { s, rx, waiting: VecDeque::new(), prefilling: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false }
     }
 
     fn run(&mut self) {
         loop {
             // Block for work when idle; otherwise take whatever has arrived.
-            if self.active.is_empty() && self.waiting.is_empty() {
+            if self.active.is_empty() && self.waiting.is_empty() && self.prefilling.is_empty() {
                 match self.rx.recv() {
                     Ok(j) => self.waiting.push_back(j),
                     Err(_) => return,
                 }
             }
             self.drain();
-            if self.closed && self.active.is_empty() && self.waiting.is_empty() {
+            if self.closed && self.active.is_empty() && self.waiting.is_empty() && self.prefilling.is_empty() {
                 return;
             }
             self.admit();
@@ -236,6 +246,10 @@ impl<'a> Scheduler<'a> {
                 for a in self.active.drain(..) {
                     let _ = a.job.tx.send(Event::Error(msg.clone()));
                     self.free[a.seq] = true;
+                }
+                for p in self.prefilling.drain(..) {
+                    let _ = p.job.tx.send(Event::Error(msg.clone()));
+                    self.free[p.seq] = true;
                 }
             }
         }
@@ -254,11 +268,10 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Starts waiting requests while sequence slots are free (lowest slot first, so a request
-    /// that starts alone gets slot 0, the one speculative decoding runs on). The new prompts are
-    /// prefilled together in packed passes.
+    /// Gives waiting requests free sequence slots (lowest slot first, so a request that starts
+    /// alone gets slot 0, the one speculative decoding runs on). Their prompts are then processed
+    /// a chunk per step, alongside the requests that are decoding.
     fn admit(&mut self) {
-        let mut batch: Vec<(Job, usize)> = Vec::new();
         while let Some(job) = self.waiting.pop_front() {
             if job.prompt.is_empty() || job.max_tokens == 0 {
                 let _ = job.tx.send(Event::Done { finish: "length" });
@@ -268,7 +281,7 @@ impl<'a> Scheduler<'a> {
                 self.waiting.push_front(job);
                 break;
             };
-            let alone = self.active.is_empty() && self.waiting.is_empty() && batch.is_empty();
+            let alone = self.active.is_empty() && self.waiting.is_empty() && self.prefilling.is_empty();
             if alone && seq == 0 && job.use_draft && self.s.spec_enabled() {
                 match self.s.reset().and_then(|_| self.s.spec_begin(&job.prompt)) {
                     Ok(first) => self.start(job, seq, first, true),
@@ -278,32 +291,12 @@ impl<'a> Scheduler<'a> {
                 }
                 continue;
             }
+            if let Err(e) = self.s.reset_seq(seq) {
+                let _ = job.tx.send(Event::Error(e.to_string()));
+                continue;
+            }
             self.free[seq] = false;
-            batch.push((job, seq));
-        }
-        if batch.is_empty() {
-            return;
-        }
-        let firsts = batch
-            .iter()
-            .try_for_each(|(_, q)| self.s.reset_seq(*q))
-            .and_then(|_| {
-                let jobs: Vec<(usize, &[u32])> = batch.iter().map(|(j, q)| (*q, j.prompt.as_slice())).collect();
-                self.s.prefill_many(&jobs)
-            });
-        match firsts {
-            Ok(f) => {
-                for ((job, seq), first) in batch.into_iter().zip(f) {
-                    self.free[seq] = true;
-                    self.start(job, seq, first, false);
-                }
-            }
-            Err(e) => {
-                for (job, seq) in batch {
-                    let _ = job.tx.send(Event::Error(e.to_string()));
-                    self.free[seq] = true;
-                }
-            }
+            self.prefilling.push_back(Pending { job, seq, done: 0 });
         }
     }
 
@@ -326,11 +319,11 @@ impl<'a> Scheduler<'a> {
 
     /// One decode step for every running request.
     fn step(&mut self) -> Result<()> {
-        if self.active.is_empty() {
+        if self.active.is_empty() && self.prefilling.is_empty() {
             return Ok(());
         }
         // A lone speculative request runs one round; anything else decodes in a batch.
-        if self.active.len() == 1 && self.active[0].spec {
+        if self.active.len() == 1 && self.active[0].spec && self.prefilling.is_empty() {
             let toks = self.s.spec_next()?;
             let mut a = self.active.pop().expect("one active request");
             a.pos = self.s.pos;
@@ -365,6 +358,9 @@ impl<'a> Scheduler<'a> {
             }
         }
         let mb = self.s.max_batch();
+        if !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= mb {
+            return self.mixed_step();
+        }
         let mut start = 0;
         while start < self.active.len() {
             let end = (start + mb).min(self.active.len());
@@ -387,6 +383,57 @@ impl<'a> Scheduler<'a> {
                     self.retire(a, end);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// One pass holding the next token of every decoding request and, in the rest of the token
+    /// budget, the next prompt chunks of the prefilling requests (oldest first). Decoding never
+    /// waits for a whole prompt, and the decode tokens share the pass's weight reads.
+    fn mixed_step(&mut self) -> Result<()> {
+        let budget = self.s.token_budget();
+        let mut parts: Vec<(usize, u32, Vec<u32>)> = self.active.iter().map(|a| (a.seq, a.pos, vec![a.last])).collect();
+        let mut left = budget.saturating_sub(parts.len());
+        let mut chunks = Vec::new();
+        for (i, p) in self.prefilling.iter().enumerate() {
+            if left == 0 {
+                break;
+            }
+            let n = (p.job.prompt.len() - p.done).min(left);
+            parts.push((p.seq, p.done as u32, p.job.prompt[p.done..p.done + n].to_vec()));
+            chunks.push((i, n));
+            left -= n;
+        }
+        let views: Vec<(usize, u32, &[u32])> = parts.iter().map(|(q, pos, t)| (*q, *pos, t.as_slice())).collect();
+        let next = self.s.step_mixed(&views)?;
+        let n_dec = self.active.len();
+        for (a, &t) in self.active.iter_mut().zip(&next[..n_dec]) {
+            a.pos += 1;
+            a.last = t;
+        }
+        // Prompts that finished this pass start decoding with the token it produced.
+        let mut finished = Vec::new();
+        for (&(i, n), &t) in chunks.iter().zip(&next[n_dec..]) {
+            let p = &mut self.prefilling[i];
+            p.done += n;
+            if p.done == p.job.prompt.len() {
+                finished.push((i, t));
+            }
+        }
+        let mut i = 0;
+        while i < n_dec.min(self.active.len()) {
+            let t = self.active[i].last;
+            match self.active[i].emit(t) {
+                Emit::More => i += 1,
+                end => {
+                    let a = self.active.swap_remove(i);
+                    self.retire(a, end);
+                }
+            }
+        }
+        for &(i, t) in finished.iter().rev() {
+            let p = self.prefilling.remove(i).expect("finished prompt is pending");
+            self.start(p.job, p.seq, t, false);
         }
         Ok(())
     }

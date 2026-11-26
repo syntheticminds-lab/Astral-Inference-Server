@@ -1710,7 +1710,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill(
 }
 
 // =============================================================================================
-#define MMA_TOK_G 64u   // tokens per GEMM work item (MMA_TOK in gemv.cu)
+// Tokens per GEMM work item: `chunk` (64 = MMA_TOK of the mma.sync kernels, 128 for wgmma).
 // MoE grouping on the GPU (prefill): sorts the P = ntok * k (token, expert) picks by expert and
 // writes the tensor-core GEMM work items for gate_up (activation row = token) and down
 // (activation row = pair), so no host sync is needed. Items are [e, start, count <= 64];
@@ -1722,7 +1722,7 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group(const in
                                                                         unsigned n_expert, unsigned* __restrict__ items_gu,
                                                                         unsigned* __restrict__ xidx_gu, unsigned* __restrict__ yidx_gu,
                                                                         unsigned* __restrict__ items_dn, unsigned* __restrict__ xidx_dn,
-                                                                        unsigned* __restrict__ yidx_dn, unsigned max_items) { PDL_WAIT();
+                                                                        unsigned* __restrict__ yidx_dn, unsigned max_items, unsigned chunk) { PDL_WAIT();
     __shared__ unsigned cnt[256], off[256], ibase[256], cur[256];
     const unsigned tid = threadIdx.x;
     for (unsigned e = tid; e < 256u; e += blockDim.x) { cnt[e] = 0u; cur[e] = 0u; }
@@ -1735,7 +1735,7 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group(const in
             off[e] = o;
             ibase[e] = ib;
             o += cnt[e];
-            ib += (cnt[e] + MMA_TOK_G - 1u) / MMA_TOK_G;
+            ib += (cnt[e] + chunk - 1u) / chunk;
         }
         cur[255] = ib;   // total items (stashed; cur[e] for e < n_expert <= 255 restarts at 0)
     }
@@ -1753,11 +1753,11 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group(const in
         yidx_dn[slot] = p;
     }
     for (unsigned e = tid; e < n_expert; e += blockDim.x) {
-        const unsigned chunks = (cnt[e] + MMA_TOK_G - 1u) / MMA_TOK_G;
+        const unsigned chunks = (cnt[e] + chunk - 1u) / chunk;
         for (unsigned c = 0; c < chunks; ++c) {
             const unsigned i = ibase[e] + c;
             if (i >= max_items) break;
-            const unsigned st = off[e] + c * MMA_TOK_G, n = min(MMA_TOK_G, cnt[e] - c * MMA_TOK_G);
+            const unsigned st = off[e] + c * chunk, n = min(chunk, cnt[e] - c * chunk);
             items_gu[3 * i] = e; items_gu[3 * i + 1] = st; items_gu[3 * i + 2] = n;
             items_dn[3 * i] = e; items_dn[3 * i + 1] = st; items_dn[3 * i + 2] = n;
         }

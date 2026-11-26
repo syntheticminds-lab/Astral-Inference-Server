@@ -1392,8 +1392,9 @@ impl InklingOps {
         gu: (&mut dyn DevMut<u32>, &mut dyn DevMut<u32>, &mut dyn DevMut<u32>),
         dn: (&mut dyn DevMut<u32>, &mut dyn DevMut<u32>, &mut dyn DevMut<u32>),
         max_items: u32,
+        chunk: u32,
     ) -> Result<()> {
-        if p == 0 || k == 0 || n_expert == 0 || n_expert > 255 || max_items < (p.div_ceil(64) + n_expert).min(p) {
+        if p == 0 || k == 0 || n_expert == 0 || n_expert > 255 || !(1..=128).contains(&chunk) || max_items < (p.div_ceil(chunk) + n_expert).min(p) {
             return Err(invalid(format!("moe_group: {p} picks, {n_expert} experts, {max_items} items")));
         }
         need("moe_group ids", ids.dlen(), p as usize)?;
@@ -1405,7 +1406,8 @@ impl InklingOps {
         }
         let (mut pi, mut pp, mut kk, mut ne) = (ids.dptr(), p, k, n_expert);
         let (mut a0, mut a1, mut a2, mut b0, mut b1, mut b2, mut mi) = (gu.0.dptr(), gu.1.dptr(), gu.2.dptr(), dn.0.dptr(), dn.1.dptr(), dn.2.dptr(), max_items);
-        let mut prm = [param(&mut pi), param(&mut pp), param(&mut kk), param(&mut ne), param(&mut a0), param(&mut a1), param(&mut a2), param(&mut b0), param(&mut b1), param(&mut b2), param(&mut mi)];
+        let mut ch = chunk;
+        let mut prm = [param(&mut pi), param(&mut pp), param(&mut kk), param(&mut ne), param(&mut a0), param(&mut a1), param(&mut a2), param(&mut b0), param(&mut b1), param(&mut b2), param(&mut mi), param(&mut ch)];
         Self::go(&self.moe_group, s, LaunchConfig { grid: (1, 1, 1), block: (1024, 1, 1), shared_mem_bytes: 0 }, &mut prm)
     }
 

@@ -2196,10 +2196,12 @@ fn layer(
             // Few tokens (verify passes): launch only as many items as can be used.
             let max_items = ((s.work[1].items.len() / 3) as u32).min((p32.div_ceil(64) + cfg.n_expert as u32).min(p32));
             let [_, w1, w2] = &mut s.work;
-            ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items)?;
+            // Hopper with fragment-layout experts: 128-token items fill the warpgroup-MMA tile.
+            let wg = |m: &GemvMatrix| m.frag.is_some() && Gemv::has_wgmma(st);
+            let chunk = if wg(&l.gate_up) && wg(&l.down) { 128 } else { 64 };
+            ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items, chunk)?;
             let (w1, w2) = (&s.work[1], &s.work[2]);
             // Experts with a fragment layout: the warpgroup-MMA GEMM (Hopper).
-            let wg = |m: &GemvMatrix| m.frag.is_some() && Gemv::has_wgmma(st);
             if wg(&l.gate_up) {
                 ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else {

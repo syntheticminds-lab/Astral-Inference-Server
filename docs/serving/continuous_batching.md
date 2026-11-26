@@ -51,12 +51,12 @@ creates as many slots as fit in free GPU memory, up to 64, and prints the number
 For many concurrent short requests, lower `--ctx`:
 
 ```bash
-astral serve Inkling-2-Mini-UD-Q4_K_XL.gguf --checkpoint Inkling-2-Mini/ --ctx 2048 --max-seqs 64
+astral serve Inkling-2-Mini/ --ctx 2048 --max-seqs 64
 ```
 
 ## Performance
 
-Inkling 2 Mini `UD-Q4_K_XL` on one H100 PCIe 80 GB, served with `--ctx 2048 --max-seqs 64`;
+Inkling 2 Mini on one H100 PCIe 80 GB, served with `--ctx 2048 --max-seqs 64`;
 vLLM (`vllm/vllm-openai:nightly`) and SGLang (`lmsysorg/sglang:inkling-2-mini`) serve the
 native checkpoint with their defaults. Load from `vllm bench serve`: random prompts, 512 input
 and 128 output tokens, `ignore_eos`, 8 x concurrency prompts (at least 16).

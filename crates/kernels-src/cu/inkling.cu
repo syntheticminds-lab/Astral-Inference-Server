@@ -1414,6 +1414,9 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split1(
 // astral_ink_attn_split1 with the G query heads of a KV head in one block (grouped-query
 // attention): each K and V row is read once for all G heads instead of once per head. Same
 // arguments and partial layout; grid = (kv_heads, splits, rows).
+#ifndef GQA_GK
+#define GQA_GK 4   // keys per warp in flight (8 measured slower)
+#endif
 template <unsigned G>
 __device__ __forceinline__ void attn_split_gqa(
     const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
@@ -1453,7 +1456,7 @@ __device__ __forceinline__ void attn_split_gqa(
     float m[G], l[G], a[G][4];
 #pragma unroll
     for (unsigned g = 0; g < G; ++g) { m[g] = -INFINITY; l[g] = 0.0f; a[g][0] = a[g][1] = a[g][2] = a[g][3] = 0.0f; }
-    constexpr unsigned GK = 4;
+    constexpr unsigned GK = GQA_GK;
     for (unsigned j0 = start + warp; j0 < end; j0 += 4u * GK) {
         float sc[G][GK];
         uint2 vr[GK];

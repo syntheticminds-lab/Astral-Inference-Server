@@ -1597,7 +1597,8 @@ impl Gemv {
         }
         d.start[items.len()] = blocks;
         let nc = k / 128;
-        let splits = if blocks >= 264 { 1 } else { 396u32.div_ceil(blocks).min(nc / 2).max(1) };
+        let min_blocks = std::env::var("ASTRAL_TILED_MINBLOCKS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(128);
+        let splits = if blocks >= min_blocks { 1 } else { 396u32.div_ceil(blocks).min(nc / 2).max(1) };
         if splits > 1 {
             for it in items.iter_mut() {
                 let (mut pz, mut nz) = (it.y.dptr(), (ntok * it.m.n) as u64);

@@ -1699,6 +1699,7 @@ fn forward(
         ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
         ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
         match w.output.ty {
+            GemvType::Q8_0 if fast_batch(ntok) && q_tiled() && ntok > 32 && ntok <= 64 && w.output.k.is_multiple_of(128) => ex.gemv.launch_q_tiled(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
             GemvType::Q8_0 if fast_batch(ntok) => ex.gemv.launch_q_dense(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
             GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa[0], &mut *b.logits, ntok)?,
             _ => ex.mm(&w.output, &s.qa[0], b.logits, ntok, &s.items_dense, &s.work[0])?,

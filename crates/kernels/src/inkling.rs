@@ -99,6 +99,7 @@ pub struct InklingOps {
     sgemm_tn: Function,
     ctrl_apply: Function,
     ctrl_gf_apply: Function,
+    moe_combine_t16: Function,
     attn_prefill: Function,
     attn_prefill_segs: Function,
     moe_group: Function,
@@ -269,6 +270,7 @@ impl InklingOps {
             tgemm_tn: f("astral_ink_tgemm_tn")?,
             ctrl_apply: f("astral_ink_ctrl_apply")?,
             ctrl_gf_apply: f("astral_ink_ctrl_gf_apply")?,
+            moe_combine_t16: f("astral_ink_moe_combine_t16")?,
             attn_prefill: {
                 let k = f("astral_ink_attn_prefill")?;
                 k.set_max_dynamic_shared(FA_SMEM)?;
@@ -1353,6 +1355,18 @@ impl InklingOps {
         Self::go(&self.conv_state, s, LaunchConfig { grid: (channels.div_ceil(128), 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
+    /// [`InklingOps::moe_combine_t`] over f16 expert outputs `y` (pointer to `ntok * slots * dim` halves).
+    pub fn moe_combine_t16(&self, s: &Stream, y: DevicePtr, w: &dyn Dev<f32>, out: &mut dyn DevMut<f32>, dim: u32, slots: u32, ntok: u32) -> Result<()> {
+        need("combine w", w.dlen(), (slots * ntok) as usize)?;
+        need("combine out", out.dlen(), (dim * ntok) as usize)?;
+        let (mut py, mut pw, mut po, mut d, mut sl, mut nt) = (y, w.dptr(), out.dptr(), dim, slots, ntok);
+        let mut p = [param(&mut py), param(&mut pw), param(&mut po), param(&mut d), param(&mut sl), param(&mut nt)];
+        if !dim.is_multiple_of(8) {
+            return Err(invalid(format!("moe_combine_t16: dim {dim} must be a multiple of 8")));
+        }
+        Self::go(&self.moe_combine_t16, s, LaunchConfig { grid: ((dim / 8).div_ceil(128), ntok, 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
     /// `out[t][c] = sum_s w[t][s] y[t][s][c]` over `ntok` tokens.
     pub fn moe_combine_t(&self, s: &Stream, y: &dyn Dev<f32>, w: &dyn Dev<f32>, out: &mut dyn DevMut<f32>, dim: u32, slots: u32, ntok: u32) -> Result<()> {
         need("combine y", y.dlen(), (dim * slots * ntok) as usize)?;
@@ -1680,7 +1694,7 @@ impl InklingOps {
         max_items: u32,
         chunk: u32,
     ) -> Result<()> {
-        if p == 0 || k == 0 || n_expert == 0 || n_expert > 255 || !(1..=128).contains(&chunk) || max_items < (p.div_ceil(chunk) + n_expert).min(p) {
+        if p == 0 || k == 0 || n_expert == 0 || n_expert > 255 || !(1..=256).contains(&chunk) || max_items < (p.div_ceil(chunk) + n_expert).min(p) {
             return Err(invalid(format!("moe_group: {p} picks, {n_expert} experts, {max_items} items")));
         }
         need("moe_group ids", ids.dlen(), p as usize)?;

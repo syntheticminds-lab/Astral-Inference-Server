@@ -1722,6 +1722,29 @@ extern "C" __global__ void astral_ink_moe_combine_t(const float* __restrict__ y,
     out[(u64)t * dim + c] = acc;
 }
 
+// astral_ink_moe_combine_t over f16 expert outputs: one block per token (blockIdx.y), eight
+// channels per thread with 16-byte loads (dim % 8 == 0).
+extern "C" __global__ void astral_ink_moe_combine_t16(const __half* __restrict__ y, const float* __restrict__ w, float* __restrict__ out,
+                                                      unsigned dim, unsigned slots, unsigned ntok) { PDL_WAIT();
+    const unsigned c8 = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c8 * 8u >= dim || t >= ntok) return;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned s = 0; s < slots; ++s) {
+        const float ws = __ldg(w + (u64)t * slots + s);
+        const uint4 v = __ldg(reinterpret_cast<const uint4*>(y + ((u64)t * slots + s) * dim) + c8);
+        const unsigned u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&u[i]));
+            acc[2 * i] += ws * f.x;
+            acc[2 * i + 1] += ws * f.y;
+        }
+    }
+    float4* o = reinterpret_cast<float4*>(out + (u64)t * dim) + 2u * c8;
+    o[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    o[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
+}
+
 // Loop controller part 1, 8 tokens per block: cd[t][r] = rx_t * (Wx[r] . x_t) + rm_t * (Wm[r] . msg_t),
 // one warp per rank row r (W row read once per 8 tokens); the RMS scales come from `rms`
 // ([t][2]: x, msg), computed once per token by astral_ink_rms2.

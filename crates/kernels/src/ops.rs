@@ -455,7 +455,8 @@ pub struct Gemv {
     /// TMA-fed grouped f16 GEMM ([`Gemv::launch_gemm_f16_tma`]).
     gemm_tma: [Function; 2],
     /// Warp-specialised 256-row NVFP4 expert GEMM (Hopper prefill).
-    ws256: [Function; 3],
+    /// Tiles 128, 64, 32 (256 rows) and 256 (128 rows x 256 tokens).
+    ws256: [Function; 4],
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
     rows_t: [Function; 2],
     /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
@@ -516,6 +517,9 @@ impl MmaWork {
 const WGMMA2_SMEM: u32 = 5 * 21504;
 /// Dynamic shared memory of `astral_gemm_nvfp4_ws256`: 5 stages of 25 KB.
 const WS256_SMEM: u32 = 5 * 25600;
+/// Bytes of one pipeline stage of the 256-token ws256 variant: activations 256 x 64 f16, 8 row
+/// tiles of fragments and their scales, rounded to 1 KB (`FWStage<256, 1>`).
+const WS_T256_STAGE: u32 = (256u32 * 64 * 2 + 8 * 32 * 16 + 8 * 8 * 8).next_multiple_of(1024);
 /// Dynamic shared memory of `astral_gemv_q8_0_tiled`: 3 stages of 19968 bytes.
 const Q_TILED_SMEM: u32 = 3 * 19968;
 /// Dynamic shared memory of `astral_gemm_f16_tma`: 6 stages of 32 KB (or, with 256-token
@@ -691,10 +695,12 @@ impl Gemv {
                 let a = f("astral_gemm_nvfp4_ws256")?;
                 let b = f("astral_gemm_nvfp4_ws256_t64")?;
                 let c = f("astral_gemm_nvfp4_ws256_t32")?;
+                let d = f("astral_gemm_nvfp4_ws256_t256")?;
                 for k in [&a, &b, &c] {
                     let _ = k.set_max_dynamic_shared(WS256_SMEM);
                 }
-                [a, b, c]
+                let _ = d.set_max_dynamic_shared(5 * WS_T256_STAGE);
+                [a, b, c, d]
             },
             gemm_tma: {
                 let a = f("astral_gemm_f16_tma")?;
@@ -983,6 +989,8 @@ impl Gemv {
         yidx: &DeviceBuffer<u32>,
         idx_len: u32,
         situ: Option<(&mut QAct, f32, f32)>,
+        combine: Option<(&mut dyn DevMut<f32>, &dyn Dev<f32>, u32)>,
+        y16: bool,
     ) -> Result<()> {
         let Some(h) = x.h.as_ref() else { return Err(invalid("launch_ws256: activations have no f16 copy".into())) };
         let Some((fq, fs)) = m.frag.as_ref() else { return Err(invalid("launch_ws256: matrix has no fragment layout".into())) };
@@ -994,6 +1002,7 @@ impl Gemv {
             return Err(invalid("launch_ws256: planes, work lists or y too small".into()));
         }
         let (f, stage) = match tile {
+            256 => (&self.ws256[3], WS_T256_STAGE),
             128 => (&self.ws256[0], 25600u32),
             64 => (&self.ws256[1], 17408),
             32 => (&self.ws256[2], 13312),
@@ -1003,7 +1012,8 @@ impl Gemv {
         let (mut n, mut k) = (m.n, m.k);
         let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
         let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
-        let (mut nm, mut unused) = (m.n_mats, 0u32);
+        // y16: y holds f16 values (y_rows x n halves in y's memory).
+        let (mut nm, mut unused) = (m.n_mats, y16 as u32);
         // Fused SITU: f16 activations [y_rows][n / 2] instead of y (gate_up rows interleaved).
         let (mut pact, mut beta, mut lb) = (0u64, 0f32, 0f32);
         if let Some((a, b, l)) = situ {
@@ -1012,6 +1022,14 @@ impl Gemv {
             }
             pact = a.f16_ptr()?;
             (beta, lb) = (b, l);
+        }
+        // Fused combine: out[pair / k][n] += w[pair] * y over the pairs (out zeroed by the caller).
+        let (mut pcomb, mut pcw, mut ck) = (0u64, 0u64, 1u32);
+        if let Some((out, w, kk)) = combine {
+            if kk == 0 || w.dlen() < y_rows as usize || out.dlen() < (y_rows as usize).div_ceil(kk as usize) * m.n as usize {
+                return Err(invalid("launch_ws256: combine output or weights too small".into()));
+            }
+            (pcomb, pcw, ck) = (out.dptr(), w.dptr(), kk);
         }
         let mut params = [
             param(&mut pq),
@@ -1032,8 +1050,13 @@ impl Gemv {
             param(&mut pact),
             param(&mut beta),
             param(&mut lb),
+            param(&mut pcomb),
+            param(&mut pcw),
+            param(&mut ck),
         ];
-        let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: 5 * stage };
+        // Tile 256: 128 weight rows per block; else 256 rows (FW_STAGES = 5 stages either way).
+        let (rows, stages) = if tile == 256 { (128, 5) } else { (256, 5) };
+        let cfg = LaunchConfig { grid: (m.n / rows, n_items, 1), block: (384, 1, 1), shared_mem_bytes: stages * stage };
         // SAFETY: params match astral_gemm_nvfp4_ws256*; the fragment planes hold n_mats * n * k
         // values (checked), the f16 activations x_rows rows of k, the work lists cover n_items /
         // idx_len (items of <= tile tokens), y covers y_rows; the kernel clamps every index.
@@ -1116,8 +1139,13 @@ impl Gemv {
         let hopper = astral_kernels_src_has_sm90a() && stream.context().device().compute_capability().map(|(m, _)| m == 9).unwrap_or(false);
         if hopper && splits == 1 && m.n.is_multiple_of(256) && std::env::var_os("ASTRAL_NO_WGMMA").is_none() && std::env::var_os("ASTRAL_NO_WS256").is_none() {
             let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: WS256_SMEM };
-            // SAFETY: as for the kernels below (same parameters); one K split.
-            return unsafe { self.ws256[0].launch(cfg, stream, &mut params) };
+            // No fused activation: null act, beta, lb after the shared parameters.
+            let (mut pact, mut beta, mut lb, mut pcomb, mut pcw, mut ck) = (0u64, 0f32, 0f32, 0u64, 0u64, 1u32);
+            let [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14] = params;
+            let mut wp = [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, param(&mut pact), param(&mut beta), param(&mut lb), param(&mut pcomb), param(&mut pcw), param(&mut ck)];
+            // SAFETY: as for the kernels below (same parameters, plus the null fused-SITU
+            // output); one K split.
+            return unsafe { self.ws256[0].launch(cfg, stream, &mut wp) };
         }
         let (f, smem) = if hopper && std::env::var_os("ASTRAL_NO_WGMMA").is_none() {
             if std::env::var_os("ASTRAL_WGMMA1").is_some() {

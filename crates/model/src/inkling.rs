@@ -2614,6 +2614,11 @@ fn layer(
         ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
     }
     let pairs = ntok * k as usize;
+    // Set when the expert GEMM already wrote the weighted combine into s.o.
+    let mut combined = false;
+    // Set when the expert GEMM wrote f16 per-pair outputs.
+    let mut y16 = false;
+    let fuse_combine = std::env::var("ASTRAL_FUSE_COMBINE").map_or(true, |v| v != "0");
     if ntok == 1 && !prefill {
         let ids = s.ids.view(0, k as usize)?;
         ex.gemv.launch_q(st, &l.gate_up, &s.qa[0], &mut s.gu, Some(&ids as &dyn Dev<i32>))?;
@@ -2655,8 +2660,10 @@ fn layer(
             let ws = wg(&l.gate_up) && wg(&l.down) && l.gate_up.n.is_multiple_of(256) && l.down.n.is_multiple_of(256) && std::env::var_os("ASTRAL_NO_WS256").is_none();
             let avg = pairs / cfg.n_expert.max(1);
             let tile: u32 = match std::env::var("ASTRAL_MOE_TILE").ok().and_then(|v| v.parse().ok()) {
-                Some(t @ (32 | 64 | 128)) => t,
+                Some(t @ (32 | 64 | 128 | 256)) => t,
                 _ if avg <= 96 => 64,
+                // 256 (128 weight rows x 256 tokens, ASTRAL_MOE_TILE=256) halves the dequantisation
+                // per MMA but measured slower on real routing: uneven experts pad more.
                 _ => 128,
             };
             let chunk = if ws { tile } else if (wg(&l.gate_up) && wg(&l.down)) || (tma(&l.gate_up) && tma(&l.down)) { 128 } else { 64 };
@@ -2673,7 +2680,7 @@ fn layer(
                 // SITU in the GEMM epilogue: the down GEMM reads only the f16 activations
                 // (ASTRAL_FUSE_SITU=0: the separate kernel).
                 let situ = fuse_situ().then_some((&mut s.qa_ff, cfg.situ_beta, cfg.situ_lb));
-                ex.gemv.launch_ws256(st, chunk, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32, situ)?;
+                ex.gemv.launch_ws256(st, chunk, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32, situ, None, false)?;
             } else if wg(&l.gate_up) {
                 ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else {
@@ -2687,7 +2694,18 @@ fn layer(
                 let (_, tm) = m.w16.as_ref().expect("checked");
                 ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa_ff.f16_ptr()?, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else if ws {
-                ex.gemv.launch_ws256(st, chunk, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32, None)?;
+                // The weighted combine in the GEMM epilogue (atomic adds into the zeroed s.o) when
+                // nothing needs the per-pair outputs (ASTRAL_FUSE_COMBINE=0: separate kernel).
+                let comb = if fuse_combine && !per_tok && std::env::var("ASTRAL_FUSE_COMBINE").is_ok_and(|v| v == "1") {
+                    s.o.zero_range_async(0, ntok * d, st)?;
+                    combined = true;
+                    Some((&mut s.o as &mut dyn DevMut<f32>, &s.w as &dyn Dev<f32>, k))
+                } else {
+                    None
+                };
+                // Otherwise f16 per-pair outputs for the combine kernel (ASTRAL_Y16=0: f32).
+                y16 = comb.is_none() && !per_tok && std::env::var("ASTRAL_Y16").map_or(true, |v| v != "0");
+                ex.gemv.launch_ws256(st, chunk, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32, None, comb, y16)?;
             } else if wg(&l.down) {
                 ex.gemv.launch_mma5(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else {
@@ -2743,7 +2761,11 @@ fn layer(
         let mut conv = conv_all.view_mut(conv_off, conv_len)?;
         ex.ops.conv_residual(st, &s.y, Some((&wv as &dyn Dev<f32>, k)), nt, &mut conv.view_mut(st_off, conv_len - st_off)?, &l.ffn_post_conv, &mut s.cur, None, du, rows)
     } else {
-        ex.ops.moe_combine_t(st, &s.y, &wv, &mut s.o, du, k, nt)?;
+        if y16 {
+            ex.ops.moe_combine_t16(st, s.y.dptr(), &wv, &mut s.o, du, k, nt)?;
+        } else if !combined {
+            ex.ops.moe_combine_t(st, &s.y, &wv, &mut s.o, du, k, nt)?;
+        }
         if let Some((dr, nd)) = dec.as_ref() {
             let nd = *nd;
             let cl = conv_all.len();

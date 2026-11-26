@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         Some("score") if args.len() >= 3 => cmd_score(&args[1], &args[2..]),
         Some("qwen-generate") if args.len() >= 4 => cmd_qwen_generate(&args[1], &args[2], &args[3..]),
         Some("generate") if args.len() >= 4 => cmd_generate(&args[1], &args[2], &args[3..]),
-        Some("serve") if args.len() >= 2 => cmd_serve(&args[1..]),
+        Some("serve") => cmd_serve(&args[1..]),
         Some("batch-check") if args.len() >= 4 => cmd_batch_check(&args[1], &args[2], &args[3]),
         Some("cmp-prefill") if args.len() >= 3 => cmd_cmp_prefill(&args[1], &args[2..]),
         Some("probe") if args.len() >= 5 => cmd_probe(&args[1], &args[2], &args[3], &args[4]),
@@ -627,56 +627,110 @@ fn cmd_cmp_prefill(path: &str, ids: &[String]) -> Result<bool> {
 /// [--name S] [--queue N] [--max-seqs N]`: the OpenAI-compatible server. `<model>` is a `.gguf` file or a
 /// safetensors checkpoint directory. The checkpoint directory provides the tokenizer and the
 /// DSpark draft (used unless `--no-draft`); it defaults to `<model>` when that is a directory.
+const SERVE_USAGE: &str = "\
+usage: astral serve <model> [options]
+
+<model> is a local .gguf file, a local checkpoint directory (safetensors), a Hugging Face
+repository id (org/name) or one GGUF file of a repository (org/name/file.gguf). Repositories
+are downloaded on first use (set HF_TOKEN for gated or private ones).
+
+Model:
+  --tokenizer <dir|org/name>        tokenizer and chat template (default: the model's own)
+  --revision <rev>                  branch, tag or commit of a repository (default: main)
+  --download-dir <dir>              where repositories are downloaded (default: ~/.cache/astral/hub)
+  --served-model-name <name>        model name in the API (default: the model's name)
+Server:
+  --host <addr>                     listen address (default: 0.0.0.0)
+  --port <port>                     listen port (default: 8000)
+Memory and batching:
+  --max-model-len <n>               context length per request (default: 8192)
+  --max-num-seqs <n>                requests decoded together (default: as many as fit, up to 64)
+  --max-num-batched-tokens <n>      tokens per forward pass, prompt chunks included (default: 2048)
+  --gpu-memory-utilization <f>      fraction of GPU memory Astral may use (default: all but a margin)
+  --kv-cache-dtype <auto|fp16>      KV cache precision (default: auto = fp16)
+  --max-queue <n>                   requests waiting beyond the running ones (default: 64)
+Speculative decoding:
+  --no-draft                        no draft model (default: the checkpoint's draft when it has one)
+  --num-speculative-tokens <k>      drafted tokens per round (default: 6)
+";
+
 fn cmd_serve(a: &[String]) -> Result<bool> {
     let bad = |m: String| astral_core::AstralError::Invalid(m);
-    let gguf = a.first().ok_or_else(|| bad("serve: missing model (a .gguf file or a checkpoint directory)".into()))?.clone();
-    let (mut ckpt, mut draft, mut k, mut host, mut port, mut ctx, mut name, mut queue) = (None::<String>, true, 6usize, "0.0.0.0".to_string(), 8000u16, 8192u32, "inkling-2-mini".to_string(), 64usize);
-    let mut max_seqs = 0usize;
+    if a.is_empty() || a.iter().any(|x| x == "-h" || x == "--help") {
+        print!("{SERVE_USAGE}");
+        return Ok(!a.is_empty());
+    }
+    let model = a[0].clone();
+    let mut opts = astral_loader::hub::HubOptions::default();
+    let (mut tokenizer, mut name, mut draft, mut k, mut host, mut port, mut ctx, mut queue, mut max_seqs) = (None::<String>, None::<String>, true, 6usize, "0.0.0.0".to_string(), 8000u16, 8192u32, 64usize, 0usize);
+    let (mut util, mut batched) = (None::<f32>, None::<usize>);
     let mut i = 1;
     while i < a.len() {
-        let val = |i: usize| a.get(i + 1).cloned().ok_or_else(|| bad(format!("serve: {} needs a value", a[i])));
-        match a[i].as_str() {
-            "--checkpoint" => {
-                ckpt = Some(val(i)?);
-                i += 1;
+        // Both "--flag value" and "--flag=value".
+        let (flag, inline) = match a[i].split_once('=') {
+            Some((f, v)) if a[i].starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (a[i].clone(), None),
+        };
+        let mut val = || -> Result<String> {
+            if let Some(v) = inline.clone() {
+                return Ok(v);
             }
+            i += 1;
+            a.get(i).cloned().ok_or_else(|| bad(format!("serve: {flag} needs a value")))
+        };
+        fn num<T: std::str::FromStr>(flag: &str, v: String) -> Result<T> {
+            v.parse().map_err(|_| astral_core::AstralError::Invalid(format!("serve: {flag} must be a number, got {v:?}")))
+        }
+        match flag.as_str() {
+            "--tokenizer" | "--checkpoint" => tokenizer = Some(val()?),
+            "--revision" => opts.revision = Some(val()?),
+            "--download-dir" => opts.download_dir = Some(val()?.into()),
+            "--served-model-name" | "--name" => name = Some(val()?),
+            "--host" => host = val()?,
+            "--port" => port = num(&flag, val()?)?,
+            "--max-model-len" | "--ctx" => ctx = num(&flag, val()?)?,
+            "--max-num-seqs" | "--max-seqs" => max_seqs = num(&flag, val()?)?,
+            "--max-num-batched-tokens" => batched = Some(num(&flag, val()?)?),
+            "--max-queue" | "--queue" => queue = num(&flag, val()?)?,
+            "--gpu-memory-utilization" => {
+                let u: f32 = num(&flag, val()?)?;
+                if !(0.05..=1.0).contains(&u) {
+                    return Err(bad(format!("serve: --gpu-memory-utilization must be in (0, 1], got {u}")));
+                }
+                util = Some(u);
+            }
+            "--kv-cache-dtype" => match val()?.to_ascii_lowercase().as_str() {
+                "auto" | "fp16" | "float16" | "half" => {}
+                o => return Err(bad(format!("serve: --kv-cache-dtype {o} is not supported yet (auto or fp16)"))),
+            },
             "--no-draft" => draft = false,
-            "--k" => {
-                k = val(i)?.parse().map_err(|_| bad("serve: --k must be a number".into()))?;
-                i += 1;
-            }
-            "--host" => {
-                host = val(i)?;
-                i += 1;
-            }
-            "--port" => {
-                port = val(i)?.parse().map_err(|_| bad("serve: --port must be a number".into()))?;
-                i += 1;
-            }
-            "--ctx" => {
-                ctx = val(i)?.parse().map_err(|_| bad("serve: --ctx must be a number".into()))?;
-                i += 1;
-            }
-            "--name" => {
-                name = val(i)?;
-                i += 1;
-            }
-            "--queue" => {
-                queue = val(i)?.parse().map_err(|_| bad("serve: --queue must be a number".into()))?;
-                i += 1;
-            }
-            "--max-seqs" => {
-                max_seqs = val(i)?.parse().map_err(|_| bad("serve: --max-seqs must be a number".into()))?;
-                i += 1;
-            }
-            o => return Err(bad(format!("serve: unknown option {o}"))),
+            "--num-speculative-tokens" | "--k" => k = num(&flag, val()?)?,
+            o => return Err(bad(format!("serve: unknown option {o} (astral serve --help lists them)"))),
         }
         i += 1;
     }
-    let ckpt = ckpt.or_else(|| std::path::Path::new(&gguf).is_dir().then(|| gguf.clone()));
-    let ckpt = std::path::PathBuf::from(ckpt.ok_or_else(|| bad("serve: --checkpoint <dir> (tokenizer and draft) is required with a .gguf model".into()))?);
-    let engine = astral_api::engine::EngineConfig { gguf: gguf.into(), draft: draft.then(|| ckpt.clone()), k, ctx, queue, max_seqs };
-    astral_api::serve(astral_api::ServerConfig { engine, tokenizer_dir: ckpt, host, port, model_name: name })?;
+    if let Some(t) = batched
+        && !(64..=astral_model::inkling::MAX_PASS_ROWS).contains(&t)
+    {
+        return Err(bad(format!("serve: --max-num-batched-tokens must be between 64 and {}", astral_model::inkling::MAX_PASS_ROWS)));
+    }
+    let m = astral_loader::hub::resolve(&model, &opts)?;
+    let tok_dir = match tokenizer {
+        Some(t) => astral_loader::hub::resolve(&t, &opts)?.weights,
+        None => m.tokenizer_dir.clone().ok_or_else(|| bad(format!("serve: no tokenizer.json next to {}; pass --tokenizer <dir or org/name>", m.weights.display())))?,
+    };
+    if !tok_dir.join("tokenizer.json").exists() {
+        return Err(bad(format!("serve: {} has no tokenizer.json", tok_dir.display())));
+    }
+    // The draft lives in the native checkpoint (mtp.safetensors); without it, decode plainly.
+    let draft_dir = [m.weights.clone(), tok_dir.clone()].into_iter().find(|d| d.join("mtp.safetensors").exists());
+    if draft && draft_dir.is_none() {
+        eprintln!("astral: no DSpark draft (mtp.safetensors) found; serving without speculative decoding");
+    }
+    let draft = draft_dir.filter(|_| draft);
+    let engine = astral_api::engine::EngineConfig { gguf: m.weights.clone(), draft, k, ctx, queue, max_seqs, gpu_memory_utilization: util, max_batched_tokens: batched };
+    let model_name = name.unwrap_or_else(|| m.name.to_ascii_lowercase());
+    astral_api::serve(astral_api::ServerConfig { engine, tokenizer_dir: tok_dir, host, port, model_name })?;
     Ok(true)
 }
 

@@ -31,6 +31,11 @@ pub struct EngineConfig {
     pub queue: usize,
     /// Requests decoded together (sequence slots); 0 picks as many as fit in GPU memory, up to 64.
     pub max_seqs: usize,
+    /// Fraction of the GPU's memory to use (weights, sequence slots and buffers); None leaves
+    /// a fixed margin free.
+    pub gpu_memory_utilization: Option<f32>,
+    /// Tokens per forward pass (prompt chunks plus decoding requests); None: the default.
+    pub max_batched_tokens: Option<usize>,
 }
 
 pub enum Event {
@@ -63,6 +68,8 @@ pub struct Engine {
 const AUTO_MAX_SEQS: usize = 64;
 /// GPU memory left free for scratch buffers, graphs and the allocator when sizing slots.
 const RESERVE_BYTES: usize = 6 << 30;
+/// Working buffers (scratch, graphs) set aside under `--gpu-memory-utilization`.
+const WORK_BYTES: usize = 4 << 30;
 
 impl Engine {
     /// Loads the model on a new engine thread and returns once it is ready to serve.
@@ -115,16 +122,21 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
     let w = Weights::load(&ctx, &g)?;
     eprintln!("astral: loaded {:.2} GB of weights in {:.1} s", w.bytes as f64 / 1e9, t.elapsed().as_secs_f64());
     let per_seq = astral_model::inkling::seq_bytes(&w.cfg, cfg.ctx);
-    let (free, _) = ctx.mem_info()?;
+    let (free, total) = ctx.mem_info()?;
     // The draft's weights and buffers come out of the same memory.
-    let reserve = RESERVE_BYTES + if cfg.draft.is_some() { 2 << 30 } else { 0 };
-    let fit = free.saturating_sub(reserve) / per_seq.max(1);
+    let draft_bytes = if cfg.draft.is_some() { 2 << 30 } else { 0 };
+    let avail = match cfg.gpu_memory_utilization {
+        // Of the allowed share, what the weights have not used yet, less the working buffers.
+        Some(u) => ((total as f64 * u as f64) as usize).saturating_sub(total - free).saturating_sub(WORK_BYTES + draft_bytes),
+        None => free.saturating_sub(RESERVE_BYTES + draft_bytes),
+    };
+    let fit = avail / per_seq.max(1);
     let seqs = if cfg.max_seqs == 0 { fit.clamp(1, AUTO_MAX_SEQS) } else { cfg.max_seqs };
     if seqs > fit.max(1) {
         eprintln!("astral: warning: {seqs} sequences of {} positions need {:.1} GB; {:.1} GB are free", cfg.ctx, (seqs * per_seq) as f64 / 1e9, free as f64 / 1e9);
     }
     let t = std::time::Instant::now();
-    let mut s = Session::with_seqs(&ctx, w, cfg.ctx, seqs, seqs)?;
+    let mut s = Session::with_pass_rows(&ctx, w, cfg.ctx, seqs, seqs, cfg.max_batched_tokens)?;
     if let Some(dir) = &cfg.draft {
         s.enable_spec(dir, cfg.k)?;
     }

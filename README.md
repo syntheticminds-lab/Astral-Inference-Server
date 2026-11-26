@@ -82,10 +82,10 @@ ASTRAL_CUDA_ARCHS=80,90a cargo build --release
 ./target/release/astral selftest      # kernel self-tests on your GPU
 ```
 
-Serve Inkling 2 Mini with its DSpark draft, straight from the checkpoint directory:
+Serve Inkling 2 Mini with its DSpark draft, straight from Hugging Face (downloaded on first use; a local checkpoint directory or a GGUF file works too):
 
 ```bash
-./target/release/astral serve Inkling-2-Mini/
+./target/release/astral serve thinkingmachines/Inkling-2-Mini
 ```
 
 Visit our [documentation](docs/README.md) to learn more.

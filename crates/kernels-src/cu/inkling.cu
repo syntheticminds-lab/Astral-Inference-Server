@@ -655,7 +655,7 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_rms_q8(const float
 //   jobs [2H, 2H+KH)   K head: conv (+ dyn taps) ; clip(thr_qk) ; store f16 at pos (and f32)
 //   jobs [2H+KH, +KH)  V head: conv (+ dyn taps) ; rms_norm(eps) ; store f16 at pos (and f32)
 // conv_kv = this slot's conv state at channel 0 (K) / width (V); dyn_heads taps per projection.
-extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep(
+__device__ __forceinline__ void astral_ink_attn_prep_body(
     float* __restrict__ q, float* __restrict__ r, float* __restrict__ k, float* __restrict__ v,
     const float* __restrict__ q_scale, const float* __restrict__ r_scale,
     float* __restrict__ conv_kv, const float* __restrict__ k_conv_w, const float* __restrict__ v_conv_w,
@@ -663,7 +663,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep(
     __half* __restrict__ kc, __half* __restrict__ vc, const int* __restrict__ pos_p,
     unsigned heads, unsigned kv_heads, unsigned hd, unsigned n_rel, float thr_qk, float thr_rel, float eps,
     unsigned global, float floor_len, float alpha, unsigned capacity, unsigned do_conv,
-    const int* __restrict__ seq_p, unsigned n_seqs, unsigned conv_stride) { PDL_WAIT();
+    const int* __restrict__ seq_p, unsigned n_seqs, unsigned conv_stride) {
     // blockIdx.y = row t (see row_pos); buffers are token-major. With do_conv = 0 the K/V convs
     // were already applied (astral_ink_conv_seq, prefill) and are skipped.
     const unsigned job = blockIdx.x, t = threadIdx.x, tok = blockIdx.y;
@@ -740,6 +740,18 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep(
         cache[base + c] = __float2half_rn(o);
     }
 }
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep(
+    float* __restrict__ q, float* __restrict__ r, float* __restrict__ k, float* __restrict__ v,
+    const float* __restrict__ q_scale, const float* __restrict__ r_scale,
+    float* __restrict__ conv_kv, const float* __restrict__ k_conv_w, const float* __restrict__ v_conv_w,
+    const float* __restrict__ kdyn, const float* __restrict__ vdyn, unsigned dyn_heads,
+    __half* __restrict__ kc, __half* __restrict__ vc, const int* __restrict__ pos_p,
+    unsigned heads, unsigned kv_heads, unsigned hd, unsigned n_rel, float thr_qk, float thr_rel, float eps,
+    unsigned global, float floor_len, float alpha, unsigned capacity, unsigned do_conv,
+    const int* __restrict__ seq_p, unsigned n_seqs, unsigned conv_stride) { PDL_WAIT();
+    astral_ink_attn_prep_body(q, r, k, v, q_scale, r_scale, conv_kv, k_conv_w, v_conv_w, kdyn, vdyn, dyn_heads, kc, vc, pos_p, heads, kv_heads, hd, n_rel, thr_qk, thr_rel, eps, global, floor_len, alpha, capacity, do_conv, seq_p, n_seqs, conv_stride);
+}
+
 
 // Short conv over `ntok` consecutive tokens (prefill), one thread per channel, in place:
 // x[t * x_stride + c]. Optional per-token dynamic taps dyn[t * dyn_stride + head * 4 + lag].
@@ -1015,6 +1027,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine3_b(Ctr
         }
     }
 }
+
 
 // Up to three rms_q8 jobs (blockIdx.y = job): y_j = rms_norm(x_j) * w_j, quantised. Rows of x_j at
 // t * x_stride; grid (ntok, jobs).
@@ -1393,10 +1406,10 @@ __device__ __forceinline__ float conv_in(const float* __restrict__ src, unsigned
 }
 
 // dst[t*dst_stride + c] = (x_t + conv + taps) * norm; optional per-token dynamic taps.
-extern "C" __global__ void astral_ink_conv_par(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
+__device__ __forceinline__ void astral_ink_conv_par_body(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
                                                unsigned dst_stride, unsigned ntok, const float* __restrict__ state,
                                                const float* __restrict__ weight, const float* __restrict__ dyn, unsigned dyn_stride,
-                                               unsigned dyn_heads, unsigned channels, float* __restrict__ hist) { PDL_WAIT();
+                                               unsigned dyn_heads, unsigned channels, float* __restrict__ hist) {
     const float norm = rsqrtf(dyn ? 9.0f : 5.0f);
     const unsigned per_head = dyn_heads ? channels / dyn_heads : 1u;
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -1419,11 +1432,18 @@ extern "C" __global__ void astral_ink_conv_par(const float* __restrict__ src, un
     }
     dst[(u64)t * dst_stride + c] = (cur + out) * norm;
 }
+extern "C" __global__ void astral_ink_conv_par(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
+                                               unsigned dst_stride, unsigned ntok, const float* __restrict__ state,
+                                               const float* __restrict__ weight, const float* __restrict__ dyn, unsigned dyn_stride,
+                                               unsigned dyn_heads, unsigned channels, float* __restrict__ hist) { PDL_WAIT();
+    astral_ink_conv_par_body(src, src_stride, dst, dst_stride, ntok, state, weight, dyn, dyn_stride, dyn_heads, channels, hist);
+}
+
 
 // Residual form: y = conv(src); bank_row ? (bank_row = cur, cur = y) : (cur += y). Token-major.
-extern "C" __global__ void astral_ink_conv_res_par(const float* __restrict__ src, unsigned ntok, const float* __restrict__ state,
+__device__ __forceinline__ void astral_ink_conv_res_par_body(const float* __restrict__ src, unsigned ntok, const float* __restrict__ state,
                                                    const float* __restrict__ weight, float* __restrict__ cur,
-                                                   float* __restrict__ bank_row, unsigned channels, float* __restrict__ hist) { PDL_WAIT();
+                                                   float* __restrict__ bank_row, unsigned channels, float* __restrict__ hist) {
     const float norm = rsqrtf(5.0f);
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (c >= channels || t >= ntok) return;
@@ -1445,11 +1465,17 @@ extern "C" __global__ void astral_ink_conv_res_par(const float* __restrict__ src
         cur[o] = cur[o] + y;
     }
 }
+extern "C" __global__ void astral_ink_conv_res_par(const float* __restrict__ src, unsigned ntok, const float* __restrict__ state,
+                                                   const float* __restrict__ weight, float* __restrict__ cur,
+                                                   float* __restrict__ bank_row, unsigned channels, float* __restrict__ hist) { PDL_WAIT();
+    astral_ink_conv_res_par_body(src, ntok, state, weight, cur, bank_row, channels, hist);
+}
+
 
 // New conv state after `ntok` tokens of src: the last three inputs (older state shifts in
 // when ntok < 3).
-extern "C" __global__ void astral_ink_conv_state(const float* __restrict__ src, unsigned src_stride, unsigned ntok,
-                                                 float* __restrict__ state, unsigned channels) { PDL_WAIT();
+__device__ __forceinline__ void astral_ink_conv_state_body(const float* __restrict__ src, unsigned src_stride, unsigned ntok,
+                                                 float* __restrict__ state, unsigned channels) {
     const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int n = (int)ntok;
@@ -1459,6 +1485,11 @@ extern "C" __global__ void astral_ink_conv_state(const float* __restrict__ src, 
     state[c * 3 + 1] = s1;
     state[c * 3 + 2] = s2;
 }
+extern "C" __global__ void astral_ink_conv_state(const float* __restrict__ src, unsigned src_stride, unsigned ntok,
+                                                 float* __restrict__ state, unsigned channels) { PDL_WAIT();
+    astral_ink_conv_state_body(src, src_stride, ntok, state, channels);
+}
+
 
 // out[t][c] = sum_s w[t*slots + s] * y[(t*slots + s)][c]   (MoE combine over ntok tokens)
 extern "C" __global__ void astral_ink_moe_combine_t(const float* __restrict__ y, const float* __restrict__ w, float* __restrict__ out,
@@ -1921,7 +1952,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill(
     unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) { PDL_WAIT();
     attn_prefill_body(q, r, sink, kc, vc, rel_bias, out, pos_p, ntok, heads, kv_heads, n_rel, extent, window, scale, capacity);
 }
-// Every segment of a packed prefill pass in one launch (blockIdx.z = segment): seg[4 z ..] =
+// Every segment of a packed prefill pass in one launch (blockIdx.z = segment): seg[8 z ..] =
 // (first row, rows, KV-cache offset in halves, index of its start position in pos_p). Rows are
 // token-major in q, r, sink and out, as for astral_ink_attn_prefill on that segment alone.
 extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill_segs(
@@ -1929,7 +1960,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill_segs(
     const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
     float* __restrict__ out, const int* __restrict__ pos_p, const unsigned* __restrict__ seg, unsigned heads, unsigned kv_heads,
     unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) { PDL_WAIT();
-    const unsigned* sg = seg + 4u * blockIdx.z;
+    const unsigned* sg = seg + 8u * blockIdx.z;
     const unsigned row0 = sg[0], n = sg[1];
     if (blockIdx.x * 64u >= n) return;
     const u64 qw = (u64)heads * 128u;
@@ -2046,4 +2077,49 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group_q(const 
         items_gu[QITEM_WORDS * i + 2 + b] = p / k; items_gu[QITEM_WORDS * i + 2 + QITEM_NB + b] = p;
         items_dn[QITEM_WORDS * i + 2 + b] = p;     items_dn[QITEM_WORDS * i + 2 + QITEM_NB + b] = p;
     }
+}
+
+// Packed prefill: the per-sequence kernels above for every segment of the pass in one launch
+// (blockIdx.z = segment). seg holds 8 words per segment: first row, rows, KV-cache offset (in
+// halves), index of its start position in pos_p, conv-state offset (in floats). Base pointers
+// are those of row 0 / sequence 0; blocks past a segment's rows exit.
+#define SEG_WORDS 8u
+extern "C" __global__ void astral_ink_conv_par_segs(const float* __restrict__ src, unsigned src_stride, float* __restrict__ dst,
+                                                    unsigned dst_stride, const float* __restrict__ state, const float* __restrict__ weight,
+                                                    const float* __restrict__ dyn, unsigned dyn_stride, unsigned dyn_heads, unsigned channels,
+                                                    const unsigned* __restrict__ seg) { PDL_WAIT();
+    const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
+    const unsigned r0 = sg[0], n = sg[1];
+    if (blockIdx.y >= n) return;
+    astral_ink_conv_par_body(src + (u64)r0 * src_stride, src_stride, dst + (u64)r0 * dst_stride, dst_stride, n, state + sg[4], weight,
+                             dyn ? dyn + (u64)r0 * dyn_stride : nullptr, dyn_stride, dyn_heads, channels, nullptr);
+}
+extern "C" __global__ void astral_ink_conv_state_segs(const float* __restrict__ src, unsigned src_stride, float* __restrict__ state,
+                                                      unsigned channels, const unsigned* __restrict__ seg) { PDL_WAIT();
+    const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
+    astral_ink_conv_state_body(src + (u64)sg[0] * src_stride, src_stride, sg[1], state + sg[4], channels);
+}
+extern "C" __global__ void astral_ink_conv_res_par_segs(const float* __restrict__ src, const float* __restrict__ state,
+                                                        const float* __restrict__ weight, float* __restrict__ cur, float* __restrict__ bank_row,
+                                                        unsigned channels, const unsigned* __restrict__ seg) { PDL_WAIT();
+    const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
+    const unsigned r0 = sg[0], n = sg[1];
+    if (blockIdx.y >= n) return;
+    const u64 o = (u64)r0 * channels;
+    astral_ink_conv_res_par_body(src + o, n, state + sg[4], weight, cur + o, bank_row ? bank_row + o : nullptr, channels, nullptr);
+}
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep_segs(
+    float* __restrict__ q, float* __restrict__ r, float* __restrict__ k, float* __restrict__ v,
+    const float* __restrict__ q_scale, const float* __restrict__ r_scale,
+    float* __restrict__ conv_kv, const float* __restrict__ k_conv_w, const float* __restrict__ v_conv_w,
+    __half* __restrict__ kc, __half* __restrict__ vc, const int* __restrict__ pos_p,
+    unsigned heads, unsigned kv_heads, unsigned hd, unsigned n_rel, float thr_qk, float thr_rel, float eps,
+    unsigned global, float floor_len, float alpha, unsigned capacity, const unsigned* __restrict__ seg) { PDL_WAIT();
+    const unsigned* sg = seg + SEG_WORDS * blockIdx.z;
+    const u64 r0 = sg[0];
+    if (blockIdx.y >= sg[1]) return;
+    const u64 kvw = (u64)kv_heads * hd;
+    astral_ink_attn_prep_body(q + r0 * heads * hd, r + r0 * heads * n_rel, k + r0 * kvw, v + r0 * kvw, q_scale, r_scale, conv_kv + sg[4],
+                              k_conv_w, v_conv_w, nullptr, nullptr, 0u, kc + sg[2], vc + sg[2], pos_p + sg[3], heads, kv_heads, hd, n_rel,
+                              thr_qk, thr_rel, eps, global, floor_len, alpha, capacity, 0u, nullptr, 0u, 0u);
 }

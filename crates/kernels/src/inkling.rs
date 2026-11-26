@@ -67,6 +67,8 @@ pub struct InklingOps {
     argmax: Function,
     rms_q8: Function,
     attn_prep: Function,
+    /// Packed-prefill segment kernels: conv_par, conv_state, conv_res_par, attn_prep.
+    segs: [Function; 4],
     sum_splits: Function,
     ctrl_down3_t: Function,
     ctrl_combine3_t: Function,
@@ -104,6 +106,44 @@ pub struct InklingOps {
 }
 
 /// Everything [`InklingOps::attn_prep`] reads and writes for one layer and token.
+/// Device pointers for [`InklingOps::attn_inputs_segs`] (row 0 / sequence 0 of each buffer).
+pub struct SegAttnInputs<'a> {
+    pub q: DevicePtr,
+    pub r: DevicePtr,
+    pub k_raw: DevicePtr,
+    pub v_raw: DevicePtr,
+    pub k_out: DevicePtr,
+    pub v_out: DevicePtr,
+    /// Dynamic conv taps (`(rows, row stride)`) of full-attention layers.
+    pub kdyn: Option<(DevicePtr, u32)>,
+    pub vdyn: Option<(DevicePtr, u32)>,
+    pub dyn_heads: u32,
+    /// Conv states of all sequences (K at 0, V at 3 * width within each).
+    pub conv: DevicePtr,
+    pub k_conv: DevicePtr,
+    pub v_conv: DevicePtr,
+    pub q_scale: DevicePtr,
+    pub r_scale: DevicePtr,
+    pub kc: DevicePtr,
+    pub vc: DevicePtr,
+    /// Start positions, indexed by the table's position word.
+    pub pos: DevicePtr,
+    pub seg: &'a dyn Dev<i32>,
+    pub n_seg: u32,
+    pub max_rows: u32,
+    pub heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub n_rel: u32,
+    pub thr_qk: f32,
+    pub thr_rel: f32,
+    pub eps: f32,
+    pub global: bool,
+    pub log_floor: f32,
+    pub log_alpha: f32,
+    pub capacity: u32,
+}
+
 pub struct AttnPrep<'a> {
     pub q: &'a mut dyn DevMut<f32>,
     pub r: &'a mut dyn DevMut<f32>,
@@ -195,6 +235,7 @@ impl InklingOps {
             argmax: f("astral_ink_argmax")?,
             rms_q8: f("astral_ink_rms_q8")?,
             attn_prep: f("astral_ink_attn_prep")?,
+            segs: [f("astral_ink_conv_par_segs")?, f("astral_ink_conv_state_segs")?, f("astral_ink_conv_res_par_segs")?, f("astral_ink_attn_prep_segs")?],
             sum_splits: f("astral_ink_sum_splits")?,
             ctrl_down3_t: f("astral_ink_ctrl_down3_t")?,
             ctrl_combine3_t: f("astral_ink_ctrl_combine3_t")?,
@@ -633,6 +674,76 @@ impl InklingOps {
     }
     /// Q/R clips (+ log-length scale), K/V short convs (unless `a.conv` is false), K clip, V
     /// norm and the KV append, for `a.ntok` tokens at positions `pos[0]..`.
+    /// The attention inputs of every segment of a packed prefill pass, one launch per step:
+    /// K and V convs (into `k_out` / `v_out`) and conv states, then clips, value norm and the KV
+    /// append. Rows, caches and conv states are those of row 0 / sequence 0; the segment table
+    /// (8 words per segment, see `astral_ink_conv_par_segs`) places each segment.
+    pub fn attn_inputs_segs(&self, s: &Stream, a: SegAttnInputs) -> Result<()> {
+        if a.n_seg == 0 || a.max_rows == 0 || a.head_dim != 128 || a.kv_heads == 0 {
+            return Err(invalid(format!("attn_inputs_segs: {} segments of up to {} rows", a.n_seg, a.max_rows)));
+        }
+        need("segs table", a.seg.dlen(), 8 * a.n_seg as usize)?;
+        let width = a.kv_heads * a.head_dim;
+        let ct = |rows: u32| LaunchConfig { grid: (width.div_ceil(128), rows, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 };
+        for (src, dst, w, taps, off) in [(a.k_raw, a.k_out, a.k_conv, a.kdyn, 0u64), (a.v_raw, a.v_out, a.v_conv, a.vdyn, 3 * width as u64)] {
+            let (mut px, mut xs, mut po, mut os, mut ps, mut pw, mut ch, mut pt) = (src, width, dst, width, a.conv + 4 * off, w, width, a.seg.dptr());
+            let (mut pd, mut ds, mut dh) = match taps {
+                Some((t, stride)) => (t, stride, a.dyn_heads),
+                None => (0, 0, 0),
+            };
+            let mut p = [param(&mut px), param(&mut xs), param(&mut po), param(&mut os), param(&mut ps), param(&mut pw), param(&mut pd), param(&mut ds), param(&mut dh), param(&mut ch), param(&mut pt)];
+            Self::go(&self.segs[0], s, ct(a.max_rows), &mut p)?;
+            let (mut px, mut xs, mut ps, mut ch, mut pt) = (src, width, a.conv + 4 * off, width, a.seg.dptr());
+            let mut p = [param(&mut px), param(&mut xs), param(&mut ps), param(&mut ch), param(&mut pt)];
+            Self::go(&self.segs[1], s, LaunchConfig { grid: (width.div_ceil(128), 1, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        }
+        let (mut pq, mut pr, mut pk, mut pv, mut qs, mut rs, mut cs, mut kw, mut vw) = (a.q, a.r, a.k_out, a.v_out, a.q_scale, a.r_scale, a.conv, a.k_conv, a.v_conv);
+        let (mut kc, mut vc, mut pp, mut hh, mut khh, mut hdd, mut nrr) = (a.kc, a.vc, a.pos, a.heads, a.kv_heads, a.head_dim, a.n_rel);
+        let (mut tq, mut tr, mut ep, mut gl, mut fl, mut al, mut cap, mut pt) = (a.thr_qk, a.thr_rel, a.eps, a.global as u32, a.log_floor, a.log_alpha, a.capacity, a.seg.dptr());
+        let mut p = [
+            param(&mut pq),
+            param(&mut pr),
+            param(&mut pk),
+            param(&mut pv),
+            param(&mut qs),
+            param(&mut rs),
+            param(&mut cs),
+            param(&mut kw),
+            param(&mut vw),
+            param(&mut kc),
+            param(&mut vc),
+            param(&mut pp),
+            param(&mut hh),
+            param(&mut khh),
+            param(&mut hdd),
+            param(&mut nrr),
+            param(&mut tq),
+            param(&mut tr),
+            param(&mut ep),
+            param(&mut gl),
+            param(&mut fl),
+            param(&mut al),
+            param(&mut cap),
+            param(&mut pt),
+        ];
+        let jobs = 2 * a.heads + 2 * a.kv_heads;
+        Self::go(&self.segs[3], s, LaunchConfig { grid: (jobs, a.max_rows, a.n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// [`InklingOps::conv_res_par`] and [`InklingOps::conv_state`] for every segment of a packed
+    /// pass: `src`, `cur` and `bank_row` hold rows from row 0, `state` is sequence 0's conv state
+    /// at this conv's offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_residual_segs(&self, s: &Stream, src: DevicePtr, state: DevicePtr, weight: DevicePtr, cur: DevicePtr, bank_row: Option<DevicePtr>, channels: u32, seg: &dyn Dev<i32>, n_seg: u32, max_rows: u32) -> Result<()> {
+        need("segs table", seg.dlen(), 8 * n_seg as usize)?;
+        let (mut px, mut ps, mut pw, mut pc, mut pb, mut ch, mut pt) = (src, state, weight, cur, bank_row.unwrap_or(0), channels, seg.dptr());
+        let mut p = [param(&mut px), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut pt)];
+        Self::go(&self.segs[2], s, LaunchConfig { grid: (channels.div_ceil(128), max_rows, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        let (mut px, mut xs, mut ps, mut ch, mut pt) = (src, channels, state, channels, seg.dptr());
+        let mut p = [param(&mut px), param(&mut xs), param(&mut ps), param(&mut ch), param(&mut pt)];
+        Self::go(&self.segs[1], s, LaunchConfig { grid: (channels.div_ceil(128), 1, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
     pub fn attn_prep(&self, s: &Stream, a: AttnPrep) -> Result<()> {
         let (h, kh, hd, nr, nt) = (a.heads as usize, a.kv_heads as usize, a.head_dim as usize, a.n_rel as usize, a.ntok as usize);
         let width = kh * hd;

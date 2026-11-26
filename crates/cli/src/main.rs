@@ -47,6 +47,7 @@ fn main() -> ExitCode {
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-gemv" => cmd_kbench_mxfp4(&args[2..], false),
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-mma" => cmd_kbench_mxfp4(&args[2..], true),
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-mma-f16" => cmd_kbench_mxfp4_f16(&args[2..]),
+        Some("kbench") if args.len() >= 2 && args[1] == "f16-tma" => cmd_kbench_f16_tma(&args[2..]),
         Some("version") | Some("--version") | Some("-V") => {
             cmd_version();
             Ok(true)
@@ -793,4 +794,55 @@ fn cmd_kbench_mxfp4_f16(a: &[String]) -> Result<bool> {
     let r = astral_testing::kbench::gemm_mxfp4_mma(&ctx, n, k, b, iters as u32, true)?;
     println!("mxfp4 mma f16x n{n} k{k} b{b}: {:.1} us/call, {:.0} GB/s of weights", r.us_per_call, r.weight_gbps);
     Ok(true)
+}
+
+/// `kbench f16-tma [n] [tokens] [k] [iters]`: the TMA f16 GEMM on random data, checked against
+/// a CPU reference on a few tokens, and timed.
+fn cmd_kbench_f16_tma(a: &[String]) -> Result<bool> {
+    let p = |i: usize, d: usize| a.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (n, t, k, iters, tile) = (p(0, 8576).next_multiple_of(128), p(1, 2048), p(2, 2304), p(3, 50), p(4, 128));
+    let ctx = astral_gpu::Context::new(astral_gpu::Device::get(0)?)?;
+    let reg = astral_kernels::KernelRegistry::load(&ctx)?;
+    let gemv = astral_kernels::ops::Gemv::new(&reg)?;
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let w: Vec<f32> = (0..n * k).map(|_| rnd() * 0.05).collect();
+    let x: Vec<f32> = (0..t * k).map(|_| rnd()).collect();
+    let h = |v: &[f32]| -> Vec<u16> { v.iter().map(|&f| astral_quant::f32_to_f16(f)).collect() };
+    let (wh, xh) = (h(&w), h(&x));
+    let wd = astral_gpu::DeviceBuffer::from_slice(&ctx, &wh)?;
+    let xd = astral_gpu::DeviceBuffer::from_slice(&ctx, &xh)?;
+    let mut yd = astral_gpu::DeviceBuffer::<f32>::zeroed(&ctx, n * t)?;
+    let tm = astral_gpu::TensorMap::f16_2d_sw128(wd.device_ptr(), n as u64, k as u64, 128, 64)?;
+    let mut work = astral_kernels::ops::MmaWork::default();
+    work.push_chunked(0, &(0..t as u32).map(|r| (r, r)).collect::<Vec<_>>(), tile);
+    let items = astral_gpu::DeviceBuffer::from_slice(&ctx, &work.items)?;
+    let xi = astral_gpu::DeviceBuffer::from_slice(&ctx, &work.xidx)?;
+    let yi = astral_gpu::DeviceBuffer::from_slice(&ctx, &work.yidx)?;
+    let st = astral_gpu::Stream::new(&ctx)?;
+    let run = |yd: &mut astral_gpu::DeviceBuffer<f32>| gemv.launch_gemm_f16_tma(&st, tile as u32, &tm, n as u32, k as u32, 1, None, xd.device_ptr(), t as u32, yd, t as u32, &items, work.n_items(), &xi, &yi, t as u32);
+    run(&mut yd)?;
+    st.synchronize()?;
+    let y = yd.to_vec()?;
+    let fh = |v: u16| astral_quant::f16_to_f32(v);
+    let mut maxerr = 0f32;
+    for &tok in &[0usize, t / 2, t - 1] {
+        for r in 0..n {
+            let refv: f32 = (0..k).map(|i| fh(wh[r * k + i]) * fh(xh[tok * k + i])).sum();
+            maxerr = maxerr.max((refv - y[tok * n + r]).abs());
+        }
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        run(&mut yd)?;
+    }
+    st.synchronize()?;
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    println!("f16 tma gemm tile {tile} n{n} t{t} k{k}: {us:.1} us, {:.0} TFLOPs, max |err| {maxerr:.2e}", 2.0 * (n * t * k) as f64 / (us * 1e-6) / 1e12);
+    Ok(maxerr < 1e-2)
 }

@@ -331,6 +331,9 @@ pub struct GemvMatrix {
     /// Q8_0 only: the weights as f16 A fragments (`astral_quant::f16_frag_layout`), for the
     /// dense warpgroup-MMA prefill GEMM [`Gemv::launch_wgmma_f16`].
     pub frag16: Option<DeviceBuffer<u16>>,
+    /// Q8_0 only: the weights as row-major f16 (`q * d` rounded once) with their TMA tensor map,
+    /// for the prefill GEMM [`Gemv::launch_gemm_f16_tma`].
+    pub w16: Option<(DeviceBuffer<u16>, astral_gpu::TensorMap)>,
     /// NVFP4 layout holding MXFP4 data: the native E8M0 scales (K/32 per row). When set, decode
     /// reads `qs` with these instead of `aux` (exact to the checkpoint, ~5.6% fewer bytes).
     pub mx_scale: Option<DeviceBuffer<u8>>,
@@ -358,12 +361,13 @@ impl GemvMatrix {
             mat_scale: mat_scale.map(|m| DeviceBuffer::from_slice(ctx, m)).transpose()?,
             frag: None,
             frag16: None,
+            w16: None,
             mx_scale: None,
         })
     }
 
     pub fn bytes(&self) -> usize {
-        self.qs.bytes() + self.aux.bytes() + self.frag.as_ref().map_or(0, |(f, s)| f.bytes() + s.bytes()) + self.frag16.as_ref().map_or(0, |f| f.bytes()) + self.mx_scale.as_ref().map_or(0, |b| b.bytes())
+        self.qs.bytes() + self.aux.bytes() + self.frag.as_ref().map_or(0, |(f, s)| f.bytes() + s.bytes()) + self.frag16.as_ref().map_or(0, |f| f.bytes()) + self.w16.as_ref().map_or(0, |(w, _)| w.bytes()) + self.mx_scale.as_ref().map_or(0, |b| b.bytes())
     }
 
     /// Adds the f16 fragment layout of a single Q8_0 matrix from its host planes (`qs`, `aux` as
@@ -374,6 +378,38 @@ impl GemvMatrix {
         }
         let f = astral_quant::f16_frag_layout(qs, aux, self.n as usize, self.k as usize)?;
         self.frag16 = Some(DeviceBuffer::from_slice(ctx, &f)?);
+        Ok(())
+    }
+
+    /// Adds a row-major f16 copy of a single Q8_0 matrix (from its host planes) and its TMA
+    /// tensor map; needs `n % 128 == 0` and `k % 64 == 0`.
+    pub fn add_w16(&mut self, ctx: &std::sync::Arc<astral_gpu::Context>, qs: &[u8], aux: &[u8]) -> Result<()> {
+        if self.ty != GemvType::Q8_0 || self.n_mats != 1 || !self.n.is_multiple_of(128) || !self.k.is_multiple_of(64) {
+            return Err(invalid(format!("add_w16: {:?} n {} k {} x{}", self.ty, self.n, self.k, self.n_mats)));
+        }
+        let (n, k) = (self.n as usize, self.k as usize);
+        if qs.len() != n * k || aux.len() != n * k / 16 {
+            return Err(invalid("add_w16: planes do not match the matrix".into()));
+        }
+        let mut h = vec![0u16; n * k];
+        std::thread::scope(|sc| {
+            let per = n.div_ceil(std::thread::available_parallelism().map_or(8, |v| v.get()).min(32)).max(1);
+            for (ci, rows) in h.chunks_mut(per * k).enumerate() {
+                sc.spawn(move || {
+                    for (ri, row) in rows.chunks_mut(k).enumerate() {
+                        let r = ci * per + ri;
+                        for (c, out) in row.iter_mut().enumerate() {
+                            let o = (r * (k / 32) + c / 32) * 2;
+                            let d = astral_quant::f16_to_f32(u16::from_le_bytes([aux[o], aux[o + 1]]));
+                            *out = astral_quant::f32_to_f16(qs[r * k + c] as i8 as f32 * d);
+                        }
+                    }
+                });
+            }
+        });
+        let buf = DeviceBuffer::from_slice(ctx, &h)?;
+        let tm = astral_gpu::TensorMap::f16_2d_sw128(buf.device_ptr(), n as u64, k as u64, 128, 64)?;
+        self.w16 = Some((buf, tm));
         Ok(())
     }
 
@@ -414,6 +450,10 @@ pub struct Gemv {
     /// [`Gemv::launch_q_dense`]: 2, 4 and 8 tiles of 8 tokens per block.
     dense_mma: [Function; 3],
     wgmma_f16: Function,
+    /// TMA-fed grouped f16 GEMM ([`Gemv::launch_gemm_f16_tma`]).
+    gemm_tma: [Function; 2],
+    /// Warp-specialised 256-row NVFP4 expert GEMM (Hopper prefill).
+    ws256: Function,
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
     rows_t: [Function; 2],
     /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
@@ -472,10 +512,20 @@ impl MmaWork {
 
 /// Dynamic shared memory of `astral_gemm_nvfp4_wgmma2`: 3 stages of `G7Stage` (21504 bytes).
 const WGMMA2_SMEM: u32 = 5 * 21504;
+/// Dynamic shared memory of `astral_gemm_nvfp4_ws256`: 5 stages of 25 KB.
+const WS256_SMEM: u32 = 5 * 25600;
+/// Dynamic shared memory of `astral_gemm_f16_tma`: 6 stages of 32 KB (or, with 256-token
+/// tiles, 4 of 48 KB).
+const GEMM_TMA_SMEM: u32 = 6 * 32768;
 /// Dynamic shared memory of `astral_gemm_f16_wgmma`: 3 stages of 32 KB.
 const WGMMA_F16_SMEM: u32 = 3 * 32768;
 
 /// Whether the kernels were built for sm_90a (wgmma).
+/// Whether the kernels were built with an sm_90a (Hopper) target.
+pub fn has_sm90a_build() -> bool {
+    astral_kernels_src_has_sm90a()
+}
+
 fn astral_kernels_src_has_sm90a() -> bool {
     crate::BUILT_ARCHS.iter().any(|a| a.contains("90a"))
 }
@@ -561,6 +611,11 @@ pub struct QAct {
 }
 
 impl QAct {
+    /// Device address of the f16 copy of the activations.
+    pub fn f16_ptr(&self) -> Result<DevicePtr> {
+        self.h.as_ref().map(|h| h.device_ptr()).ok_or_else(|| invalid("activations have no f16 copy".into()))
+    }
+
     /// Device planes for a kernel that writes `slots` quantised vectors of `k` values.
     /// Planes (int8, scales, optional f16) for a kernel that writes `slots` vectors of `k`.
     pub(crate) fn planes_for(&mut self, slots: u32) -> Result<(DevicePtr, DevicePtr, DevicePtr)> {
@@ -623,6 +678,18 @@ impl Gemv {
                 [q, h]
             },
             dense_mma: [f("astral_gemv_q8_0_dense_n2")?, f("astral_gemv_q8_0_dense_n4")?, f("astral_gemv_q8_0_dense_n8")?],
+            ws256: {
+                let fw = f("astral_gemm_nvfp4_ws256")?;
+                let _ = fw.set_max_dynamic_shared(WS256_SMEM);
+                fw
+            },
+            gemm_tma: {
+                let a = f("astral_gemm_f16_tma")?;
+                let b = f("astral_gemm_f16_tma_t256")?;
+                let _ = a.set_max_dynamic_shared(GEMM_TMA_SMEM);
+                let _ = b.set_max_dynamic_shared(GEMM_TMA_SMEM);
+                [a, b]
+            },
             wgmma_f16: {
                 let fw = f("astral_gemm_f16_wgmma")?;
                 // 3 stages of 32 KB; fails harmlessly on GPUs without that much (Hopper only).
@@ -959,6 +1026,11 @@ impl Gemv {
         // v6 (32 x 64 warp tiles, `ASTRAL_MMA6=1`) measured slower than v5 on Qwen3.8 prefill.
         // Hopper (sm_90a build on an sm_90 device): the warpgroup-MMA kernel; else v5.
         let hopper = astral_kernels_src_has_sm90a() && stream.context().device().compute_capability().map(|(m, _)| m == 9).unwrap_or(false);
+        if hopper && splits == 1 && m.n.is_multiple_of(256) && std::env::var_os("ASTRAL_NO_WGMMA").is_none() && std::env::var_os("ASTRAL_NO_WS256").is_none() {
+            let cfg = LaunchConfig { grid: (m.n / 256, n_items, 1), block: (384, 1, 1), shared_mem_bytes: WS256_SMEM };
+            // SAFETY: as for the kernels below (same parameters); one K split.
+            return unsafe { self.ws256.launch(cfg, stream, &mut params) };
+        }
         let (f, smem) = if hopper && std::env::var_os("ASTRAL_NO_WGMMA").is_none() {
             if std::env::var_os("ASTRAL_WGMMA1").is_some() {
                 (&self.wgmma, 0)
@@ -1337,6 +1409,70 @@ impl Gemv {
         // activations x_rows rows of k and each y y_rows * n values (checked), the work lists
         // cover n_items / idx_len; the kernel clamps every index.
         unsafe { self.wgmma_f16.launch(cfg, stream, &mut params) }
+    }
+
+    /// Grouped f16 GEMM on Hopper with TMA-loaded weights: `y[yidx[j]] = mat_scale[e] W_e
+    /// x[xidx[j]]` for the tokens `j` of each item (`items`: 3 words per item, `(e, start,
+    /// count <= 128)`). `w` is the tensor map of the row-major f16 weights of all `n_mats`
+    /// matrices (`[n_mats * n][k]`, [`astral_gpu::TensorMap::f16_2d_sw128`] with 128 x 64 boxes),
+    /// `xh` the f16 activations (`x_rows` rows of `k`). `n % 128 == 0`, `k % 64 == 0`. `tile`
+    /// is the item size the work lists were built with: 128 or 256 tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gemm_f16_tma(
+        &self,
+        stream: &Stream,
+        tile: u32,
+        w: &astral_gpu::TensorMap,
+        n: u32,
+        k: u32,
+        n_mats: u32,
+        mat_scale: Option<&DeviceBuffer<f32>>,
+        xh: DevicePtr,
+        x_rows: u32,
+        y: &mut dyn DevMut<f32>,
+        y_rows: u32,
+        items: &DeviceBuffer<u32>,
+        n_items: u32,
+        xidx: &DeviceBuffer<u32>,
+        yidx: &DeviceBuffer<u32>,
+        idx_len: u32,
+    ) -> Result<()> {
+        if !n.is_multiple_of(128) || !k.is_multiple_of(64) || n_items == 0 || x_rows == 0 || y_rows == 0 || idx_len == 0 || n_mats == 0 {
+            return Err(invalid(format!("launch_gemm_f16_tma: n {n} k {k} x{n_mats}")));
+        }
+        if items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize || y.dlen() < y_rows as usize * n as usize {
+            return Err(invalid("launch_gemm_f16_tma: work lists or y too small".into()));
+        }
+        let mut tm = *w;
+        let (mut px, mut py, mut nn, mut kk) = (xh, y.dptr(), n, k);
+        let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
+        let (mut psc, mut nm) = (mat_scale.map_or(0, |b| b.device_ptr()), n_mats);
+        let mut params = [
+            param(&mut tm),
+            param(&mut px),
+            param(&mut py),
+            param(&mut nn),
+            param(&mut kk),
+            param(&mut pi),
+            param(&mut pxi),
+            param(&mut pyi),
+            param(&mut il),
+            param(&mut xr),
+            param(&mut yr),
+            param(&mut psc),
+            param(&mut nm),
+        ];
+        let cfg = LaunchConfig { grid: (n / 128, n_items, 1), block: (384, 1, 1), shared_mem_bytes: GEMM_TMA_SMEM };
+        // SAFETY: params match astral_gemm_f16_tma; the tensor map covers n_mats * n rows of k
+        // (built by the caller for these weights), the activations hold x_rows rows of k
+        // halves, the work lists cover n_items / idx_len, y covers y_rows (checked); the kernel
+        // clamps every index.
+        let f = match tile {
+            128 => &self.gemm_tma[0],
+            256 => &self.gemm_tma[1],
+            _ => return Err(invalid(format!("launch_gemm_f16_tma: tile {tile}"))),
+        };
+        unsafe { f.launch(cfg, stream, &mut params) }
     }
 
     /// Up to 8 Q8_0 products with the same `k` for `ntok` activation rows (batched decode):

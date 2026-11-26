@@ -130,7 +130,7 @@ for eng in $ENGINES; do
       sudo -n docker logs astral-vllm > "$OUT/vllm-server.log" 2>&1 ;;
     sglang)
       sudo -n docker run -d --name astral-sglang --gpus all --ipc=host --shm-size 32g --network host \
-        -v "$NATIVE":/models/native:ro "$SGL_IMG" python3 -m sglang.launch_server \
+        -v "$NATIVE":/models/native:ro -v "$(cd "$(dirname "$0")" && pwd)/serving/sglang_launch.py":/sglang_launch.py:ro "$SGL_IMG" python3 /sglang_launch.py \
         --model-path /models/native --served-model-name model --context-length "$CTX" \
         --mem-fraction-static 0.85 --host 127.0.0.1 --port 30000 $SGL_EXTRA > /dev/null
       if wait_ready http://127.0.0.1:30000/health 600 astral-sglang; then warm_gpu sglang; run_client sglang http://127.0.0.1:30000 model openai

@@ -91,6 +91,48 @@ pub fn driver_version() -> Result<i32> {
 }
 
 /// `CUdevice_attribute` values used by Astral (from `cuda.h`).
+/// A TMA tensor map (`CUtensorMap`): 128 opaque bytes, passed by value to kernels as a
+/// `const __grid_constant__ CUtensorMap` parameter.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct TensorMap(pub [u64; 16]);
+
+impl TensorMap {
+    /// A row-major 2-D f16 tensor of `rows` x `cols` at `ptr`, read in boxes of `box_rows` x
+    /// `box_cols` (box_cols * 2 = 128 bytes) with the 128-byte swizzle (the shared-memory layout
+    /// warpgroup MMA reads with a K-major, 128-byte-swizzle descriptor).
+    pub fn f16_2d_sw128(ptr: DevicePtr, rows: u64, cols: u64, box_rows: u32, box_cols: u32) -> Result<Self> {
+        if box_cols * 2 != 128 || box_rows == 0 || box_rows > 256 || !(cols * 2).is_multiple_of(16) || ptr % 16 != 0 {
+            return Err(AstralError::Invalid(format!("tensor map: {rows} x {cols} in {box_rows} x {box_cols} boxes")));
+        }
+        let d = drv()?;
+        let mut m = TensorMap([0; 16]);
+        let (dims, strides, boxd, elem) = ([cols, rows], [cols * 2], [box_cols, box_rows], [1u32, 1u32]);
+        const F16: u32 = 6;
+        const SWIZZLE_128B: u32 = 3;
+        const L2_256B: u32 = 3;
+        // SAFETY: the out-parameter is a 64-byte aligned 128-byte buffer; the arrays outlive the
+        // call and have rank (2) entries (strides rank - 1); the driver only reads them.
+        check("cuTensorMapEncodeTiled", unsafe {
+            (d.fns.cuTensorMapEncodeTiled)(
+                m.0.as_mut_ptr().cast(),
+                F16,
+                2,
+                ptr as *mut core::ffi::c_void,
+                dims.as_ptr(),
+                strides.as_ptr(),
+                boxd.as_ptr(),
+                elem.as_ptr(),
+                0,
+                SWIZZLE_128B,
+                L2_256B,
+                0,
+            )
+        })?;
+        Ok(m)
+    }
+}
+
 pub mod attr {
     pub const MAX_THREADS_PER_BLOCK: i32 = 1;
     pub const WARP_SIZE: i32 = 10;

@@ -144,6 +144,7 @@ api_table! {
         cuGraphDestroy(CUgraph);
         cuProfilerStart();
         cuProfilerStop();
+        cuTensorMapEncodeTiled(*mut c_void, u32, u32, *mut c_void, *const u64, *const u64, *const u32, *const u32, u32, u32, u32, u32);
     }
 }
 

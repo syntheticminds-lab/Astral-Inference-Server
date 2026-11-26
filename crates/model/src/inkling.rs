@@ -230,9 +230,15 @@ impl Loader<'_> {
         if ty == GemvType::Nvfp4 && mats > 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
             m.add_frag(self.ctx, &qs, &aux)?;
         }
-        // Dense Q8_0 projections: the f16 fragment copy for the warpgroup-MMA prefill GEMM.
+        // Dense Q8_0 projections: an f16 copy for the prefill GEMMs -- row-major with a TMA tensor
+        // map on Hopper (ASTRAL_NO_TMA=1: the fragment-order copy for the older kernel).
         if ty == GemvType::Q8_0 && mats == 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
-            m.add_frag16(self.ctx, &qs, &aux)?;
+            let hopper = self.ctx.device().compute_capability().map(|(m, _)| m == 9).unwrap_or(false) && astral_kernels::ops::has_sm90a_build();
+            if hopper && std::env::var_os("ASTRAL_NO_TMA").is_none() {
+                m.add_w16(self.ctx, &qs, &aux)?;
+            } else {
+                m.add_frag16(self.ctx, &qs, &aux)?;
+            }
         }
         self.bytes += m.bytes();
         Ok(m)
@@ -415,6 +421,8 @@ struct Scratch {
     work: [DevWork; 3],
     /// The dense work list in items of up to 128 rows (warpgroup-MMA prefill GEMMs).
     work128: DevWork,
+    /// The dense work list in items of up to 256 rows (TMA prefill GEMMs).
+    work256: DevWork,
     /// Layer intermediates (name, values), collected on decode steps when set (verification).
     dbg: Option<Vec<(&'static str, Vec<f32>)>>,
 }
@@ -691,6 +699,7 @@ impl Session {
                 [DevWork::new(ctx, mi, mx)?, DevWork::new(ctx, mi, mx)?, DevWork::new(ctx, mi, mx)?]
             },
             work128: DevWork::new(ctx, t.div_ceil(128) + 1, t)?,
+            work256: DevWork::new(ctx, t.div_ceil(256) + 1, t)?,
             dbg: None,
         };
         let b = BatchBufs {
@@ -702,7 +711,7 @@ impl Session {
             part_i: DeviceBuffer::<u32>::zeroed(ctx, max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
             dops: DsparkOps::new(&reg)?,
             // Start positions, then (packed prefill) the 4-word segment table for attention.
-            seg_pos: DeviceBuffer::<i32>::zeroed(ctx, 5 * max_batch)?,
+            seg_pos: DeviceBuffer::<i32>::zeroed(ctx, 9 * max_batch)?,
         };
         let mut me = Self {
             stream: Stream::new(ctx)?,
@@ -794,6 +803,9 @@ impl Session {
         let mut dense128 = MmaWork::default();
         dense128.push_chunked(0, &pairs, 128);
         s.work128.upload(&dense128)?;
+        let mut dense256 = MmaWork::default();
+        dense256.push_chunked(0, &pairs, 256);
+        s.work256.upload(&dense256)?;
         self.dense_rows = rows;
         Ok(())
     }
@@ -1032,12 +1044,13 @@ impl Session {
             segs.push(Seg { seq: q, row0, len: t.len(), pos0: pos });
             row0 += t.len();
         }
-        let mut sp = vec![0i32; 5 * self.max_batch];
+        let mut sp = vec![0i32; 9 * self.max_batch];
         let kv_span = self.capacity as usize * self.w.cfg.kv_width();
+        let conv_span = self.w.cfg.conv_len();
         for (k, sg) in segs.iter().enumerate() {
             sp[k] = sg.pos0 as i32;
-            let t = self.max_batch + 4 * k;
-            sp[t..t + 4].copy_from_slice(&[sg.row0 as i32, sg.len as i32, (sg.seq * kv_span) as i32, k as i32]);
+            let t = self.max_batch + 8 * k;
+            sp[t..t + 5].copy_from_slice(&[sg.row0 as i32, sg.len as i32, (sg.seq * kv_span) as i32, k as i32, (sg.seq * conv_span) as i32]);
         }
         // Leading one-token parts (decoding sequences) run on the batched decode kernels, which
         // read each row's sequence and position from the batch buffers.
@@ -1108,7 +1121,7 @@ impl Session {
             let chunk = &tokens[done..done + t];
             let pos = &mut cur_pos;
             {
-                let mut sp = vec![0i32; 5 * self.max_batch];
+                let mut sp = vec![0i32; 9 * self.max_batch];
                 sp[0] = *pos as i32;
                 self.b.seg_pos.copy_from_slice(&sp)?;
             }
@@ -1265,6 +1278,9 @@ impl Session {
         let mut dense128 = MmaWork::default();
         dense128.push_chunked(0, &pairs, 128);
         s.work128.upload(&dense128)?;
+        let mut dense256 = MmaWork::default();
+        dense256.push_chunked(0, &pairs, 256);
+        s.work256.upload(&dense256)?;
         let mut words = QItem::words(&QItem::dense(vmax as u32));
         words.resize(s.items_dense.len(), 0);
         s.items_dense.copy_from_slice(&words)?;
@@ -1717,6 +1733,16 @@ fn fast_batch(ntok: usize) -> bool {
     ntok > QITEM_ROWS && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
 }
 
+/// A dense prefill product on the TMA GEMM: 256-token items when they still give two waves of
+/// blocks, else 128.
+fn mm_tma(ex: &Exec, m: &GemvMatrix, qa: &QAct, y: &mut DeviceBuffer<f32>, ntok: usize, w128: &DevWork, w256: &DevWork) -> Result<()> {
+    let (_, tm) = m.w16.as_ref().ok_or_else(|| bad("mm_tma: no f16 copy".into()))?;
+    let wide = (m.n as usize / 128) * ntok.div_ceil(256) >= 2 * 132;
+    let (w, tile) = if wide { (w256, 256) } else { (w128, 128) };
+    let n = ntok as u32;
+    ex.gemv.launch_gemm_f16_tma(ex.st, tile, tm, m.n, m.k, 1, None, qa.f16_ptr()?, n, y, n, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)
+}
+
 /// Largest KV-cache offset (in halves) a segment table would hold.
 fn sg_max_kv(list: &[Seg], kv_span: usize) -> usize {
     list.iter().map(|sg| (sg.seq + 1) * kv_span).max().unwrap_or(0)
@@ -2012,6 +2038,13 @@ fn layer(
             side_fused = true;
         }
         ex.gemv.launch_q_dense(st, &mut items, nt)?;
+    } else if prefill && Gemv::has_wgmma(st) && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.w16.is_some()) {
+        // Prefill on Hopper: the TMA GEMM per projection.
+        mm_tma(ex, &l.wq, &s.qa[0], &mut s.q, ntok, &s.work128, &s.work256)?;
+        mm_tma(ex, &l.wgate, &s.qa[0], &mut s.gate, ntok, &s.work128, &s.work256)?;
+        mm_tma(ex, &l.wrel, &s.qa[0], &mut s.r, ntok, &s.work128, &s.work256)?;
+        mm_tma(ex, &l.wk, &s.qa[ik], &mut s.k, ntok, &s.work128, &s.work256)?;
+        mm_tma(ex, &l.wv, &s.qa[iv], &mut s.v, ntok, &s.work128, &s.work256)?;
     } else if prefill && Gemv::has_wgmma(st) && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.frag16.is_some()) {
         // Prefill on Hopper: Q, gate, R, K and V in one warpgroup-MMA launch.
         let mut prods = [
@@ -2118,8 +2151,54 @@ fn layer(
                 },
             )?;
         }
+        // Several prompt segments without verify history: one launch per step for all of them.
+        let rest = list.len() - n_dec;
+        let seg_launch = packed && rest >= 2 && hist.is_none() && std::env::var_os("ASTRAL_PER_SEG").is_none();
+        if seg_launch {
+            let sp = seg_pos.expect("packed segments carry positions");
+            let nb = sp.len() / 9;
+            let table = sp.view(nb + 8 * n_dec, 8 * rest)?;
+            let max_rows = list[n_dec..].iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
+            let dyn_w = kp.map_or(0, |m| m.n);
+            ex.ops.attn_inputs_segs(
+                st,
+                astral_kernels::inkling::SegAttnInputs {
+                    q: s.q.device_ptr(),
+                    r: s.r.device_ptr(),
+                    k_raw: s.k.device_ptr(),
+                    v_raw: s.v.device_ptr(),
+                    k_out: s.attn.device_ptr(),
+                    v_out: s.o.device_ptr(),
+                    kdyn: kp.map(|_| (s.kdyn.device_ptr(), dyn_w)),
+                    vdyn: vp.map(|_| (s.vdyn.device_ptr(), dyn_w)),
+                    dyn_heads,
+                    conv: conv_all.device_ptr(),
+                    k_conv: l.k_conv.device_ptr(),
+                    v_conv: l.v_conv.device_ptr(),
+                    q_scale: l.q_clip.device_ptr(),
+                    r_scale: l.rel_clip.device_ptr(),
+                    kc: kc_all.device_ptr(),
+                    vc: vc_all.device_ptr(),
+                    pos: sp.device_ptr(),
+                    seg: &table,
+                    n_seg: rest as u32,
+                    max_rows,
+                    heads,
+                    kv_heads: kvh,
+                    head_dim: hd,
+                    n_rel,
+                    thr_qk: cfg.qk_clip,
+                    thr_rel: cfg.rel_clip,
+                    eps: cfg.rms_eps,
+                    global: !l.swa,
+                    log_floor: cfg.log_floor,
+                    log_alpha: cfg.log_alpha,
+                    capacity,
+                },
+            )?;
+        }
         for (si, sg) in list.iter().enumerate() {
-            if si < n_dec {
+            if si < n_dec || seg_launch {
                 continue;
             }
             let (r0, n) = (sg.row0, sg.len);
@@ -2210,8 +2289,8 @@ fn layer(
             }
             if list.len() > n_dec {
                 let sp = seg_pos.expect("packed segments carry positions");
-                let nb = sp.len() / 5;
-                let table = sp.view(nb + 4 * n_dec, 4 * (list.len() - n_dec))?;
+                let nb = sp.len() / 9;
+                let table = sp.view(nb + 8 * n_dec, 8 * (list.len() - n_dec))?;
                 let max_rows = list[n_dec..].iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
                 let (q, r, sk) = (&s.q, &s.r, &s.sinks);
                 ex.ops.attn_prefill_segs(st, q, r, sk, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn, &sp.view(0, nb)?, &table, (list.len() - n_dec) as u32, max_rows, nt, shape)?;
@@ -2325,7 +2404,11 @@ fn layer(
     } else if per_tok {
         ex.mm_decode(&l.wo, &s.qa_attn, &mut s.o, ntok)?;
     } else {
-        ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        if prefill && l.wo.w16.is_some() && Gemv::has_wgmma(st) {
+            mm_tma(ex, &l.wo, &s.qa_attn, &mut s.o, ntok, &s.work128, &s.work256)?;
+        } else {
+            ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        }
     }
     let starts_block = ip % cfg.attn_res_block == 0;
     if starts_block && *next_row >= BANK_ROWS {
@@ -2350,7 +2433,17 @@ fn layer(
                 };
                 ex.ops.conv_residual(st, &o, None, nd as u32, &mut conv_all.view_mut(2 * kvw * 3, cl - 2 * kvw * 3)?, &l.attn_post_conv, &mut cur, bv.as_mut().map(|v| v as &mut dyn DevMut<f32>), du, Some(dr.rows))?;
             }
-            for sg in seg_list.iter().skip(n_dec) {
+            let rest = seg_list.len() - n_dec;
+            let seg_launch = segs.is_some() && rest >= 2 && hist.is_none() && std::env::var_os("ASTRAL_PER_SEG").is_none();
+            if seg_launch {
+                let sp = segs.expect("checked").1;
+                let nb = sp.len() / 9;
+                let table = sp.view(nb + 8 * n_dec, 8 * rest)?;
+                let max_rows = seg_list[n_dec..].iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
+                let bank = bank_row.as_ref().map(|b| b.dptr());
+                ex.ops.conv_residual_segs(st, s.o.device_ptr(), conv_all.device_ptr() + 4 * (2 * kvw * 3) as u64, l.attn_post_conv.device_ptr(), s.cur.device_ptr(), bank, du, &table, rest as u32, max_rows)?;
+            }
+            for sg in seg_list.iter().skip(if seg_launch { seg_list.len() } else { n_dec }) {
                 let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
                 let (r0, n) = (sg.row0 * d, sg.len * d);
                 let mut ha = match (hist.as_mut(), hoff) {
@@ -2532,7 +2625,16 @@ fn layer(
             let mut cur = s.cur.view_mut(0, nd * d)?;
             ex.ops.conv_residual(st, &o, None, nd as u32, &mut conv_all.view_mut(st_off, cl - st_off)?, &l.ffn_post_conv, &mut cur, None, du, Some(dr.rows))?;
         }
-        for sg in seg_list.iter().skip(n_dec) {
+        let rest = seg_list.len() - n_dec;
+        let seg_launch = segs.is_some() && rest >= 2 && hist.is_none() && std::env::var_os("ASTRAL_PER_SEG").is_none();
+        if seg_launch {
+            let sp = segs.expect("checked").1;
+            let nb = sp.len() / 9;
+            let table = sp.view(nb + 8 * n_dec, 8 * rest)?;
+            let max_rows = seg_list[n_dec..].iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
+            ex.ops.conv_residual_segs(st, s.o.device_ptr(), conv_all.device_ptr() + 4 * st_off as u64, l.ffn_post_conv.device_ptr(), s.cur.device_ptr(), None, du, &table, rest as u32, max_rows)?;
+        }
+        for sg in seg_list.iter().skip(if seg_launch { seg_list.len() } else { n_dec }) {
             let mut cv = conv_all.view_mut(sg.seq * conv_span, conv_span)?;
             let (r0, n) = (sg.row0 * d, sg.len * d);
             let mut hf = match (hist.as_mut(), hoff) {

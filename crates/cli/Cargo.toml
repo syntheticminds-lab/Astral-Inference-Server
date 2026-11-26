@@ -20,4 +20,5 @@ astral-testing.workspace = true
 astral-loader.workspace = true
 astral-model.workspace = true
 astral-api.workspace = true
+astral-quant.workspace = true
 serde_json.workspace = true

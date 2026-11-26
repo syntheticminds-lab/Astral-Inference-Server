@@ -940,7 +940,7 @@ impl InklingOps {
                 let mut c1 = Ctrl3 { wd: c.wd, wgf: c.wgf, x: c.x, msg: c.msg, cd: c.cd, out: c.out };
                 let (mut xs1, mut ms1, mut dd1, mut nt2, mut psc2) = (x_stride as u32, msg_stride as u32, dim, ntok, scratch.dptr());
                 let mut p = [param(&mut c1), param(&mut xs1), param(&mut ms1), param(&mut dd1), param(&mut nt2), param(&mut psc2)];
-                Self::go(&self.ctrl_tc[1], s, LaunchConfig { grid: (2 * dim / 128, nj as u32, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+                Self::go(&self.ctrl_tc[1], s, LaunchConfig { grid: (2 * dim / 128, nj as u32, ntok.div_ceil(64)), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
             } else {
                 let mut nt1 = ntok;
                 let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1)];
@@ -1373,6 +1373,28 @@ impl InklingOps {
         let (mut px, mut xs, mut pm, mut ms, mut pr, mut dd) = (x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, rms.dptr(), dim);
         let mut p = [param(&mut px), param(&mut xs), param(&mut pm), param(&mut ms), param(&mut pr), param(&mut dd)];
         Self::go(&self.rms2, s, LaunchConfig { grid: (ntok, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        // Rank 64: the K-sliced bf16 tensor-core down projection (atomic partial sums into a
+        // zeroed cd); ASTRAL_CTRL_SIMT=1 keeps the split GEMM below.
+        if rank == 64 && dim.is_multiple_of(128) && x_stride.is_multiple_of(4) && msg_stride.is_multiple_of(4) && std::env::var_os("ASTRAL_CTRL_SIMT").is_none() {
+            #[repr(C)]
+            struct Ctrl3 {
+                wd: [DevicePtr; 3],
+                wgf: [DevicePtr; 3],
+                x: [DevicePtr; 3],
+                msg: [DevicePtr; 3],
+                cd: [DevicePtr; 3],
+                out: [DevicePtr; 3],
+            }
+            cd.zero_range_async(0, nt * rank as usize, s)?;
+            let mut c = Ctrl3 { wd: [wd.qs.device_ptr(), 0, 0], wgf: [0; 3], x: [x.dptr(), 0, 0], msg: [msg.dptr(), 0, 0], cd: [cd.device_ptr(), 0, 0], out: [0; 3] };
+            let (mut xs1, mut ms1, mut dd1, mut nt1, mut psc) = (x_stride as u32, msg_stride as u32, dim, ntok, rms.dptr());
+            let mut p = [param(&mut c), param(&mut xs1), param(&mut ms1), param(&mut dd1), param(&mut nt1), param(&mut psc)];
+            Self::go(&self.ctrl_tc[1], s, LaunchConfig { grid: (2 * dim / 128, 1, ntok.div_ceil(64)), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            self.sgemm(s, cd.device_ptr(), 0, rank, rank, rank, 0, wgf.qs.device_ptr(), rank, gf.dptr(), 2 * dim, ntok, 2 * dim, rank, rank.next_multiple_of(32), false)?;
+            let (mut pg, mut px, mut xs, mut pm, mut ms, mut po, mut dd, mut n) = (gf.dptr(), x.dptr(), x_stride as u32, msg.dptr(), msg_stride as u32, out.dptr(), dim, ntok);
+            let mut p = [param(&mut pg), param(&mut px), param(&mut xs), param(&mut pm), param(&mut ms), param(&mut po), param(&mut dd), param(&mut n)];
+            return Self::go(&self.ctrl_apply, s, LaunchConfig { grid: (dim.div_ceil(256), ntok, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p);
+        }
         // cd = concat(rx x, rm msg) . W_down^T, K = 2 dim split 8 ways: per-split partials in gf
         // (free until the next GEMM), summed in a fixed order (deterministic).
         let k = 2 * dim;

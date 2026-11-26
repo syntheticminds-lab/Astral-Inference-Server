@@ -2278,7 +2278,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down_tc(Ctrl3 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr unsigned RK = 64, KS = 128, RW = KS / 2 + 4;   // words per smem row (bf16 pairs + pad)
     __shared__ unsigned Ws[RK * RW], Xs[64 * RW];
-    const unsigned j = blockIdx.y, kbase = blockIdx.x * KS;
+    const unsigned j = blockIdx.y, kbase = blockIdx.x * KS, t0 = blockIdx.z * 64u;
     const unsigned part = kbase < dim ? 0u : 1u, koff = kbase - part * dim;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     const float* w = c.wd[j];
@@ -2291,8 +2291,8 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down_tc(Ctrl3 
     for (unsigned i = tid; i < 64u * (KS / 4); i += 256u) {
         const unsigned r = i / (KS / 4), q = i % (KS / 4);
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (r < ntok) {
-            const float* src = part ? c.msg[j] + (u64)r * msg_stride : c.x[j] + (u64)r * x_stride;
+        if (t0 + r < ntok) {
+            const float* src = part ? c.msg[j] + (u64)(t0 + r) * msg_stride : c.x[j] + (u64)(t0 + r) * x_stride;
             v = __ldg(reinterpret_cast<const float4*>(src + koff) + q);
         }
         Xs[r * RW + 2u * q] = bf16x2(v.x, v.y);
@@ -2319,7 +2319,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down_tc(Ctrl3 
 #pragma unroll
         for (unsigned e = 0; e < 4; ++e) {
             const unsigned r = rt + g + (e >> 1) * 8u, tok = tb + n * 8u + 2u * t + (e & 1u);
-            if (tok < ntok) atomicAdd(cd + (u64)tok * RK + r, acc[n][e] * scales[((u64)j * ntok + tok) * 2u + part]);
+            if (t0 + tok < ntok) atomicAdd(cd + (u64)(t0 + tok) * RK + r, acc[n][e] * scales[((u64)j * ntok + t0 + tok) * 2u + part]);
         }
     }
 #endif

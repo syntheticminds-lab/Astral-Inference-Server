@@ -207,6 +207,8 @@ struct Pending {
     seq: usize,
     /// Prompt tokens already in the sequence.
     done: usize,
+    /// When the request was admitted.
+    since: std::time::Instant,
 }
 
 struct Scheduler<'a> {
@@ -321,7 +323,7 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             self.free[seq] = false;
-            self.prefilling.push_back(Pending { job, seq, done: 0 });
+            self.prefilling.push_back(Pending { job, seq, done: 0, since: std::time::Instant::now() });
         }
     }
 
@@ -383,7 +385,7 @@ impl<'a> Scheduler<'a> {
             }
         }
         let mb = self.s.max_batch();
-        if !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= mb {
+        if !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= mb && self.prefill_now() {
             return self.mixed_step();
         }
         let mut start = 0;
@@ -417,6 +419,21 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether to run prompt chunks this step. A pass streams every expert's weights however few
+    /// prompt tokens it holds, so while requests are decoding, prompts that arrive one by one
+    /// wait (at most `ASTRAL_PREFILL_WAIT_MS`, default 0 = never) until `ASTRAL_PREFILL_BATCH`
+    /// prompt tokens are pending, and are then prefilled together.
+    fn prefill_now(&self) -> bool {
+        let wait_ms: u64 = std::env::var("ASTRAL_PREFILL_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if wait_ms == 0 || self.active.is_empty() {
+            return true;
+        }
+        let want: usize = std::env::var("ASTRAL_PREFILL_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(self.s.token_budget() / 2);
+        let pending: usize = self.prefilling.iter().map(|p| p.job.prompt.len() - p.done).sum();
+        let oldest = self.prefilling.front().map_or(0, |p| p.since.elapsed().as_millis() as u64);
+        pending >= want || oldest >= wait_ms || self.active.len() + self.prefilling.len() >= self.s.max_batch()
     }
 
     /// One pass holding the next token of every decoding request and, in the rest of the token

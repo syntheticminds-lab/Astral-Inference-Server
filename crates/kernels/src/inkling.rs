@@ -96,6 +96,8 @@ pub struct InklingOps {
     attn_split: Function,
     attn_merge: Function,
     attn_split1: Function,
+    /// [`InklingOps::attn_decode_split`] one-chunk splits, 3 query heads per KV head in a block.
+    attn_split_gqa3: Function,
     attn_merge_q8: Function,
     mix_rms_q8: Function,
     router_b: Function,
@@ -261,6 +263,7 @@ impl InklingOps {
             attn_split: f("astral_ink_attn_split")?,
             attn_merge: f("astral_ink_attn_merge")?,
             attn_split1: f("astral_ink_attn_split1")?,
+            attn_split_gqa3: f("astral_ink_attn_split_gqa3")?,
             attn_merge_q8: f("astral_ink_attn_merge_q8")?,
             mix_rms_q8: f("astral_ink_mix_rms_q8")?,
             router_fused: f("astral_ink_router_fused")?,
@@ -1160,10 +1163,17 @@ impl InklingOps {
         ];
         // One chunk per split (decode, exact-size prefill splits) or splits looping over chunks
         // (graph-captured multi-token passes with a capped split count).
-        let f = if chunk_loop { &self.attn_split } else { &self.attn_split1 };
-        // One-chunk splits: blocks loop over splits, so many rows need fewer (mostly idle) blocks.
-        let gy = if chunk_loop { max_splits } else { (max_splits * 8).div_ceil(ntok).clamp(1, max_splits) };
-        Self::go(f, s, LaunchConfig { grid: (a.heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        let gqa3 = !chunk_loop && a.heads == 3 * a.kv_heads && std::env::var_os("ASTRAL_NO_GQA").is_none();
+        if gqa3 {
+            // A KV head's 3 query heads in one block: each K / V row read once.
+            let gy = (max_splits * 24).div_ceil(ntok).clamp(1, max_splits);
+            Self::go(&self.attn_split_gqa3, s, LaunchConfig { grid: (a.kv_heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        } else {
+            let f = if chunk_loop { &self.attn_split } else { &self.attn_split1 };
+            // One-chunk splits: blocks loop over splits, so many rows need fewer (mostly idle) blocks.
+            let gy = if chunk_loop { max_splits } else { (max_splits * 8).div_ceil(ntok).clamp(1, max_splits) };
+            Self::go(f, s, LaunchConfig { grid: (a.heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+        }
         let (mut pw2, mut po, mut pp2, mut win2, mut cap2, mut ms2) = (work.dptr(), out.dptr(), pos.dptr(), a.window, a.capacity, max_splits);
         let cfg = LaunchConfig { grid: (a.heads, ntok, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
         match gate {

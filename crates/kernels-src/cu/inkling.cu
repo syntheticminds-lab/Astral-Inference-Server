@@ -1341,6 +1341,131 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split1(
     }
 }
 
+// astral_ink_attn_split1 with the G query heads of a KV head in one block (grouped-query
+// attention): each K and V row is read once for all G heads instead of once per head. Same
+// arguments and partial layout; grid = (kv_heads, splits, rows).
+template <unsigned G>
+__device__ __forceinline__ void attn_split_gqa(
+    const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
+    const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
+    float* __restrict__ part, const int* __restrict__ pos_p, unsigned heads, unsigned kv_heads, unsigned n_rel,
+    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits,
+    const int* __restrict__ seq_p, unsigned n_seqs) {
+    constexpr unsigned HD = 128;
+    const unsigned kvh = blockIdx.x, sp = blockIdx.y, z = blockIdx.z;
+    q += (u64)z * heads * HD;
+    r += (u64)z * heads * n_rel;
+    sink += (u64)z * heads;
+    part += (u64)z * heads * max_splits * (HD + 2);
+    {
+        const u64 so = row_seq(seq_p, n_seqs, z) * capacity * kv_heads * HD;
+        kc += so;
+        vc += so;
+    }
+    const unsigned h0 = kvh * G;
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned width = kv_heads * HD;
+    float4 qv[G];
+    float rs[G], sk[G];
+#pragma unroll
+    for (unsigned g = 0; g < G; ++g) {
+        qv[g] = reinterpret_cast<const float4*>(q + (u64)(h0 + g) * HD)[lane];
+        rs[g] = lane < n_rel ? r[(u64)(h0 + g) * n_rel + lane] : 0.0f;
+        sk[g] = sink[h0 + g];
+    }
+    __shared__ float wm[4][G], wl[4][G], wacc[4][G][HD];
+    for (unsigned spl = sp; spl < max_splits; spl += gridDim.y) {
+    const unsigned start = lo + spl * ATT_CHUNK;
+    if (start > pos) return;
+    const unsigned end = min(pos + 1, start + ATT_CHUNK);
+    float m[G], l[G], a[G][4];
+#pragma unroll
+    for (unsigned g = 0; g < G; ++g) { m[g] = -INFINITY; l[g] = 0.0f; a[g][0] = a[g][1] = a[g][2] = a[g][3] = 0.0f; }
+    constexpr unsigned GK = 4;
+    for (unsigned j0 = start + warp; j0 < end; j0 += 4u * GK) {
+        float sc[G][GK];
+        uint2 vr[GK];
+#pragma unroll
+        for (unsigned u = 0; u < GK; ++u) {
+            const unsigned j = j0 + 4u * u;
+            const unsigned jj = j < end ? j : j0;
+            const uint2 kr = reinterpret_cast<const uint2*>(kc + (u64)jj * width + (u64)kvh * HD)[lane];
+            vr[u] = reinterpret_cast<const uint2*>(vc + (u64)jj * width + (u64)kvh * HD)[lane];
+            const float2 k01 = __half22float2(*reinterpret_cast<const __half2*>(&kr.x));
+            const float2 k23 = __half22float2(*reinterpret_cast<const __half2*>(&kr.y));
+            const unsigned dist = pos - jj;
+            const float rb = (lane < n_rel && dist < extent) ? rel_bias[(u64)dist * n_rel + lane] : 0.0f;
+#pragma unroll
+            for (unsigned g = 0; g < G; ++g) {
+                float tt = scale * (qv[g].x * k01.x + qv[g].y * k01.y + qv[g].z * k23.x + qv[g].w * k23.y);
+                sc[g][u] = fmaf(rb, rs[g], tt);
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+            for (unsigned g = 0; g < G; ++g)
+#pragma unroll
+                for (unsigned u = 0; u < GK; ++u) sc[g][u] += __shfl_xor_sync(0xffffffffu, sc[g][u], o);
+        }
+#pragma unroll
+        for (unsigned g = 0; g < G; ++g) {
+            float mx = m[g];
+#pragma unroll
+            for (unsigned u = 0; u < GK; ++u) {
+                sc[g][u] = (j0 + 4u * u < end) ? sc[g][u] - sk[g] : -INFINITY;
+                mx = fmaxf(mx, sc[g][u]);
+            }
+            const float c = expf(m[g] - mx);
+            l[g] *= c; a[g][0] *= c; a[g][1] *= c; a[g][2] *= c; a[g][3] *= c;
+#pragma unroll
+            for (unsigned u = 0; u < GK; ++u) {
+                const float p = expf(sc[g][u] - mx);
+                const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&vr[u].x));
+                const float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&vr[u].y));
+                l[g] += p;
+                a[g][0] = fmaf(p, v01.x, a[g][0]); a[g][1] = fmaf(p, v01.y, a[g][1]);
+                a[g][2] = fmaf(p, v23.x, a[g][2]); a[g][3] = fmaf(p, v23.y, a[g][3]);
+            }
+            m[g] = mx;
+        }
+    }
+#pragma unroll
+    for (unsigned g = 0; g < G; ++g) {
+        if (lane == 0) { wm[warp][g] = m[g]; wl[warp][g] = l[g]; }
+#pragma unroll
+        for (unsigned c = 0; c < 4; ++c) wacc[warp][g][lane * 4 + c] = a[g][c];
+    }
+    __syncthreads();
+    const unsigned d = threadIdx.x;   // 128 threads = HD
+#pragma unroll
+    for (unsigned g = 0; g < G; ++g) {
+        const float M = fmaxf(fmaxf(wm[0][g], wm[1][g]), fmaxf(wm[2][g], wm[3][g]));
+        float acc = 0.0f, L = 0.0f;
+#pragma unroll
+        for (unsigned w = 0; w < 4; ++w) {
+            const float f = wm[w][g] == -INFINITY ? 0.0f : expf(wm[w][g] - M);
+            acc = fmaf(wacc[w][g][d], f, acc);
+            L = fmaf(wl[w][g], f, L);
+        }
+        float* out = part + ((u64)(h0 + g) * max_splits + spl) * (HD + 2);
+        out[2 + d] = acc;
+        if (d == 0) { out[0] = M; out[1] = L; }
+    }
+    __syncthreads();
+    }
+}
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split_gqa3(
+    const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
+    const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
+    float* __restrict__ part, const int* __restrict__ pos_p, unsigned heads, unsigned kv_heads, unsigned n_rel,
+    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits,
+    const int* __restrict__ seq_p, unsigned n_seqs) { PDL_WAIT();
+    attn_split_gqa<3>(q, r, sink, kc, vc, rel_bias, part, pos_p, heads, kv_heads, n_rel, extent, window, scale, capacity, max_splits, seq_p, n_seqs);
+}
+
 extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_merge(const float* __restrict__ part, float* __restrict__ out,
                                                                         const int* __restrict__ pos_p, unsigned window,
                                                                         unsigned capacity, unsigned max_splits,

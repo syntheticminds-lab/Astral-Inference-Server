@@ -574,7 +574,7 @@ pub struct Session {
     /// Row count the dense work lists (`s.work[0]`, `s.items_dense`) currently describe.
     dense_rows: usize,
     /// `ASTRAL_STEP_TIMING`: decode_batch calls and seconds in (prepare, launch, wait, read).
-    phase: (u64, [f64; 4]),
+    phase: (u64, [f64; 4], u64),
 }
 
 /// Device buffers of the batched decode pass.
@@ -736,7 +736,7 @@ impl Session {
             batch_graphs: (0..=max_batch).map(|_| None).collect(),
             seq_reset: (0..n_seqs).map(|_| None).collect(),
             dense_rows: 0,
-            phase: (0, [0.0; 4]),
+            phase: (0, [0.0; 4], 0),
             w,
         };
         me.capture_graph()?;
@@ -854,9 +854,21 @@ impl Session {
             forward(&Exec { st: stream, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, Some(captured), &mut SpecIo::none(), 0, Some(&mut io), None)?;
         } else {
             let t1 = std::time::Instant::now();
+            // ASTRAL_PROFILE_STEP=k: profile the k-th batched step of at least 48 rows.
+            let prof = n >= 48 && std::env::var("ASTRAL_PROFILE_STEP").ok().and_then(|v| v.parse::<u64>().ok()).is_some_and(|k| {
+                self.phase.2 += 1;
+                self.phase.2 == k
+            });
+            if prof {
+                self.stream.synchronize()?;
+                astral_gpu::profiler(true)?;
+            }
             self.batch_graphs[n].as_ref().expect("captured above").launch(&self.stream)?;
             let t2 = std::time::Instant::now();
             self.stream.synchronize()?;
+            if prof {
+                astral_gpu::profiler(false)?;
+            }
             let t3 = std::time::Instant::now();
             let next = self.b.next.to_vec()?;
             if std::env::var_os("ASTRAL_STEP_TIMING").is_some() {

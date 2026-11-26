@@ -230,7 +230,7 @@ fn cmd_batch_check(path: &str, n: &str, steps: &str) -> Result<bool> {
         ok &= picks == 0 && maxd == 0.0;
     }
     // Timing: one batched step at this batch size.
-    let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: (prompts[i].len() + steps) as u32, token: 1000 }).collect();
+    let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: (prompts[i].len() + steps) as u32, token: (1000 + i * 7919 % 150000) as u32 }).collect();
     s.decode_batch(&rows)?;
     if std::env::var_os("ASTRAL_PROFILE").is_some() {
         astral_gpu::profiler(true)?;
@@ -301,13 +301,45 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 s.reset_seq(q)?;
                 s.prefill_seq(q, 0, &long[..64])?;
             }
-            let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 600, token: 1000 }).collect();
+            let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 600, token: (1000 + q * 7919 % 150000) as u32 }).collect();
             while std::time::Instant::now() < t_end {
                 s.decode_batch(&rows)?;
                 cnt += 1;
                 if tick.elapsed().as_secs_f64() >= 1.0 {
                     println!("decode {n}: {:.2} ms per step", tick.elapsed().as_secs_f64() * 1e3 / cnt as f64);
                     (cnt, tick) = (0, std::time::Instant::now());
+                }
+            }
+        }
+        "interleave" => {
+            // Server-like: a mixed pass (n - 1 decoding rows + a prompt chunk) every 10 decode
+            // steps of the n - 1 rows; prints the decode-step time.
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let chunk: Vec<u32> = (0..512).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
+            let one = [1000u32];
+            let rows: Vec<DecodeRow> = (0..n - 1).map(|q| DecodeRow { seq: q, pos: 600, token: (1000 + q * 7919 % 150000) as u32 }).collect();
+            let mut dt = 0f64;
+            let mut it = 0usize;
+            while std::time::Instant::now() < t_end {
+                if std::env::var_os("ASTRAL_NO_MIX").is_none() {
+                    s.reset_seq(n - 1)?;
+                    let mut parts: Vec<(usize, u32, &[u32])> = (0..n - 1).map(|q| (q, 600u32, &one[..])).collect();
+                    parts.push((n - 1, 0, &chunk[..]));
+                    s.step_mixed(&parts)?;
+                }
+                for _ in 0..10 {
+                    let t0 = std::time::Instant::now();
+                    s.decode_batch(&rows)?;
+                    dt += t0.elapsed().as_secs_f64();
+                    cnt += 1;
+                }
+                it += 1;
+                if tick.elapsed().as_secs_f64() >= 2.0 {
+                    println!("interleave {}: decode {:.2} ms per step ({it} mixed passes)", n - 1, dt * 1e3 / cnt as f64);
+                    (cnt, dt, tick) = (0, 0.0, std::time::Instant::now());
                 }
             }
         }

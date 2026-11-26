@@ -565,6 +565,8 @@ pub struct Session {
     seq_reset: Vec<Option<GraphExec>>,
     /// Row count the dense work lists (`s.work[0]`, `s.items_dense`) currently describe.
     dense_rows: usize,
+    /// `ASTRAL_STEP_TIMING`: decode_batch calls and seconds in (prepare, launch, wait, read).
+    phase: (u64, [f64; 4]),
 }
 
 /// Device buffers of the batched decode pass.
@@ -725,6 +727,7 @@ impl Session {
             batch_graphs: (0..=max_batch).map(|_| None).collect(),
             seq_reset: (0..n_seqs).map(|_| None).collect(),
             dense_rows: 0,
+            phase: (0, [0.0; 4]),
             w,
         };
         me.capture_graph()?;
@@ -812,6 +815,7 @@ impl Session {
                 return Err(bad(format!("decode_batch: sequence {} at position {} (sequences {}, context {})", r.seq, r.pos, self.n_seqs, self.capacity)));
             }
         }
+        let t0 = std::time::Instant::now();
         self.set_dense(n)?;
         if !self.capture {
             self.capture_batch(n)?;
@@ -837,7 +841,24 @@ impl Session {
             let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
             forward(&Exec { st: stream, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, Some(captured), &mut SpecIo::none(), 0, Some(&mut io), None)?;
         } else {
+            let t1 = std::time::Instant::now();
             self.batch_graphs[n].as_ref().expect("captured above").launch(&self.stream)?;
+            let t2 = std::time::Instant::now();
+            self.stream.synchronize()?;
+            let t3 = std::time::Instant::now();
+            let next = self.b.next.to_vec()?;
+            if std::env::var_os("ASTRAL_STEP_TIMING").is_some() {
+                let p = &mut self.phase;
+                p.0 += 1;
+                for (k, d) in [(t1 - t0), (t2 - t1), (t3 - t2), t3.elapsed()].iter().enumerate() {
+                    p.1[k] += d.as_secs_f64();
+                }
+                if p.0 % 200 == 0 {
+                    let a = |k: usize| p.1[k] * 1e3 / p.0 as f64;
+                    eprintln!("decode_batch: {} steps: prepare {:.2} ms, launch {:.2} ms, wait {:.2} ms, read {:.2} ms", p.0, a(0), a(1), a(2), a(3));
+                }
+            }
+            return Ok(next[..n].iter().map(|&t| t as u32).collect());
         }
         self.stream.synchronize()?;
         let next = self.b.next.to_vec()?;

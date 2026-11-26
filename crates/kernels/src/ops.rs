@@ -471,7 +471,7 @@ impl MmaWork {
 }
 
 /// Dynamic shared memory of `astral_gemm_nvfp4_wgmma2`: 3 stages of `G7Stage` (21504 bytes).
-const WGMMA2_SMEM: u32 = 3 * 21504;
+const WGMMA2_SMEM: u32 = 5 * 21504;
 /// Dynamic shared memory of `astral_gemm_f16_wgmma`: 3 stages of 32 KB.
 const WGMMA_F16_SMEM: u32 = 3 * 32768;
 

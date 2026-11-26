@@ -1975,6 +1975,9 @@ __device__ __forceinline__ void g8_dequant(const G7Stage& S, unsigned warp, unsi
 }
 #endif
 
+#ifndef G8_STAGES
+#define G8_STAGES 5   // shared-memory stages of astral_gemm_nvfp4_wgmma2 (loads run G8_STAGES - 1 ahead)
+#endif
 extern "C" __global__ void __launch_bounds__(256) astral_gemm_nvfp4_wgmma2(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
@@ -2013,18 +2016,19 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemm_nvfp4_wgmma2(
     float d[64];
 #pragma unroll
     for (unsigned i = 0; i < 64; ++i) d[i] = 0.0f;
-    load(0, 0);
-    cp_async_commit();
-    if (KCS > 1) load(1, 1);
-    cp_async_commit();
+#pragma unroll
+    for (unsigned p = 0; p < G8_STAGES - 1; ++p) {
+        if (p < KCS) load(p, p);
+        cp_async_commit();
+    }
     unsigned a0[4][4], a1[4][4];
     // One K step: wait for its stage, dequant into A, issue its 4 wgmmas, keep 1 group in flight,
     // then refill the stage two steps ahead (the one the previous group just released).
     auto step = [&](unsigned kc, unsigned (&a)[4][4]) {
-        cp_async_wait<1>();
+        cp_async_wait<G8_STAGES - 2>();
         __syncthreads();
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        const G7Stage& S = sm[kc % 3u];
+        const G7Stage& S = sm[kc % G8_STAGES];
         g8_dequant(S, warp, lane, g, a);
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         const unsigned long long db = wgmma_desc(S.b);
@@ -2033,7 +2037,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemm_nvfp4_wgmma2(
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
         asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
         __syncthreads();   // both warpgroups released stage kc - 1
-        if (kc + 2 < KCS) load((kc + 2) % 3u, kc + 2);
+        if (kc + G8_STAGES - 1 < KCS) load((kc + G8_STAGES - 1) % G8_STAGES, kc + G8_STAGES - 1);
         cp_async_commit();
     };
     unsigned kc = 0;

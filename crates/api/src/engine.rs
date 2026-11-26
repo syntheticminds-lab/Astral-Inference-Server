@@ -218,12 +218,37 @@ struct Scheduler<'a> {
     active: Vec<Active>,
     free: Vec<bool>,
     closed: bool,
+    /// `ASTRAL_STEP_STATS=1`: time and tokens of mixed passes and decode-only steps.
+    stats: Option<StepStats>,
+}
+
+#[derive(Default)]
+struct StepStats {
+    mixed: (u64, f64, usize, usize),
+    decode: (u64, f64, usize),
+    last: Option<std::time::Instant>,
+}
+
+impl StepStats {
+    fn report(&mut self) {
+        if self.last.is_some_and(|t| t.elapsed().as_secs_f64() < 5.0) {
+            return;
+        }
+        self.last = Some(std::time::Instant::now());
+        let (mn, mt, mp, md) = self.mixed;
+        let (dn, dt, dr) = self.decode;
+        eprintln!(
+            "astral: steps: mixed {mn} ({mt:.1} s, {mp} prompt + {md} decode tokens, {:.1} ms avg), decode-only {dn} ({dt:.1} s, {dr} tokens, {:.1} ms avg)",
+            mt * 1e3 / mn.max(1) as f64,
+            dt * 1e3 / dn.max(1) as f64
+        );
+    }
 }
 
 impl<'a> Scheduler<'a> {
     fn new(s: &'a mut Session, rx: Receiver<Job>) -> Self {
         let n = s.n_seqs();
-        Self { s, rx, waiting: VecDeque::new(), prefilling: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false }
+        Self { s, rx, waiting: VecDeque::new(), prefilling: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false, stats: std::env::var_os("ASTRAL_STEP_STATS").map(|_| StepStats::default()) }
     }
 
     fn run(&mut self) {
@@ -365,7 +390,14 @@ impl<'a> Scheduler<'a> {
         while start < self.active.len() {
             let end = (start + mb).min(self.active.len());
             let rows: Vec<DecodeRow> = self.active[start..end].iter().map(|a| DecodeRow { seq: a.seq, pos: a.pos, token: a.last }).collect();
+            let t0 = std::time::Instant::now();
             let next = self.s.decode_batch(&rows)?;
+            if let Some(st) = self.stats.as_mut() {
+                st.decode.0 += 1;
+                st.decode.1 += t0.elapsed().as_secs_f64();
+                st.decode.2 += rows.len();
+                st.report();
+            }
             for (a, t) in self.active[start..end].iter_mut().zip(next) {
                 a.pos += 1;
                 a.last = t;
@@ -405,7 +437,16 @@ impl<'a> Scheduler<'a> {
             left -= n;
         }
         let views: Vec<(usize, u32, &[u32])> = parts.iter().map(|(q, pos, t)| (*q, *pos, t.as_slice())).collect();
+        let t0 = std::time::Instant::now();
         let next = self.s.step_mixed(&views)?;
+        if let Some(st) = self.stats.as_mut() {
+            let p: usize = chunks.iter().map(|c| c.1).sum();
+            st.mixed.0 += 1;
+            st.mixed.1 += t0.elapsed().as_secs_f64();
+            st.mixed.2 += p;
+            st.mixed.3 += self.active.len();
+            st.report();
+        }
         let n_dec = self.active.len();
         for (a, &t) in self.active.iter_mut().zip(&next[..n_dec]) {
             a.pos += 1;

@@ -696,7 +696,8 @@ impl Session {
             part_v: z(max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
             part_i: DeviceBuffer::<u32>::zeroed(ctx, max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
             dops: DsparkOps::new(&reg)?,
-            seg_pos: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            // Start positions, then (packed prefill) the 4-word segment table for attention.
+            seg_pos: DeviceBuffer::<i32>::zeroed(ctx, 5 * max_batch)?,
         };
         let mut me = Self {
             stream: Stream::new(ctx)?,
@@ -973,9 +974,12 @@ impl Session {
                     tok[sg.row0 + r] = x as i32;
                 }
             }
-            let mut sp = vec![0i32; self.max_batch];
+            let mut sp = vec![0i32; 5 * self.max_batch];
+            let kv_span = self.capacity as usize * self.w.cfg.kv_width();
             for (k, sg) in segs.iter().enumerate() {
                 sp[k] = sg.pos0 as i32;
+                let t = self.max_batch + 4 * k;
+                sp[t..t + 4].copy_from_slice(&[sg.row0 as i32, sg.len as i32, (sg.seq * kv_span) as i32, k as i32]);
             }
             self.set_dense(rows)?;
             self.s.token.copy_from_slice(&tok)?;
@@ -1043,7 +1047,7 @@ impl Session {
             let chunk = &tokens[done..done + t];
             let pos = &mut cur_pos;
             {
-                let mut sp = vec![0i32; self.max_batch];
+                let mut sp = vec![0i32; 5 * self.max_batch];
                 sp[0] = *pos as i32;
                 self.b.seg_pos.copy_from_slice(&sp)?;
             }
@@ -1630,6 +1634,11 @@ fn fast_batch(ntok: usize) -> bool {
     ntok > QITEM_ROWS && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
 }
 
+/// Largest KV-cache offset (in halves) a segment table would hold.
+fn sg_max_kv(list: &[Seg], kv_span: usize) -> usize {
+    list.iter().map(|sg| (sg.seq + 1) * kv_span).max().unwrap_or(0)
+}
+
 /// Experiment: prefill Q, gate, R, K, V on [`Gemv::launch_q_dense`] (`ASTRAL_PREFILL_DENSE_Q8=1`).
 fn prefill_dense_q8() -> bool {
     std::env::var_os("ASTRAL_PREFILL_DENSE_Q8").is_some()
@@ -2045,7 +2054,21 @@ fn layer(
         tap!("Vcur", v);
         tap!("Rcur", r);
         tap!("sinks", sinks);
+        // Packed prefill: every segment's attention in one launch.
+        let all_flash = list.iter().all(|sg| prefill && hd == 128 && n_rel <= 16 && n_rel.is_multiple_of(4) && !split_prefill() && sg.len > 0);
+        let one_launch = packed && list.len() > 1 && all_flash && (sg_max_kv(list, kv_span) < i32::MAX as usize) && std::env::var_os("ASTRAL_ATTN_PER_SEG").is_none();
+        if one_launch {
+            let sp = seg_pos.expect("packed segments carry positions");
+            let nb = sp.len() / 5;
+            let table = sp.view(nb, 4 * list.len())?;
+            let max_rows = list.iter().map(|sg| sg.len).max().unwrap_or(1) as u32;
+            let (q, r, sk) = (&s.q, &s.r, &s.sinks);
+            ex.ops.attn_prefill_segs(st, q, r, sk, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn, &sp.view(0, nb)?, &table, list.len() as u32, max_rows, nt, shape)?;
+        }
         for (si, sg) in list.iter().enumerate() {
+            if one_launch {
+                break;
+            }
             let (r0, n) = (sg.row0, sg.len);
             let nn = n as u32;
             let ko = sg.seq * kv_span;

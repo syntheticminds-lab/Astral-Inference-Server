@@ -88,6 +88,7 @@ pub struct InklingOps {
     sgemm_tn: Function,
     ctrl_apply: Function,
     attn_prefill: Function,
+    attn_prefill_segs: Function,
     moe_group: Function,
     moe_group_q: Function,
     attn_split: Function,
@@ -212,6 +213,7 @@ impl InklingOps {
             tgemm_tn: f("astral_ink_tgemm_tn")?,
             ctrl_apply: f("astral_ink_ctrl_apply")?,
             attn_prefill: f("astral_ink_attn_prefill")?,
+            attn_prefill_segs: f("astral_ink_attn_prefill_segs")?,
             moe_group: f("astral_ink_moe_group")?,
             moe_group_q: f("astral_ink_moe_group_q")?,
             attn_split: f("astral_ink_attn_split")?,
@@ -1349,6 +1351,62 @@ impl InklingOps {
     /// Flash-attention prefill on tensor cores for `ntok` causal queries at positions
     /// `pos[0]..` (keys already in the cache). `head_dim` must be 128 and `n_rel <= 16`.
     #[allow(clippy::too_many_arguments)]
+    /// [`InklingOps::attn_prefill`] for every segment of a packed prefill pass in one launch:
+    /// `seg` holds 4 words per segment (first row, rows, KV-cache offset in halves, index of its
+    /// start position in `pos`); `kc` / `vc` are the whole caches, `max_rows` the longest segment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_segs(
+        &self,
+        s: &Stream,
+        q: &impl Dev<f32>,
+        r: &impl Dev<f32>,
+        sink: &impl Dev<f32>,
+        kc: &impl Dev<u16>,
+        vc: &impl Dev<u16>,
+        rel_bias: &impl Dev<f32>,
+        out: &mut impl DevMut<f32>,
+        pos: &impl Dev<i32>,
+        seg: &impl Dev<i32>,
+        n_seg: u32,
+        max_rows: u32,
+        rows: u32,
+        a: AttnShape,
+    ) -> Result<()> {
+        if a.head_dim != 128 || a.n_rel > 16 || !a.n_rel.is_multiple_of(4) || a.kv_heads == 0 || !a.heads.is_multiple_of(a.kv_heads) || a.capacity == 0 || a.capacity > MAX_CTX || n_seg == 0 || max_rows == 0 {
+            return Err(invalid(format!("attn prefill segs: unsupported shape {a:?}")));
+        }
+        let nt = rows as usize;
+        need("attn q", q.dlen(), nt * (a.heads * a.head_dim) as usize)?;
+        need("attn r", r.dlen(), nt * (a.heads * a.n_rel) as usize)?;
+        need("attn sink", sink.dlen(), nt * a.heads as usize)?;
+        need("attn rel bias", rel_bias.dlen(), (a.extent * a.n_rel) as usize)?;
+        need("attn out", out.dlen(), nt * (a.heads * a.head_dim) as usize)?;
+        need("attn seg table", seg.dlen(), 4 * n_seg as usize)?;
+        let (mut pq, mut pr, mut ps, mut pk, mut pv, mut pb, mut po, mut pp, mut pt) = (q.dptr(), r.dptr(), sink.dptr(), kc.dptr(), vc.dptr(), rel_bias.dptr(), out.dptr(), pos.dptr(), seg.dptr());
+        let (mut h, mut kh, mut nr, mut ex, mut win, mut cap) = (a.heads, a.kv_heads, a.n_rel, a.extent, a.window, a.capacity);
+        let mut scale = 1.0f32 / (a.head_dim as f32).sqrt();
+        let mut p = [
+            param(&mut pq),
+            param(&mut pr),
+            param(&mut ps),
+            param(&mut pk),
+            param(&mut pv),
+            param(&mut pb),
+            param(&mut po),
+            param(&mut pp),
+            param(&mut pt),
+            param(&mut h),
+            param(&mut kh),
+            param(&mut nr),
+            param(&mut ex),
+            param(&mut win),
+            param(&mut scale),
+            param(&mut cap),
+        ];
+        // The caller wrote the table for these caches (offsets + capacity * width stay inside).
+        Self::go(&self.attn_prefill_segs, s, LaunchConfig { grid: (max_rows.div_ceil(64), a.heads, n_seg), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
     pub fn attn_prefill(
         &self,
         s: &Stream,

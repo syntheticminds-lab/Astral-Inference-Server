@@ -1720,11 +1720,11 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill(
+__device__ __forceinline__ void attn_prefill_body(
     const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
     const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
     float* __restrict__ out, const int* __restrict__ pos_p, unsigned ntok, unsigned heads, unsigned kv_heads,
-    unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) { PDL_WAIT();
+    unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) {
     constexpr unsigned HD = 128;
     __shared__ __align__(16) __half Ks[FA_K * FA_ROW];
     __shared__ __align__(16) __half Vs[FA_K * FA_ROW];
@@ -1881,6 +1881,28 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill(
             orow[c + 1] = o[dn][3] * ib;
         }
     }
+}
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill(
+    const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
+    const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
+    float* __restrict__ out, const int* __restrict__ pos_p, unsigned ntok, unsigned heads, unsigned kv_heads,
+    unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) { PDL_WAIT();
+    attn_prefill_body(q, r, sink, kc, vc, rel_bias, out, pos_p, ntok, heads, kv_heads, n_rel, extent, window, scale, capacity);
+}
+// Every segment of a packed prefill pass in one launch (blockIdx.z = segment): seg[4 z ..] =
+// (first row, rows, KV-cache offset in halves, index of its start position in pos_p). Rows are
+// token-major in q, r, sink and out, as for astral_ink_attn_prefill on that segment alone.
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill_segs(
+    const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
+    const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
+    float* __restrict__ out, const int* __restrict__ pos_p, const unsigned* __restrict__ seg, unsigned heads, unsigned kv_heads,
+    unsigned n_rel, unsigned extent, unsigned window, float scale, unsigned capacity) { PDL_WAIT();
+    const unsigned* sg = seg + 4u * blockIdx.z;
+    const unsigned row0 = sg[0], n = sg[1];
+    if (blockIdx.x * 64u >= n) return;
+    const u64 qw = (u64)heads * 128u;
+    attn_prefill_body(q + row0 * qw, r + (u64)row0 * heads * n_rel, sink + (u64)row0 * heads, kc + sg[2], vc + sg[2], rel_bias,
+                      out + row0 * qw, pos_p + sg[3], n, heads, kv_heads, n_rel, extent, window, scale, capacity);
 }
 
 // =============================================================================================

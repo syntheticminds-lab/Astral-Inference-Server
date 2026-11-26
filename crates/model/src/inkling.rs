@@ -1753,6 +1753,12 @@ fn prefill_dense_q8() -> bool {
     std::env::var_os("ASTRAL_PREFILL_DENSE_Q8").is_some()
 }
 
+/// Batched decode's dense projections on the TMA f16 GEMM (`ASTRAL_DECODE_TMA=1`; measured
+/// slower than the int8 kernel at 32 and 64 rows on a GH200, 21.1 vs 17.8 ms per 64-row step).
+fn decode_tma() -> bool {
+    std::env::var("ASTRAL_DECODE_TMA").is_ok_and(|v| v == "1")
+}
+
 fn small_batch(ntok: usize) -> bool {
     ntok > 1 && ntok <= QITEM_ROWS && std::env::var_os("ASTRAL_SMALL_MMA").is_none()
 }
@@ -2004,6 +2010,19 @@ fn layer(
             ex.gemv.launch_q_multi_mma(st, &mut items, 1)?;
         } else if ntok == 1 {
             ex.gemv.launch_q_multi(st, &mut items)?;
+        } else if fast && decode_tma() && items[..5].iter().all(|it| it.m.w16.is_some()) && Gemv::has_wgmma(st) {
+            // Large batched decode on Hopper: the f16 TMA GEMM for Q, gate, R, K, V (the side
+            // projections stay on the int8 kernel).
+            let rest = items.split_off(5);
+            for it in items.iter_mut() {
+                let (_, tm) = it.m.w16.as_ref().expect("checked");
+                let w = &s.work128;
+                ex.gemv.launch_gemm_f16_tma(st, 128, tm, it.m.n, it.m.k, 1, None, it.x.f16_ptr()?, nt, &mut *it.y, nt, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)?;
+            }
+            let mut rest = rest;
+            if !rest.is_empty() {
+                ex.gemv.launch_q_dense(st, &mut rest, nt)?;
+            }
         } else if fast {
             // Large batched decode: one launch, each weight row read once for the batch.
             ex.gemv.launch_q_dense(st, &mut items, nt)?;
@@ -2399,7 +2418,11 @@ fn layer(
     if !gated {
         ex.ops.gate_q8(st, &mut s.attn, &s.gate, &mut s.qa_attn, nt)?;
     }
-    if fast {
+    if fast && decode_tma() && l.wo.w16.is_some() && Gemv::has_wgmma(st) {
+        let (_, tm) = l.wo.w16.as_ref().expect("checked");
+        let w = &s.work128;
+        ex.gemv.launch_gemm_f16_tma(st, 128, tm, l.wo.n, l.wo.k, 1, None, s.qa_attn.f16_ptr()?, nt, &mut s.o, nt, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)?;
+    } else if fast {
         ex.gemv.launch_q_dense(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;
     } else if per_tok {
         ex.mm_decode(&l.wo, &s.qa_attn, &mut s.o, ntok)?;
@@ -2501,7 +2524,11 @@ fn layer(
     }
     tap!("ffn_normed", mn);
     let (ne, k) = (cfg.n_expert as u32, cfg.n_expert_used as u32);
-    if l.router.ty == GemvType::F32 && !prefill && (ntok <= QITEM_ROWS || batch.is_some()) && s.dbg.is_none() && std::env::var_os("ASTRAL_NO_FUSE_ROUTER").is_none() {
+    if fast && l.router.ty == GemvType::F32 && s.dbg.is_none() {
+        // Large batches: tiled logits, then the top-k.
+        ex.ops.router_logits_b(st, &l.router, &s.mn, &mut s.rlogits, nt)?;
+        ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
+    } else if l.router.ty == GemvType::F32 && !prefill && (ntok <= QITEM_ROWS || batch.is_some()) && s.dbg.is_none() && std::env::var_os("ASTRAL_NO_FUSE_ROUTER").is_none() {
         // Router GEMV + top-k in one kernel (the last block per token selects).
         let bias = l.probs_b.as_ref().map(|b| b as &dyn Dev<f32>);
         ex.ops.router_fused(st, &l.router, &s.mn, &mut s.rlogits, bias, &mut s.ids, &mut s.w, k, cfg.expert_scale, nt, &mut s.router_cnt)?;

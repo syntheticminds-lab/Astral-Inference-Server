@@ -2360,7 +2360,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_items_x(
 // per 16-row tile and 64-column stage, lane l holds one 16-byte word quad (its A fragments for 4
 // k16-steps) and row group g = l / 4 one 8-byte scale pair. Activations are the f16 copy.
 // N % 64 == 0, K % 64 == 0, dynamic shared memory 8 * (K + 8) * 2 bytes.
-extern "C" __global__ void __launch_bounds__(128) astral_gemv_nvfp4_frag_items(
+extern "C" __global__ void __launch_bounds__(512) astral_gemv_nvfp4_frag_items(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const QItem* __restrict__ items, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale,
     unsigned n_mats) { PDL_WAIT();
@@ -2383,7 +2383,7 @@ extern "C" __global__ void __launch_bounds__(128) astral_gemv_nvfp4_frag_items(
     }
     __syncthreads();
     const unsigned KC = K >> 6, NT = N >> 4;
-    const unsigned tile = blockIdx.y * 4u + warp;
+    const unsigned tile = blockIdx.y * (blockDim.x >> 5) + warp;
     if (tile >= NT) return;
     const uint4* fa = reinterpret_cast<const uint4*>(frag) + ((u64)e * NT + tile) * KC * 32u + lane;
     const uint2* fs = reinterpret_cast<const uint2*>(fscale) + ((u64)e * NT + tile) * KC * 8u + g;

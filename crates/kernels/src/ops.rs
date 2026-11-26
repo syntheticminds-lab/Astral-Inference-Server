@@ -1272,7 +1272,6 @@ impl Gemv {
         }
         let (mut n, mut k, mut pi, mut xr, mut yr, mut nm) = (m.n, m.k, items.device_ptr(), x_rows, y_rows, m.n_mats);
         let mut psc = m.mat_scale.as_ref().map_or(0, |b| b.device_ptr());
-        let grid = (n_items, m.n.div_ceil(64), 1);
         match m.ty {
             GemvType::Q8_0 => {
                 if !m.k.is_multiple_of(128) {
@@ -1327,7 +1326,9 @@ impl Gemv {
                     param(&mut psc),
                     param(&mut nm),
                 ];
-                let cfg = LaunchConfig { grid, block: (128, 1, 1), shared_mem_bytes: smem };
+                // Warps per block (16 rows each): more rows share each staged activation tile.
+                let warps = std::env::var("ASTRAL_FRAG_WARPS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8).clamp(4, 16);
+                let cfg = LaunchConfig { grid: (n_items, (m.n / 16).div_ceil(warps), 1), block: (32 * warps, 1, 1), shared_mem_bytes: smem };
                 // SAFETY: params match astral_gemv_nvfp4_frag_items; the fragment planes hold
                 // n_mats * n * k values (checked), the f16 activations x_rows rows of k, the item
                 // words cover n_items, y covers y_rows; the kernel clamps e, xi and yi.

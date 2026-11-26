@@ -359,6 +359,8 @@ impl Weights {
 
 /// Most prompt tokens one forward pass takes (prefill chunk).
 pub const PREFILL_TMAX: usize = 2048;
+/// Upper bound on rows per forward pass (`ASTRAL_TMAX`).
+pub const MAX_PASS_ROWS: usize = 8192;
 
 /// Scratch buffers for up to `tmax` tokens per forward pass, all token-major (decode uses row
 /// 0). The attention-residual bank holds `BANK_ROWS` rows of `[tmax][dim]`.
@@ -619,7 +621,8 @@ impl Session {
         let n_seqs = n_seqs.max(1);
         let reg = KernelRegistry::load(ctx)?;
         let c = &w.cfg;
-        let tmax = std::env::var("ASTRAL_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_TMAX).clamp(1, PREFILL_TMAX).min(capacity as usize);
+        // Rows per pass. Packed passes hold several sequences, so this may exceed the context.
+        let tmax = std::env::var("ASTRAL_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_TMAX).clamp(1, MAX_PASS_ROWS);
         let max_batch = max_batch.clamp(1, n_seqs).min(PREFILL_TMAX);
         // Batch rows share the prefill scratch: it must hold max_batch tokens.
         let tmax = tmax.max(max_batch);

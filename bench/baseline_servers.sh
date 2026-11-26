@@ -94,6 +94,8 @@ stop_all() {
 }
 
 run_client() { # engine base_url served_model_name backend
+  # A seed per concurrency: with one seed every run repeats the previous run's prompts, and
+  # engines with a prefix cache (vLLM, SGLang) skip their prefill.
   local eng=$1 url=$2 name=$3 backend=$4
   for c in $CONCURRENCY; do
     local n=$(( c * 8 < 16 ? 16 : c * 8 ))
@@ -102,7 +104,7 @@ run_client() { # engine base_url served_model_name backend
       --entrypoint vllm "$VLLM_IMG" bench serve \
       --backend "$backend" --base-url "$url" --endpoint /v1/completions --model "$name" --tokenizer /tok \
       --dataset-name random --random-input-len "$IN" --random-output-len "$OUTL" \
-      --num-prompts "$n" --max-concurrency "$c" --ignore-eos --seed 1 \
+      --num-prompts "$n" --max-concurrency "$c" --ignore-eos --seed "$((1000 + c))" \
       --save-result --result-dir /results --result-filename "$eng-c$c.json" \
       > "$OUT/$eng-c$c.log" 2>&1 || echo "   (client failed, see $eng-c$c.log)"
   done

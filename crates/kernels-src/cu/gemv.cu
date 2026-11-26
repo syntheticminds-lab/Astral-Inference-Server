@@ -2988,16 +2988,18 @@ __device__ __forceinline__ float situ_act(float g, float u, float beta, float lb
     const float a = beta * tanh_fast(g * (1.0f / beta)) * __frcp_rn(1.0f + __expf(-g));
     return a * (lb > 0.0f ? lb * tanh_fast(u * (1.0f / lb)) : u);
 }
-template <unsigned BT, unsigned TL = 2>
+template <unsigned BT, unsigned TILES = 16>
 struct __align__(1024) FWStage {
     __half b[BT * 64];        // activations, 128-byte swizzle (BT * 128 bytes)
-    uint4 a[8 * TL * 32];     // 8 TL row tiles x 32 lanes
-    uint2 sc[8 * TL * 8];
+    uint4 a[TILES * 32];      // row tiles of 16 x 32 lanes
+    uint2 sc[TILES * 8];
 };
 
-// TL = row tiles of 16 per consumer warp: 2 -> 256 weight rows per block (tokens BT <= 128),
-// 1 -> 128 rows with BT = 256 tokens (half the dequantisation per MMA, for large items).
-template <unsigned BT, unsigned TL = 2>
+// TL = row tiles of 16 per consumer warp, NWG = consumer warpgroups: (2, 2) -> 256 weight rows
+// per block (tokens BT <= 128); (1, 2) -> 128 rows x 256 tokens (half the dequantisation per
+// MMA); (1, 1) -> 64 rows with 256 threads, two blocks per SM (one block's prologue and
+// epilogue overlap the other's main loop).
+template <unsigned BT, unsigned TL = 2, unsigned NWG = 2>
 __device__ __forceinline__ void nvfp4_ws256(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
@@ -3005,7 +3007,8 @@ __device__ __forceinline__ void nvfp4_ws256(
     float beta, float lb, float* __restrict__ comb, const float* __restrict__ comb_w, unsigned comb_k, unsigned y16) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     extern __shared__ __align__(1024) unsigned char fwsmem[];
-    FWStage<BT, TL>* sm = reinterpret_cast<FWStage<BT, TL>*>(fwsmem);
+    constexpr unsigned CW = 4u * NWG, TILES = CW * TL, ROWS = 16u * TILES;   // consumer warps
+    FWStage<BT, TILES>* sm = reinterpret_cast<FWStage<BT, TILES>*>(fwsmem);
     __shared__ __align__(8) unsigned long long full[FW_STAGES], empty[FW_STAGES];
     __shared__ unsigned xrow[BT];
     const unsigned tid = threadIdx.x, wg = tid >> 7;
@@ -3013,7 +3016,6 @@ __device__ __forceinline__ void nvfp4_ws256(
     const unsigned e = min(it[0], n_mats - 1u);
     const unsigned start = min(it[1], idx_len);
     const unsigned count = min(min(it[2], BT), idx_len - start);
-    constexpr unsigned ROWS = 128u * TL, TILES = 8u * TL;
     const unsigned row0 = blockIdx.x * ROWS;
     if (count == 0 || row0 >= N) return;
     const unsigned KC = K / 64u, NT = N / 16u;
@@ -3021,7 +3023,7 @@ __device__ __forceinline__ void nvfp4_ws256(
     if (tid == 0) {
         for (unsigned s = 0; s < FW_STAGES; ++s) {
             tf_mbar_init(&full[s], 128);
-            tf_mbar_init(&empty[s], 8);
+            tf_mbar_init(&empty[s], CW);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
@@ -3060,7 +3062,7 @@ __device__ __forceinline__ void nvfp4_ws256(
         for (unsigned i = 0; i < KC; ++i) {
             const unsigned s = i % FW_STAGES;
             if (i >= FW_STAGES) tf_mbar_wait(&empty[s], ((i / FW_STAGES) - 1u) & 1u);
-            FWStage<BT, TL>& S = sm[s];
+            FWStage<BT, TILES>& S = sm[s];
 #pragma unroll
             for (unsigned q = 0; q < QA; ++q) cp_async16(&S.a[a_dst[q]], a_src[q] + i * 32u);
             if (lt < NS) cp_async16(reinterpret_cast<uint4*>(S.sc) + lt, s_src + i * 2u);
@@ -3080,7 +3082,10 @@ __device__ __forceinline__ void nvfp4_ws256(
         return;
     }
 
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");   // two accumulator tiles + two A sets
+    // Two accumulator tiles + two A sets; with one consumer warpgroup the block's 32 K
+    // registers (two blocks per SM) leave 216.
+    if constexpr (NWG == 2) asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
+    else asm volatile("setmaxnreg.inc.sync.aligned.u32 216;\n");
     const unsigned ct = tid - 128u, warp = ct >> 5, lane = ct & 31u, t = lane & 3u, g = lane >> 2;
     // Warp w of the consumers: row tiles w (rows 16w) and w + 8 (rows 128 + 16w).
     constexpr unsigned ND = BT / 2u;
@@ -3094,9 +3099,9 @@ __device__ __forceinline__ void nvfp4_ws256(
         const unsigned s = i % FW_STAGES;
         tf_mbar_wait(&full[s], (i / FW_STAGES) & 1u);
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        const FWStage<BT, TL>& S = sm[s];
+        const FWStage<BT, TILES>& S = sm[s];
         g10_dequant(S.a[warp * 32u + lane], S.sc[warp * 8u + g], a[0]);
-        if constexpr (TL == 2) g10_dequant(S.a[(warp + 8u) * 32u + lane], S.sc[(warp + 8u) * 8u + g], a[TL - 1]);
+        if constexpr (TL == 2) g10_dequant(S.a[(warp + CW) * 32u + lane], S.sc[(warp + CW) * 8u + g], a[TL - 1]);
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
         const unsigned long long db = wgmma_desc(S.b);
 #pragma unroll
@@ -3105,13 +3110,13 @@ __device__ __forceinline__ void nvfp4_ws256(
                 wgmma_m64n256k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
             } else if constexpr (BT == 128) {
                 wgmma_m64n128k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
-                wgmma_m64n128k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
+                if constexpr (TL == 2) wgmma_m64n128k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
             } else if constexpr (BT == 64) {
                 wgmma_m64n64k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
-                wgmma_m64n64k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
+                if constexpr (TL == 2) wgmma_m64n64k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
             } else {
                 wgmma_m64n32k16(d0, a[0][ks], db + (unsigned long long)(ks * 2u));
-                wgmma_m64n32k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
+                if constexpr (TL == 2) wgmma_m64n32k16(d1, a[TL - 1][ks], db + (unsigned long long)(ks * 2u));
             }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
@@ -3136,7 +3141,7 @@ __device__ __forceinline__ void nvfp4_ws256(
 #pragma unroll
         for (unsigned h = 0; h < TL; ++h) {
             const float* d = h ? d1 : d0;
-            const unsigned c = (row0 + h * 128u + warp * 16u) / 2u + g;
+            const unsigned c = (row0 + h * 16u * CW + warp * 16u) / 2u + g;
 #pragma unroll
             for (unsigned nt = 0; nt < BT / 8u; ++nt) {
                 const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
@@ -3152,7 +3157,7 @@ __device__ __forceinline__ void nvfp4_ws256(
 #pragma unroll
         for (unsigned h = 0; h < TL; ++h) {
             const float* d = h ? d1 : d0;
-            const unsigned r_lo = row0 + h * 128u + warp * 16u + g, r_hi = r_lo + 8u;
+            const unsigned r_lo = row0 + h * 16u * CW + warp * 16u + g, r_hi = r_lo + 8u;
 #pragma unroll
             for (unsigned nt = 0; nt < BT / 8u; ++nt) {
 #pragma unroll
@@ -3173,7 +3178,7 @@ __device__ __forceinline__ void nvfp4_ws256(
 #pragma unroll
     for (unsigned h = 0; h < TL; ++h) {
         const float* d = h ? d1 : d0;
-        const unsigned r_lo = row0 + h * 128u + warp * 16u + g, r_hi = r_lo + 8u;
+        const unsigned r_lo = row0 + h * 16u * CW + warp * 16u + g, r_hi = r_lo + 8u;
 #pragma unroll
         for (unsigned nt = 0; nt < BT / 8u; ++nt) {
             const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
@@ -3215,7 +3220,11 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t256(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
-    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb, float* __restrict__ comb, const float* __restrict__ comb_w, unsigned comb_k) { PDL_WAIT(); nvfp4_ws256<256, 1>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb, comb, comb_w, comb_k, unused); }
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb, float* __restrict__ comb, const float* __restrict__ comb_w, unsigned comb_k) { PDL_WAIT(); nvfp4_ws256<256, 1, 2>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb, comb, comb_w, comb_k, unused); }
+extern "C" __global__ void __launch_bounds__(256, 2) astral_gemm_nvfp4_ws128x2(
+    const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
+    unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,
+    unsigned idx_len, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned unused, __half* __restrict__ act, float beta, float lb, float* __restrict__ comb, const float* __restrict__ comb_w, unsigned comb_k) { PDL_WAIT(); nvfp4_ws256<128, 1, 1>(frag, fscale, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, act, beta, lb, comb, comb_w, comb_k, unused); }
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256_t64(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx,

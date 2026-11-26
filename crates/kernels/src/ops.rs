@@ -455,8 +455,9 @@ pub struct Gemv {
     /// TMA-fed grouped f16 GEMM ([`Gemv::launch_gemm_f16_tma`]).
     gemm_tma: [Function; 2],
     /// Warp-specialised 256-row NVFP4 expert GEMM (Hopper prefill).
-    /// Tiles 128, 64, 32 (256 rows) and 256 (128 rows x 256 tokens).
-    ws256: [Function; 4],
+    /// Tiles 128, 64, 32 (256 rows), 256 (128 rows x 256 tokens) and 128 with two blocks per
+    /// SM (128 rows, 256 threads).
+    ws256: [Function; 5],
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
     rows_t: [Function; 2],
     /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
@@ -519,6 +520,14 @@ const WGMMA2_SMEM: u32 = 5 * 21504;
 const WS256_SMEM: u32 = 5 * 25600;
 /// Bytes of one pipeline stage of the 256-token ws256 variant: activations 256 x 64 f16, 8 row
 /// tiles of fragments and their scales, rounded to 1 KB (`FWStage<256, 1>`).
+/// One stage of the two-blocks-per-SM variant (`FWStage<128, 4>`: 64 weight rows).
+const WS_X2_STAGE: u32 = (128u32 * 64 * 2 + 4 * 32 * 16 + 4 * 8 * 8).next_multiple_of(1024);
+
+fn ws_dual() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_WS_DUAL").is_ok_and(|v| v == "1"))
+}
+
 const WS_T256_STAGE: u32 = (256u32 * 64 * 2 + 8 * 32 * 16 + 8 * 8 * 8).next_multiple_of(1024);
 /// Dynamic shared memory of `astral_gemv_q8_0_tiled`: 3 stages of 19968 bytes.
 const Q_TILED_SMEM: u32 = 3 * 19968;
@@ -696,11 +705,13 @@ impl Gemv {
                 let b = f("astral_gemm_nvfp4_ws256_t64")?;
                 let c = f("astral_gemm_nvfp4_ws256_t32")?;
                 let d = f("astral_gemm_nvfp4_ws256_t256")?;
+                let e = f("astral_gemm_nvfp4_ws128x2")?;
                 for k in [&a, &b, &c] {
                     let _ = k.set_max_dynamic_shared(WS256_SMEM);
                 }
                 let _ = d.set_max_dynamic_shared(5 * WS_T256_STAGE);
-                [a, b, c, d]
+                let _ = e.set_max_dynamic_shared(5 * WS_X2_STAGE);
+                [a, b, c, d, e]
             },
             gemm_tma: {
                 let a = f("astral_gemm_f16_tma")?;
@@ -1001,7 +1012,10 @@ impl Gemv {
         if fq.len() < plane / 2 || fs.len() < plane / 16 || items.len() < 3 * n_items as usize || xidx.len() < idx_len as usize || yidx.len() < idx_len as usize || y.dlen() < y_rows as usize * m.n as usize {
             return Err(invalid("launch_ws256: planes, work lists or y too small".into()));
         }
+        // Tile 128 with two blocks per SM: ASTRAL_WS_DUAL=1.
+        let dual = tile == 128 && ws_dual();
         let (f, stage) = match tile {
+            128 if dual => (&self.ws256[4], WS_X2_STAGE),
             256 => (&self.ws256[3], WS_T256_STAGE),
             128 => (&self.ws256[0], 25600u32),
             64 => (&self.ws256[1], 17408),
@@ -1055,8 +1069,9 @@ impl Gemv {
             param(&mut ck),
         ];
         // Tile 256: 128 weight rows per block; else 256 rows (FW_STAGES = 5 stages either way).
-        let (rows, stages) = if tile == 256 { (128, 5) } else { (256, 5) };
-        let cfg = LaunchConfig { grid: (m.n / rows, n_items, 1), block: (384, 1, 1), shared_mem_bytes: stages * stage };
+        let (rows, stages) = if dual { (64, 5) } else if tile == 256 { (128, 5) } else { (256, 5) };
+        let threads = if dual { 256 } else { 384 };
+        let cfg = LaunchConfig { grid: (m.n / rows, n_items, 1), block: (threads, 1, 1), shared_mem_bytes: stages * stage };
         // SAFETY: params match astral_gemm_nvfp4_ws256*; the fragment planes hold n_mats * n * k
         // values (checked), the f16 activations x_rows rows of k, the work lists cover n_items /
         // idx_len (items of <= tile tokens), y covers y_rows; the kernel clamps every index.

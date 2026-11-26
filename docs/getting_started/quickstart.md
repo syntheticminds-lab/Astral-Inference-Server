@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide serves Inkling 2 Mini with its DSpark draft and sends requests to it.
+This guide serves Inkling 2 Mini with its DSpark draft and sends requests to it. Install Astral first ([installation](installation.md)).
 
 ## 1. Get the model files
 
@@ -11,7 +11,7 @@ A GGUF file of the model works too: pass it as the model and the checkpoint dire
 ## 2. Start the server
 
 ```bash
-./target/release/astral serve Inkling-2-Mini/
+astral serve Inkling-2-Mini/
 ```
 
 Loading takes about half a minute: weights, draft, and CUDA graph capture. The server is ready when it prints:

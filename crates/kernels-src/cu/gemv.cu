@@ -2373,13 +2373,17 @@ extern "C" __global__ void __launch_bounds__(512) astral_gemv_nvfp4_frag_items(
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     const unsigned e = min(itp->e, n_mats - 1u);
     {
-        const unsigned per_row = K >> 3;   // uint4 per activation row
-        for (unsigned i = tid; i < NB * per_row; i += blockDim.x) {
-            const unsigned r = i / per_row, c = i - r * per_row;
-            uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if (r < cnt) v = __ldg(reinterpret_cast<const uint4*>(xh + (u64)min(itp->xi[r], x_rows - 1u) * K) + c);
-            *reinterpret_cast<uint4*>(xs + r * stride + c * 8u) = v;
+        // Asynchronous copies, row by row (rows past the item repeat its last token: their
+        // columns are computed but never stored).
+        const unsigned per_row = K >> 3;   // 16-byte pieces per activation row
+#pragma unroll
+        for (unsigned r = 0; r < NB; ++r) {
+            const uint4* src = reinterpret_cast<const uint4*>(xh + (u64)min(itp->xi[min(r, cnt - 1u)], x_rows - 1u) * K);
+            __half* dst = xs + r * stride;
+            for (unsigned c = tid; c < per_row; c += blockDim.x) cp_async16(dst + c * 8u, src + c);
         }
+        cp_async_commit();
+        cp_async_wait<0>();
     }
     __syncthreads();
     const unsigned KC = K >> 6, NT = N >> 4;

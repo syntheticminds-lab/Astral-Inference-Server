@@ -1190,7 +1190,8 @@ impl InklingOps {
         let gqa3 = !chunk_loop && a.heads == 3 * a.kv_heads && std::env::var_os("ASTRAL_NO_GQA").is_none();
         if gqa3 {
             // A KV head's 3 query heads in one block: each K / V row read once.
-            let gy = (max_splits * 24).div_ceil(ntok).clamp(1, max_splits);
+            let f: u32 = std::env::var("ASTRAL_GQA_GY").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+            let gy = (max_splits * f).div_ceil(ntok).clamp(1, max_splits);
             Self::go(&self.attn_split_gqa3, s, LaunchConfig { grid: (a.kv_heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
         } else {
             let f = if chunk_loop { &self.attn_split } else { &self.attn_split1 };

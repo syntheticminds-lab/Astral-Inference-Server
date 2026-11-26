@@ -794,6 +794,54 @@ mod mxfp4_ct_tests {
     }
 }
 
+/// f16 tensor-core fragment layout of a Q8_0 matrix (`repack_q8_0` planes: `qs` [n][k] int8,
+/// `aux` [n][k/32] f16 scales) for the dense warpgroup-MMA GEMM (`astral_gemm_f16_wgmma`).
+///
+/// Tiles of 16 rows x 64 columns, ordered [row tile][column tile]. In a tile, lane `L` (g = L / 4,
+/// t = L % 4) owns 32 f16 values: for each 16-column step `ks`, the 4 registers of its
+/// `mma.m16n8k16` A fragment -- (row g, cols 2t, 2t+1), (row g+8, same), (row g, cols 2t+8, 2t+9),
+/// (row g+8, same) -- each value `q * d` rounded once to f16 (as the mma.sync kernels compute it).
+pub fn f16_frag_layout(qs: &[u8], aux: &[u8], n: usize, k: usize) -> Result<Vec<u16>> {
+    if !n.is_multiple_of(16) || !k.is_multiple_of(64) || qs.len() != n * k || aux.len() != n * k / 16 {
+        return Err(AstralError::Invalid(format!("f16 frag layout: n {n} k {k}: {} / {} bytes", qs.len(), aux.len())));
+    }
+    let (nt, kc_n) = (n / 16, k / 64);
+    let mut out = vec![0u16; n * k];
+    let val = |row: usize, col: usize| -> u16 {
+        let q = qs[row * k + col] as i8 as f32;
+        let o = (row * (k / 32) + col / 32) * 2;
+        let d = f16_to_f32(u16::from_le_bytes([aux[o], aux[o + 1]]));
+        f32_to_f16(q * d)
+    };
+    std::thread::scope(|sc| {
+        let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32);
+        let per = nt.div_ceil(threads);
+        for (ci, chunk) in out.chunks_mut(per * kc_n * 32 * 32).enumerate() {
+            let val = &val;
+            sc.spawn(move || {
+                for (i, slot) in chunk.chunks_mut(32 * 32).enumerate() {
+                    let tile = ci * per * kc_n + i;
+                    let (rt, kc) = (tile / kc_n, tile % kc_n);
+                    for lane in 0..32 {
+                        let (g, t) = (lane / 4, lane % 4);
+                        let r = rt * 16 + g;
+                        for ks in 0..4 {
+                            let c0 = kc * 64 + ks * 16 + 2 * t;
+                            let pairs = [(r, c0), (r + 8, c0), (r, c0 + 8), (r + 8, c0 + 8)];
+                            for (p, &(row, col)) in pairs.iter().enumerate() {
+                                let o = lane * 32 + ks * 8 + p * 2;
+                                slot[o] = val(row, col);
+                                slot[o + 1] = val(row, col + 1);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(out)
+}
+
 /// Tensor-core fragment layout of an NVFP4 matrix stack (`repack_nvfp4` planes: `qs`
 /// [mats][n][k/2], `aux` [mats][n][k/16]) for the prefill GEMM (`astral_gemm_nvfp4_mma5`).
 ///

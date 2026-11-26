@@ -230,6 +230,10 @@ impl Loader<'_> {
         if ty == GemvType::Nvfp4 && mats > 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
             m.add_frag(self.ctx, &qs, &aux)?;
         }
+        // Dense Q8_0 projections: the f16 fragment copy for the warpgroup-MMA prefill GEMM.
+        if ty == GemvType::Q8_0 && mats == 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
+            m.add_frag16(self.ctx, &qs, &aux)?;
+        }
         self.bytes += m.bytes();
         Ok(m)
     }
@@ -407,6 +411,8 @@ struct Scratch {
     items_dn: DeviceBuffer<u32>,
     /// Tensor-core prefill work lists: dense rows, MoE gate_up and MoE down.
     work: [DevWork; 3],
+    /// The dense work list in items of up to 128 rows (warpgroup-MMA prefill GEMMs).
+    work128: DevWork,
     /// Layer intermediates (name, values), collected on decode steps when set (verification).
     dbg: Option<Vec<(&'static str, Vec<f32>)>>,
 }
@@ -492,9 +498,14 @@ impl Exec<'_> {
     /// [`Exec::mm`], or for prefill passes (`prefill`) always the prefill GEMMs, whatever the
     /// token count.
     #[allow(clippy::too_many_arguments)]
-    fn mm_any(&self, m: &GemvMatrix, qa: &QAct, y: &mut DeviceBuffer<f32>, ntok: usize, dense: &DeviceBuffer<u32>, work: &DevWork, prefill: bool) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn mm_any(&self, m: &GemvMatrix, qa: &QAct, y: &mut DeviceBuffer<f32>, ntok: usize, dense: &DeviceBuffer<u32>, work: &DevWork, work128: &DevWork, prefill: bool) -> Result<()> {
         if !prefill {
             return self.mm(m, qa, y, ntok, dense, work);
+        }
+        if m.frag16.is_some() && Gemv::has_wgmma(self.st) {
+            let n = ntok as u32;
+            return self.gemv.launch_wgmma_f16(self.st, m, qa, n, y, n, &work128.items, work128.n_items, &work128.xidx, &work128.yidx, work128.idx_len);
         }
         if use_mma() && m.n.is_multiple_of(16) {
             let n = ntok as u32;
@@ -674,6 +685,7 @@ impl Session {
                 let (mi, mx) = (t + c.n_expert + 1, t * ke);
                 [DevWork::new(ctx, mi, mx)?, DevWork::new(ctx, mi, mx)?, DevWork::new(ctx, mi, mx)?]
             },
+            work128: DevWork::new(ctx, t.div_ceil(128) + 1, t)?,
             dbg: None,
         };
         let b = BatchBufs {
@@ -768,9 +780,13 @@ impl Session {
         let mut words = QItem::words(&QItem::dense(rows as u32));
         words.resize(s.items_dense.len(), 0);
         s.items_dense.copy_from_slice(&words)?;
+        let pairs: Vec<(u32, u32)> = (0..rows as u32).map(|r| (r, r)).collect();
         let mut dense = MmaWork::default();
-        dense.push(0, &(0..rows as u32).map(|r| (r, r)).collect::<Vec<_>>());
+        dense.push(0, &pairs);
         s.work[0].upload(&dense)?;
+        let mut dense128 = MmaWork::default();
+        dense128.push_chunked(0, &pairs, 128);
+        s.work128.upload(&dense128)?;
         self.dense_rows = rows;
         Ok(())
     }
@@ -1177,9 +1193,13 @@ impl Session {
         let sp = spec.as_deref_mut().expect("checked above");
         let vmax = sp.k + 1;
         // The verify pass's dense work list (prefill left its own in work[0]).
+        let pairs: Vec<(u32, u32)> = (0..vmax as u32).map(|r| (r, r)).collect();
         let mut dense = MmaWork::default();
-        dense.push(0, &(0..vmax as u32).map(|r| (r, r)).collect::<Vec<_>>());
+        dense.push(0, &pairs);
         s.work[0].upload(&dense)?;
+        let mut dense128 = MmaWork::default();
+        dense128.push_chunked(0, &pairs, 128);
+        s.work128.upload(&dense128)?;
         let mut words = QItem::words(&QItem::dense(vmax as u32));
         words.resize(s.items_dense.len(), 0);
         s.items_dense.copy_from_slice(&words)?;
@@ -1610,6 +1630,11 @@ fn fast_batch(ntok: usize) -> bool {
     ntok > QITEM_ROWS && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
 }
 
+/// Experiment: prefill Q, gate, R, K, V on [`Gemv::launch_q_dense`] (`ASTRAL_PREFILL_DENSE_Q8=1`).
+fn prefill_dense_q8() -> bool {
+    std::env::var_os("ASTRAL_PREFILL_DENSE_Q8").is_some()
+}
+
 fn small_batch(ntok: usize) -> bool {
     ntok > 1 && ntok <= QITEM_ROWS && std::env::var_os("ASTRAL_SMALL_MMA").is_none()
 }
@@ -1875,15 +1900,41 @@ fn layer(
             ex.gemv.launch_q_multi_t(st, &mut items, nt)?;
         }
         side_fused = side;
+    } else if prefill && prefill_dense_q8() && [&l.wq, &l.wgate, &l.wrel, &l.wk, &l.wv].iter().all(|m| m.ty == GemvType::Q8_0 && m.n_mats == 1 && m.mat_scale.is_none() && m.k.is_multiple_of(128)) {
+        // Experiment: the batched dense kernel for prefill.
+        let mut items: Vec<MultiItem> = vec![
+            MultiItem { m: &l.wq, x: &s.qa[0], y: &mut s.q },
+            MultiItem { m: &l.wgate, x: &s.qa[0], y: &mut s.gate },
+            MultiItem { m: &l.wrel, x: &s.qa[0], y: &mut s.r },
+            MultiItem { m: &l.wk, x: &s.qa[ik], y: &mut s.k },
+            MultiItem { m: &l.wv, x: &s.qa[iv], y: &mut s.v },
+        ];
+        if side_q8() && s.dbg.is_none() {
+            items.push(MultiItem { m: &l.sink_q8, x: &s.qa[0], y: &mut s.sinks });
+            if let (Some(kq), Some(vq)) = (l.kp_q8.as_ref(), l.vp_q8.as_ref()) {
+                items.push(MultiItem { m: kq, x: &s.qa[ik], y: &mut s.kdyn });
+                items.push(MultiItem { m: vq, x: &s.qa[iv], y: &mut s.vdyn });
+            }
+            side_fused = true;
+        }
+        ex.gemv.launch_q_dense(st, &mut items, nt)?;
     } else {
-        ex.mm_any(&l.wq, &s.qa[0], &mut s.q, ntok, &s.items_dense, &s.work[0], prefill)?;
-        ex.mm_any(&l.wgate, &s.qa[0], &mut s.gate, ntok, &s.items_dense, &s.work[0], prefill)?;
-        ex.mm_any(&l.wrel, &s.qa[0], &mut s.r, ntok, &s.items_dense, &s.work[0], prefill)?;
-        ex.mm_any(&l.wk, &s.qa[ik], &mut s.k, ntok, &s.items_dense, &s.work[0], prefill)?;
-        ex.mm_any(&l.wv, &s.qa[iv], &mut s.v, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wq, &s.qa[0], &mut s.q, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        ex.mm_any(&l.wgate, &s.qa[0], &mut s.gate, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        ex.mm_any(&l.wrel, &s.qa[0], &mut s.r, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        ex.mm_any(&l.wk, &s.qa[ik], &mut s.k, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
+        ex.mm_any(&l.wv, &s.qa[iv], &mut s.v, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
     }
     let (kp, vp) = (l.k_conv_proj.as_ref(), l.v_conv_proj.as_ref());
-    if !side_fused && prefill {
+    if !side_fused && prefill && side_q8() && s.dbg.is_none() {
+        // Prefill: the Q8_0 copies of the sink and conv-tap projections, one launch.
+        let mut items: Vec<MultiItem> = vec![MultiItem { m: &l.sink_q8, x: &s.qa[0], y: &mut s.sinks }];
+        if let (Some(kq), Some(vq)) = (l.kp_q8.as_ref(), l.vp_q8.as_ref()) {
+            items.push(MultiItem { m: kq, x: &s.qa[ik], y: &mut s.kdyn });
+            items.push(MultiItem { m: vq, x: &s.qa[iv], y: &mut s.vdyn });
+        }
+        ex.gemv.launch_q_dense(st, &mut items, nt)?;
+    } else if !side_fused && prefill {
         // Prefill: tiled f32 GEMMs (the same kernels for any token count).
         ex.ops.gemm_f32_ws(st, &s.normed[0], d, &l.sink_f32, &mut s.sinks, nt, &mut s.gu)?;
         if let (Some(kq), Some(vq)) = (l.kp_f32.as_ref(), l.vp_f32.as_ref()) {
@@ -2099,7 +2150,7 @@ fn layer(
     } else if per_tok {
         ex.mm_decode(&l.wo, &s.qa_attn, &mut s.o, ntok)?;
     } else {
-        ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], prefill)?;
+        ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], &s.work128, prefill)?;
     }
     let starts_block = ip % cfg.attn_res_block == 0;
     if starts_block && *next_row >= BANK_ROWS {

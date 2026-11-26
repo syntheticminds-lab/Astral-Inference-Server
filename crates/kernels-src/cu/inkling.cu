@@ -8,6 +8,7 @@
 // Parameter lists are mirrored by the launchers in crates/kernels/src/inkling.rs.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // Programmatic dependent launch: on Hopper every kernel may be launched before its predecessor
 // finishes (overlapping launch latency); griddepcontrol.wait blocks until the predecessor's
@@ -1572,6 +1573,102 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_sgemm_tn(const floa
             }
         }
     }
+}
+
+// astral_ink_sgemm_tn on bf16 tensor cores (mma.sync m16n8k16, f32 accumulation): the same
+// parameters and split-K modes, with A and W rounded to bf16 as they are staged (the controller
+// and router weights are bf16 in the checkpoint, so only the activations are rounded). 64 x 64
+// tiles, BK 32, 4 warps of 32 x 32. lda, lda1, ldw and k_split must be multiples of 4.
+__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned bf16x2(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+extern "C" __global__ void __launch_bounds__(128) astral_ink_tgemm_tn(const float* __restrict__ a0, const float* __restrict__ a1,
+                                                                      unsigned lda, unsigned lda1, unsigned k_split, const float* __restrict__ row_scale,
+                                                                      const float* __restrict__ w, unsigned ldw, float* __restrict__ c,
+                                                                      unsigned ldc, unsigned M, unsigned N, unsigned K,
+                                                                      unsigned k_per_split, unsigned atomic) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr unsigned RS = 20;   // words per smem row: 16 bf16 pairs + 4 pad (conflict-free fragment reads)
+    __shared__ unsigned As[64 * RS], Ws[64 * RS];
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned m0 = blockIdx.y * 64u, n0 = blockIdx.x * 64u;
+    const unsigned kbeg = blockIdx.z * k_per_split, kend = min(K, kbeg + k_per_split);
+    const unsigned wm = (warp & 1u) * 32u, wn = (warp >> 1) * 32u;
+    float acc[2][4][4];
+#pragma unroll
+    for (unsigned i = 0; i < 2; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+    for (unsigned k0 = kbeg; k0 < kend; k0 += 32u) {
+        // 64 rows x 8 float4 per matrix: 4 per thread each.
+#pragma unroll
+        for (unsigned q = 0; q < 4; ++q) {
+            const unsigned i = tid + q * 128u, r = i >> 3, c4 = i & 7u, k = k0 + c4 * 4u;
+            float4 av = make_float4(0.0f, 0.0f, 0.0f, 0.0f), wv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const unsigned m = m0 + r, n = n0 + r;
+            if (m < M && k < kend) {
+                if (k < k_split) {
+                    av = __ldg(reinterpret_cast<const float4*>(a0 + (u64)m * lda + k));
+                    if (row_scale) { const float sc = row_scale[2 * m]; av.x *= sc; av.y *= sc; av.z *= sc; av.w *= sc; }
+                } else {
+                    av = __ldg(reinterpret_cast<const float4*>(a1 + (u64)m * lda1 + (k - k_split)));
+                    if (row_scale) { const float sc = row_scale[2 * m + 1]; av.x *= sc; av.y *= sc; av.z *= sc; av.w *= sc; }
+                }
+            }
+            if (n < N && k < kend) wv = __ldg(reinterpret_cast<const float4*>(w + (u64)n * ldw + k));
+            As[r * RS + c4 * 2u] = bf16x2(av.x, av.y);
+            As[r * RS + c4 * 2u + 1u] = bf16x2(av.z, av.w);
+            Ws[r * RS + c4 * 2u] = bf16x2(wv.x, wv.y);
+            Ws[r * RS + c4 * 2u + 1u] = bf16x2(wv.z, wv.w);
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned ks = 0; ks < 2; ++ks) {
+            unsigned a[2][4], b[4][2];
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt) {
+                const unsigned r = wm + mt * 16u + g;
+                a[mt][0] = As[r * RS + ks * 8u + t];
+                a[mt][1] = As[(r + 8u) * RS + ks * 8u + t];
+                a[mt][2] = As[r * RS + ks * 8u + 4u + t];
+                a[mt][3] = As[(r + 8u) * RS + ks * 8u + 4u + t];
+            }
+#pragma unroll
+            for (unsigned nt = 0; nt < 4; ++nt) {
+                const unsigned r = wn + nt * 8u + g;
+                b[nt][0] = Ws[r * RS + ks * 8u + t];
+                b[nt][1] = Ws[r * RS + ks * 8u + 4u + t];
+            }
+#pragma unroll
+            for (unsigned mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (unsigned nt = 0; nt < 4; ++nt) mma_bf16_16816(acc[mt][nt], a[mt], b[nt][0], b[nt][1]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (unsigned nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (unsigned e = 0; e < 4; ++e) {
+                const unsigned m = m0 + wm + mt * 16u + g + (e >> 1) * 8u, n = n0 + wn + nt * 8u + 2u * t + (e & 1u);
+                if (m < M && n < N) {
+                    const float v = acc[mt][nt][e];
+                    if (atomic == 1u) atomicAdd(&c[(u64)m * ldc + n], v);
+                    else if (atomic == 2u) c[((u64)blockIdx.z * M + m) * ldc + n] = v;
+                    else c[(u64)m * ldc + n] = v;
+                }
+            }
+        }
+    }
+#endif
 }
 
 // out[i] = ((p[0][i] + p[1][i]) + p[2][i]) + ... over `splits` partials of n values each.

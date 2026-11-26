@@ -83,6 +83,8 @@ pub struct InklingOps {
     conv_state: Function,
     moe_combine_t: Function,
     rms2: Function,
+    /// [`InklingOps::sgemm_mode`] on bf16 tensor cores (64 x 64 tiles).
+    tgemm_tn: Function,
     sgemm_tn: Function,
     ctrl_apply: Function,
     attn_prefill: Function,
@@ -207,6 +209,7 @@ impl InklingOps {
             moe_combine_t: f("astral_ink_moe_combine_t")?,
             rms2: f("astral_ink_rms2")?,
             sgemm_tn: f("astral_ink_sgemm_tn")?,
+            tgemm_tn: f("astral_ink_tgemm_tn")?,
             ctrl_apply: f("astral_ink_ctrl_apply")?,
             attn_prefill: f("astral_ink_attn_prefill")?,
             moe_group: f("astral_ink_moe_group")?,
@@ -1335,6 +1338,11 @@ impl InklingOps {
             param(&mut at),
         ];
         let splits = k.div_ceil(k_per_split);
+        // Many rows (prefill): bf16 tensor cores when the operands allow 16-byte loads.
+        let aligned = [lda, lda1, k_split, ldw, k_per_split].iter().all(|v| v.is_multiple_of(4)) && [a0, a1, w].iter().all(|p| p % 16 == 0);
+        if m >= 64 && aligned && std::env::var_os("ASTRAL_SGEMM_F32").is_none() {
+            return Self::go(&self.tgemm_tn, s, LaunchConfig { grid: (n.div_ceil(64), m.div_ceil(64), splits), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p);
+        }
         Self::go(&self.sgemm_tn, s, LaunchConfig { grid: (n.div_ceil(32), m.div_ceil(32), splits), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 

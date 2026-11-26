@@ -449,6 +449,8 @@ pub struct Gemv {
     items_mma: [Function; 2],
     /// [`Gemv::launch_q_dense`]: 2, 4 and 8 tiles of 8 tokens per block.
     dense_mma: [Function; 3],
+    /// [`Gemv::launch_q_tiled`].
+    q_tiled: Function,
     wgmma_f16: Function,
     /// TMA-fed grouped f16 GEMM ([`Gemv::launch_gemm_f16_tma`]).
     gemm_tma: [Function; 2],
@@ -514,6 +516,8 @@ impl MmaWork {
 const WGMMA2_SMEM: u32 = 5 * 21504;
 /// Dynamic shared memory of `astral_gemm_nvfp4_ws256`: 5 stages of 25 KB.
 const WS256_SMEM: u32 = 5 * 25600;
+/// Dynamic shared memory of `astral_gemv_q8_0_tiled`: 3 stages of 19968 bytes.
+const Q_TILED_SMEM: u32 = 3 * 19968;
 /// Dynamic shared memory of `astral_gemm_f16_tma`: 6 stages of 32 KB (or, with 256-token
 /// tiles, 4 of 48 KB).
 const GEMM_TMA_SMEM: u32 = 6 * 32768;
@@ -678,6 +682,11 @@ impl Gemv {
                 [q, h]
             },
             dense_mma: [f("astral_gemv_q8_0_dense_n2")?, f("astral_gemv_q8_0_dense_n4")?, f("astral_gemv_q8_0_dense_n8")?],
+            q_tiled: {
+                let fw = f("astral_gemv_q8_0_tiled")?;
+                let _ = fw.set_max_dynamic_shared(Q_TILED_SMEM);
+                fw
+            },
             ws256: {
                 let fw = f("astral_gemm_nvfp4_ws256")?;
                 let _ = fw.set_max_dynamic_shared(WS256_SMEM);
@@ -1445,6 +1454,19 @@ impl Gemv {
             return Err(invalid("launch_gemm_f16_tma: work lists or y too small".into()));
         }
         let mut tm = *w;
+        // Split K when the grid is too small to fill the GPU (batched decode).
+        let kc = k / 64;
+        let blocks = (n / 128) * n_items;
+        let splits = if blocks >= 200 { 1 } else { 400u32.div_ceil(blocks).min(kc / 4).clamp(1, 8) };
+        let mut kcps = kc.div_ceil(splits);
+        let splits = kc.div_ceil(kcps);
+        if splits > 1 {
+            let (mut pz, mut nz) = (y.dptr(), (y_rows as u64) * n as u64);
+            let mut zp = [param(&mut pz), param(&mut nz)];
+            let zc = LaunchConfig { grid: ((nz as u32).div_ceil(256).min(4096), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: y holds at least y_rows * n floats (checked above).
+            unsafe { self.zero.launch(zc, stream, &mut zp) }?;
+        }
         let (mut px, mut py, mut nn, mut kk) = (xh, y.dptr(), n, k);
         let (mut pi, mut pxi, mut pyi, mut il, mut xr, mut yr) = (items.device_ptr(), xidx.device_ptr(), yidx.device_ptr(), idx_len, x_rows, y_rows);
         let (mut psc, mut nm) = (mat_scale.map_or(0, |b| b.device_ptr()), n_mats);
@@ -1462,8 +1484,9 @@ impl Gemv {
             param(&mut yr),
             param(&mut psc),
             param(&mut nm),
+            param(&mut kcps),
         ];
-        let cfg = LaunchConfig { grid: (n / 128, n_items, 1), block: (384, 1, 1), shared_mem_bytes: GEMM_TMA_SMEM };
+        let cfg = LaunchConfig { grid: (n / 128, n_items, splits), block: (384, 1, 1), shared_mem_bytes: GEMM_TMA_SMEM };
         // SAFETY: params match astral_gemm_f16_tma; the tensor map covers n_mats * n rows of k
         // (built by the caller for these weights), the activations hold x_rows rows of k
         // halves, the work lists cover n_items / idx_len, y covers y_rows (checked); the kernel
@@ -1474,6 +1497,55 @@ impl Gemv {
             _ => return Err(invalid(format!("launch_gemm_f16_tma: tile {tile}"))),
         };
         unsafe { f.launch(cfg, stream, &mut params) }
+    }
+
+    /// Up to 8 Q8_0 products with the same `k` for 1..=64 activation rows (batched decode),
+    /// tiled through shared memory: weight and activation chunks staged with cp.async, 64
+    /// weight rows per block, K split across blocks (atomic adds into zeroed outputs) when there
+    /// are too few blocks. Needs `k % 128 == 0`.
+    pub fn launch_q_tiled(&self, stream: &Stream, items: &mut [MultiItem], ntok: u32) -> Result<()> {
+        let k = items.first().map_or(0, |it| it.m.k);
+        let ok = (1..=64).contains(&ntok)
+            && (1..=8).contains(&items.len())
+            && k.is_multiple_of(128)
+            && items.iter().all(|it| it.m.ty == GemvType::Q8_0 && it.m.n_mats == 1 && it.m.mat_scale.is_none() && it.m.k == k && it.x.k == k && it.x.slots >= ntok);
+        if !ok {
+            return Err(invalid(format!("launch_q_tiled: {} products for {ntok} tokens do not qualify", items.len())));
+        }
+        let mut d = MultiQ8 { qs: [0; 8], aux: [0; 8], xq: [0; 8], xd: [0; 8], y: [0; 8], n: [0; 8], start: [0; 9], count: items.len() as u32 };
+        let mut blocks = 0u32;
+        for (i, it) in items.iter().enumerate() {
+            if it.y.dlen() < (ntok * it.m.n) as usize {
+                return Err(invalid(format!("launch_q_tiled: y {} has {} values, need {}", i, it.y.dlen(), ntok * it.m.n)));
+            }
+            d.qs[i] = it.m.qs.device_ptr();
+            d.aux[i] = it.m.aux.device_ptr();
+            d.xq[i] = it.x.q.device_ptr();
+            d.xd[i] = it.x.d.device_ptr();
+            d.y[i] = it.y.dptr();
+            d.n[i] = it.m.n;
+            d.start[i] = blocks;
+            blocks += it.m.n.div_ceil(64);
+        }
+        d.start[items.len()] = blocks;
+        let nc = k / 128;
+        let splits = if blocks >= 264 { 1 } else { 396u32.div_ceil(blocks).min(nc / 2).max(1) };
+        if splits > 1 {
+            for it in items.iter_mut() {
+                let (mut pz, mut nz) = (it.y.dptr(), (ntok * it.m.n) as u64);
+                let mut zp = [param(&mut pz), param(&mut nz)];
+                let zc = LaunchConfig { grid: ((nz as u32).div_ceil(256).min(4096), 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+                // SAFETY: y holds at least ntok * n floats (checked above).
+                unsafe { self.zero.launch(zc, stream, &mut zp) }?;
+            }
+        }
+        let (mut kk, mut t) = (k, ntok);
+        let mut params = [param(&mut d), param(&mut kk), param(&mut t)];
+        let cfg = LaunchConfig { grid: (blocks, splits, 1), block: (256, 1, 1), shared_mem_bytes: Q_TILED_SMEM };
+        // SAFETY: MultiQ8 mirrors gemv.cu; planes validated at upload, the activation planes hold
+        // >= ntok rows of k and each y ntok * n values (checked); k % 128 == 0 (checked); the
+        // kernel clamps rows and tokens.
+        unsafe { self.q_tiled.launch(cfg, stream, &mut params) }
     }
 
     /// Up to 8 Q8_0 products with the same `k` for `ntok` activation rows (batched decode):

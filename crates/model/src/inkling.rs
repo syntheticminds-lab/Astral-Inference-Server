@@ -1771,6 +1771,12 @@ fn decode_tma() -> bool {
     std::env::var("ASTRAL_DECODE_TMA").is_ok_and(|v| v == "1")
 }
 
+/// Batched decode's dense projections on the shared-memory tiled kernel (`ASTRAL_Q_TILED=0`
+/// for the register kernel).
+fn q_tiled() -> bool {
+    std::env::var("ASTRAL_Q_TILED").map_or(true, |v| v != "0")
+}
+
 fn small_batch(ntok: usize) -> bool {
     ntok > 1 && ntok <= QITEM_ROWS && std::env::var_os("ASTRAL_SMALL_MMA").is_none()
 }
@@ -2035,6 +2041,9 @@ fn layer(
             if !rest.is_empty() {
                 ex.gemv.launch_q_dense(st, &mut rest, nt)?;
             }
+        } else if fast && q_tiled() && nt > 32 && nt <= 64 && l.wq.k.is_multiple_of(128) {
+            // Large batched decode: weights and activations staged through shared memory.
+            ex.gemv.launch_q_tiled(st, &mut items, nt)?;
         } else if fast {
             // Large batched decode: one launch, each weight row read once for the batch.
             ex.gemv.launch_q_dense(st, &mut items, nt)?;
@@ -2434,6 +2443,8 @@ fn layer(
         let (_, tm) = l.wo.w16.as_ref().expect("checked");
         let w = &s.work128;
         ex.gemv.launch_gemm_f16_tma(st, 128, tm, l.wo.n, l.wo.k, 1, None, s.qa_attn.f16_ptr()?, nt, &mut s.o, nt, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)?;
+    } else if fast && q_tiled() && nt > 32 && nt <= 64 && l.wo.k.is_multiple_of(128) {
+        ex.gemv.launch_q_tiled(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;
     } else if fast {
         ex.gemv.launch_q_dense(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;
     } else if per_tok {

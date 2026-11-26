@@ -2801,7 +2801,7 @@ template <unsigned BT>
 __device__ __forceinline__ void gemm_f16_tma(
     const CUtensorMapStub& tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
-    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) {
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned kc_per_split) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     extern __shared__ __align__(1024) unsigned char tfsmem[];
     constexpr unsigned STAGES = BT == 256 ? 4u : TF_STAGES;
@@ -2816,7 +2816,12 @@ __device__ __forceinline__ void gemm_f16_tma(
     const unsigned count = min(min(it[2], BT), idx_len - start);
     const unsigned row0 = blockIdx.x * 128u;
     if (count == 0 || row0 >= N) return;
-    const unsigned KC = K / 64u;
+    // blockIdx.z selects K stages [z * kc_per_split, ...); with several splits the partial sums
+    // are atomically added into y, which the caller has zeroed.
+    const unsigned KC_ALL = K / 64u, kc0 = blockIdx.z * kc_per_split;
+    if (kc0 >= KC_ALL) return;
+    const unsigned KC = min(kc_per_split, KC_ALL - kc0);
+    const bool split = gridDim.z > 1;
     for (unsigned q = tid; q < BT; q += blockDim.x) xrow[q] = min(xidx[start + min(q, count - 1u)], x_rows - 1u);
     if (tid == 0) {
         for (unsigned s = 0; s < STAGES; ++s) {
@@ -2847,9 +2852,9 @@ __device__ __forceinline__ void gemm_f16_tma(
             __half* sbb = sa + 128u * 64u;
             if (lt == 0) {
                 tf_mbar_expect_tx(&full[s], 128u * 64u * 2u);
-                tf_tma_2d(sa, &tw, (int)(i * 64u), wrow, &full[s]);
+                tf_tma_2d(sa, &tw, (int)((kc0 + i) * 64u), wrow, &full[s]);
             }
-            const unsigned k0 = i * 64u;
+            const unsigned k0 = (kc0 + i) * 64u;
 #pragma unroll
             for (unsigned q = 0; q < PER; ++q) cp_async16(sbb + dst[q], src[q] + k0);
             tf_mbar_cp_async_arrive(&full[s]);
@@ -2889,13 +2894,13 @@ __device__ __forceinline__ void gemm_f16_tma(
         const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
         if (j0 < count) {
             float* yr = y + (u64)min(yidx[start + j0], y_rows - 1u) * N;
-            yr[r_lo] = d[4 * nt] * ms;
-            yr[r_hi] = d[4 * nt + 2] * ms;
+            if (split) { atomicAdd(yr + r_lo, d[4 * nt] * ms); atomicAdd(yr + r_hi, d[4 * nt + 2] * ms); }
+            else { yr[r_lo] = d[4 * nt] * ms; yr[r_hi] = d[4 * nt + 2] * ms; }
         }
         if (j1 < count) {
             float* yr = y + (u64)min(yidx[start + j1], y_rows - 1u) * N;
-            yr[r_lo] = d[4 * nt + 1] * ms;
-            yr[r_hi] = d[4 * nt + 3] * ms;
+            if (split) { atomicAdd(yr + r_lo, d[4 * nt + 1] * ms); atomicAdd(yr + r_hi, d[4 * nt + 3] * ms); }
+            else { yr[r_lo] = d[4 * nt + 1] * ms; yr[r_hi] = d[4 * nt + 3] * ms; }
         }
     }
 #else
@@ -2905,11 +2910,11 @@ __device__ __forceinline__ void gemm_f16_tma(
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma(
     const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
-    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT(); gemm_f16_tma<128>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned kc_per_split) { PDL_WAIT(); gemm_f16_tma<128>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, kc_per_split); }
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma_t256(
     const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
-    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT(); gemm_f16_tma<256>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats); }
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned kc_per_split) { PDL_WAIT(); gemm_f16_tma<256>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, kc_per_split); }
 
 // =============================================================================================
 // NVFP4 expert GEMM for prefill, warp-specialised with 256-row blocks (fragment layout, as
@@ -3069,5 +3074,111 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_nvfp4_ws256(
     }
 #else
     __trap();
+#endif
+}
+
+// =============================================================================================
+// Dense Q8_0 products for batched decode (T <= 64 tokens), tiled through shared memory: a block
+// owns 64 weight rows of one matrix (MultiQ8, blocks per matrix = ceil(n / 64)) and a K range
+// (blockIdx.y of gridDim.y splits; partial sums atomically added into y, zeroed by the caller,
+// when there are several). Each 128-column chunk of the weight rows (8 KB), their scales, and the
+// tokens' activations and scales are staged with cp.async in QT_STAGES buffers, so the
+// activations are read once per 64 rows. Warp w: row tile w % 4 (16 rows) x tokens 32 (w / 4)
+// .. +31 (4 tiles of 8), int8 mma.sync m16n8k32 per Q8_0 block, scaled into f32.
+// 256 threads, K % 128 == 0.
+#define QT_STAGES 3
+#define QT_ROWB 144   // smem bytes per staged row: 128 + 16 pad (conflict-free 32-bit fragment loads)
+struct QTStage {
+    unsigned char w[64 * QT_ROWB];
+    unsigned char x[64 * QT_ROWB];
+    u16 ws[64 * 4];
+    float xs[64 * 4];
+};
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_tiled(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(16) unsigned char qtsmem[];
+    QTStage* sm = reinterpret_cast<QTStage*>(qtsmem);
+    const unsigned bx = blockIdx.x;
+    unsigned i = 0;
+    while (i + 1 < m.count && bx >= m.start[i + 1]) ++i;
+    const unsigned N = m.n[i], row0 = (bx - m.start[i]) * 64u;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned KB = K >> 5, NC = K >> 7;
+    const unsigned c0 = blockIdx.y * NC / gridDim.y, c1 = (blockIdx.y + 1) * NC / gridDim.y;
+    if (c0 >= c1) return;
+    const bool split = gridDim.y > 1;
+    const u8* wq = m.qs[i];
+    const u16* wd = reinterpret_cast<const u16*>(m.aux[i]);
+    const signed char* xq = m.xq[i];
+    const float* xd = m.xd[i];
+    auto load = [&](unsigned stage, unsigned c) {
+        QTStage& S = sm[stage];
+        const unsigned k0 = c * 128u;
+        for (unsigned p = tid; p < 64u * 8u; p += 256u) {   // 64 rows x 8 pieces of 16 bytes
+            const unsigned r = p >> 3, part = p & 7u;
+            cp_async16(S.w + r * QT_ROWB + part * 16u, wq + (u64)min(row0 + r, N - 1u) * K + k0 + part * 16u);
+            cp_async16(S.x + r * QT_ROWB + part * 16u, xq + (u64)min(r, T - 1u) * K + k0 + part * 16u);
+        }
+        if (tid < 64) {
+            cp_async8(S.ws + tid * 4u, wd + (u64)min(row0 + tid, N - 1u) * KB + c * 4u);
+        } else if (tid < 128) {
+            const unsigned r = tid - 64u;
+            cp_async16(S.xs + r * 4u, xd + (u64)min(r, T - 1u) * KB + c * 4u);
+        }
+    };
+    const unsigned rt = warp & 3u, th = warp >> 2;   // row tile, token half
+    float acc[4][4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    const unsigned n = c1 - c0;
+#pragma unroll
+    for (unsigned s = 0; s < QT_STAGES - 1; ++s) {
+        if (s < n) load(s, c0 + s);
+        cp_async_commit();
+    }
+    for (unsigned c = 0; c < n; ++c) {
+        cp_async_wait<QT_STAGES - 2>();
+        __syncthreads();
+        if (c + QT_STAGES - 1 < n) load((c + QT_STAGES - 1) % QT_STAGES, c0 + c + QT_STAGES - 1);
+        cp_async_commit();
+        const QTStage& S = sm[c % QT_STAGES];
+        const unsigned char* wa = S.w + (rt * 16u + g) * QT_ROWB;
+        const unsigned char* wb = wa + 8u * QT_ROWB;
+#pragma unroll
+        for (unsigned kb = 0; kb < 4; ++kb) {
+            const unsigned a[4] = {*reinterpret_cast<const unsigned*>(wa + kb * 32u + 4u * t), *reinterpret_cast<const unsigned*>(wb + kb * 32u + 4u * t),
+                                   *reinterpret_cast<const unsigned*>(wa + kb * 32u + 16u + 4u * t), *reinterpret_cast<const unsigned*>(wb + kb * 32u + 16u + 4u * t)};
+            const float wsa = __half2float(__ushort_as_half(S.ws[(rt * 16u + g) * 4u + kb]));
+            const float wsb = __half2float(__ushort_as_half(S.ws[(rt * 16u + g + 8u) * 4u + kb]));
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned tok = th * 32u + j * 8u;
+                const unsigned char* xb = S.x + (tok + g) * QT_ROWB + kb * 32u + 4u * t;
+                int cc[4];
+                mma_s8_16832(cc, a, *reinterpret_cast<const unsigned*>(xb), *reinterpret_cast<const unsigned*>(xb + 16u));
+                const float x0 = S.xs[(tok + 2u * t) * 4u + kb], x1 = S.xs[(tok + 2u * t + 1u) * 4u + kb];
+                acc[j][0] = fmaf((float)cc[0], wsa * x0, acc[j][0]);
+                acc[j][1] = fmaf((float)cc[1], wsa * x1, acc[j][1]);
+                acc[j][2] = fmaf((float)cc[2], wsb * x0, acc[j][2]);
+                acc[j][3] = fmaf((float)cc[3], wsb * x1, acc[j][3]);
+            }
+        }
+    }
+    cp_async_wait<0>();
+    float* y = m.y[i];
+    const unsigned r_lo = row0 + rt * 16u + g, r_hi = r_lo + 8u;
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const unsigned j0 = th * 32u + j * 8u + 2u * t, j1 = j0 + 1u;
+        const float v[4] = {acc[j][0], acc[j][1], acc[j][2], acc[j][3]};
+        const unsigned rr[4] = {r_lo, r_lo, r_hi, r_hi}, tt[4] = {j0, j1, j0, j1};
+#pragma unroll
+        for (unsigned e = 0; e < 4; ++e) {
+            if (tt[e] < T && rr[e] < N) {
+                float* dst = y + (u64)tt[e] * N + rr[e];
+                if (split) atomicAdd(dst, v[e]); else *dst = v[e];
+            }
+        }
+    }
 #endif
 }

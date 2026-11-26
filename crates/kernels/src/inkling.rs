@@ -96,6 +96,7 @@ pub struct InklingOps {
     attn_split1: Function,
     attn_merge_q8: Function,
     mix_rms_q8: Function,
+    router_b: Function,
     router_fused: Function,
     ctrl_down3: Function,
     ctrl_combine3: Function,
@@ -222,6 +223,7 @@ impl InklingOps {
             attn_merge_q8: f("astral_ink_attn_merge_q8")?,
             mix_rms_q8: f("astral_ink_mix_rms_q8")?,
             router_fused: f("astral_ink_router_fused")?,
+            router_b: f("astral_ink_router_b")?,
             ctrl_down3: f("astral_ink_ctrl_down3")?,
             ctrl_combine3: f("astral_ink_ctrl_combine3")?,
             rms_q8_3: f("astral_ink_rms_q8_3")?,
@@ -506,6 +508,20 @@ impl InklingOps {
     /// The router GEMV (an F32 `[n_expert, k]` matrix over `ntok` rows of `x`) fused with
     /// [`InklingOps::router_topk`]. `counter` holds `ntok` zeros and is left zeroed.
     #[allow(clippy::too_many_arguments)]
+    /// Router logits `[ntok][n_expert]` of many tokens (F32 weights), 8 experts x 8 tokens per
+    /// block; pair with [`InklingOps::router_topk`].
+    pub fn router_logits_b(&self, s: &Stream, router: &GemvMatrix, x: &dyn Dev<f32>, logits: &mut dyn DevMut<f32>, ntok: u32) -> Result<()> {
+        let (ne, k) = (router.n, router.k);
+        if router.ty != GemvType::F32 || router.n_mats != 1 || !k.is_multiple_of(4) || ntok == 0 {
+            return Err(invalid(format!("router_logits_b: {:?} {ne} x {k}", router.ty)));
+        }
+        need("router x", x.dlen(), (ntok * k) as usize)?;
+        need("router logits", logits.dlen(), (ne * ntok) as usize)?;
+        let (mut pw, mut px, mut kk, mut pl, mut n, mut nt) = (router.qs.device_ptr(), x.dptr(), k, logits.dptr(), ne, ntok);
+        let mut p = [param(&mut pw), param(&mut px), param(&mut kk), param(&mut pl), param(&mut n), param(&mut nt)];
+        Self::go(&self.router_b, s, LaunchConfig { grid: (ne.div_ceil(8), ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
     pub fn router_fused(
         &self,
         s: &Stream,

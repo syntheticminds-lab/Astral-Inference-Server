@@ -1367,7 +1367,8 @@ impl Gemv {
             blocks += it.m.n.div_ceil(32);
         }
         d.start[items.len()] = blocks;
-        let (f, per) = match ntok {
+        // 32-token tiles for larger batches measured best (64 rows: 24.6 vs 25.5 ms per step).
+        let (f, per) = match ntok.min(32) {
             0..=16 => (&self.dense_mma[0], 16),
             17..=32 => (&self.dense_mma[1], 32),
             _ => (&self.dense_mma[2], 64),

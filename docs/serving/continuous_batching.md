@@ -37,7 +37,7 @@ its plain greedy output after a near-tie; this is unchanged from single-request 
 request that starts with the draft and later joins a batch continues with batch-independent
 plain decoding.
 
-`astral batch-check <gguf> <n> <steps>` checks this on the GPU: it decodes `n` sequences
+`astral batch-check <model> <n> <steps>` checks this on the GPU: it decodes `n` sequences
 alone and then together (teacher-forced on the single-sequence tokens) and compares every
 row's logits and pick. It passes with a maximum logit difference of exactly zero for
 `n` = 1 to 64. Over the server, [`bench/serving/batch_parity.py`](../../bench/serving/batch_parity.py)

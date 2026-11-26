@@ -1235,6 +1235,7 @@ impl InklingOps {
 
     /// [`InklingOps::gemm_f32`] with K split across blocks (up to 8 ways, by K alone): the
     /// per-split partials go to `ws` and are summed in a fixed order (deterministic).
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32_ws(&self, s: &Stream, a: &dyn Dev<f32>, lda: usize, w: &GemvMatrix, c: &mut dyn DevMut<f32>, m: u32, ws: &mut dyn DevMut<f32>) -> Result<()> {
         // The split depends on K only, so a row's sum does not depend on how many rows there are.
         let splits = 8u32.min(w.k.div_ceil(256));

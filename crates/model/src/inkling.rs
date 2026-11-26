@@ -1545,7 +1545,7 @@ fn forward(
     }
 
     // Batched decode: logits and greedy pick of every row.
-    if let Some(b) = batch.as_deref_mut() {
+    if let Some(b) = batch {
         let vp = w.output.n as usize;
         ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
         ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
@@ -2141,6 +2141,7 @@ fn layer(
             let msg = msgs.view(3 * d, msgs.len() - 3 * d)?;
             let rank = lp.down[3].n as usize;
             let mut cdv = cd.view_mut(0, ntok * rank)?;
+            #[allow(clippy::type_complexity)]
             let mut jobs: [(&GemvMatrix, &GemvMatrix, &dyn Dev<f32>, &dyn Dev<f32>, &mut dyn DevMut<f32>, &mut dyn DevMut<f32>); 1] = [(&lp.down[3], &lp.gain_forget[3], &*m, &msg, &mut cdv, &mut *ctmp)];
             ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt)?;
         } else {

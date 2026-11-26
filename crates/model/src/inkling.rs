@@ -230,6 +230,20 @@ impl Loader<'_> {
         if ty == GemvType::Nvfp4 && mats > 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
             m.add_frag(self.ctx, &qs, &aux)?;
         }
+        // Q8_0 experts (MXFP8 checkpoints) on GPUs with room for an f16 copy (about 2 GB per
+        // layer): the TMA prefill GEMM instead of the mma.sync one. ASTRAL_EXPERT_F16=0/1 forces.
+        if ty == GemvType::Q8_0 && mats > 1 && n % 128 == 0 && k % 64 == 0 {
+            let hopper = self.ctx.device().compute_capability().map(|(m, _)| m == 9).unwrap_or(false) && astral_kernels::ops::has_sm90a_build();
+            let big = self.ctx.mem_info().map(|(_, total)| total >= 90usize << 30).unwrap_or(false);
+            let want = match std::env::var("ASTRAL_EXPERT_F16").ok().as_deref() {
+                Some("0") => false,
+                Some(_) => true,
+                None => big,
+            };
+            if hopper && want {
+                m.add_w16(self.ctx, &qs, &aux)?;
+            }
+        }
         // Dense Q8_0 projections: an f16 copy for the prefill GEMMs -- row-major with a TMA tensor
         // map on Hopper (ASTRAL_NO_TMA=1: the fragment-order copy for the older kernel).
         if ty == GemvType::Q8_0 && mats == 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
@@ -2602,17 +2616,26 @@ fn layer(
             let [_, w1, w2] = &mut s.work;
             // Hopper with fragment-layout experts: 128-token items fill the warpgroup-MMA tile.
             let wg = |m: &GemvMatrix| m.frag.is_some() && Gemv::has_wgmma(st);
-            let chunk = if wg(&l.gate_up) && wg(&l.down) { 128 } else { 64 };
+            let tma = |m: &GemvMatrix| m.w16.is_some() && Gemv::has_wgmma(st);
+            let chunk = if (wg(&l.gate_up) && wg(&l.down)) || (tma(&l.gate_up) && tma(&l.down)) { 128 } else { 64 };
             ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items, chunk)?;
             let (w1, w2) = (&s.work[1], &s.work[2]);
             // Experts with a fragment layout: the warpgroup-MMA GEMM (Hopper).
-            if wg(&l.gate_up) {
+            if tma(&l.gate_up) && chunk == 128 {
+                let m = &l.gate_up;
+                let (_, tm) = m.w16.as_ref().expect("checked");
+                ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa[0].f16_ptr()?, nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+            } else if wg(&l.gate_up) {
                 ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             } else {
                 ex.gemv.launch_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
             }
             ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
-            if wg(&l.down) {
+            if tma(&l.down) && chunk == 128 {
+                let m = &l.down;
+                let (_, tm) = m.w16.as_ref().expect("checked");
+                ex.gemv.launch_gemm_f16_tma(st, 128, tm, m.n, m.k, m.n_mats, m.mat_scale.as_ref(), s.qa_ff.f16_ptr()?, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+            } else if wg(&l.down) {
                 ex.gemv.launch_mma5(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
             } else {
                 ex.gemv.launch_mma(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;

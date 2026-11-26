@@ -381,13 +381,13 @@ impl GemvMatrix {
         Ok(())
     }
 
-    /// Adds a row-major f16 copy of a single Q8_0 matrix (from its host planes) and its TMA
-    /// tensor map; needs `n % 128 == 0` and `k % 64 == 0`.
+    /// Adds a row-major f16 copy of a Q8_0 matrix stack (from its host planes; `[n_mats * n][k]`)
+    /// and its TMA tensor map; needs `n % 128 == 0` and `k % 64 == 0`.
     pub fn add_w16(&mut self, ctx: &std::sync::Arc<astral_gpu::Context>, qs: &[u8], aux: &[u8]) -> Result<()> {
-        if self.ty != GemvType::Q8_0 || self.n_mats != 1 || !self.n.is_multiple_of(128) || !self.k.is_multiple_of(64) {
+        if self.ty != GemvType::Q8_0 || !self.n.is_multiple_of(128) || !self.k.is_multiple_of(64) {
             return Err(invalid(format!("add_w16: {:?} n {} k {} x{}", self.ty, self.n, self.k, self.n_mats)));
         }
-        let (n, k) = (self.n as usize, self.k as usize);
+        let (n, k) = (self.n as usize * self.n_mats as usize, self.k as usize);
         if qs.len() != n * k || aux.len() != n * k / 16 {
             return Err(invalid("add_w16: planes do not match the matrix".into()));
         }

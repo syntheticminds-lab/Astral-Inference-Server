@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         Some("serve") if args.len() >= 2 => cmd_serve(&args[1..]),
         Some("batch-check") if args.len() >= 4 => cmd_batch_check(&args[1], &args[2], &args[3]),
         Some("cmp-prefill") if args.len() >= 3 => cmd_cmp_prefill(&args[1], &args[2..]),
+        Some("probe") if args.len() >= 5 => cmd_probe(&args[1], &args[2], &args[3], &args[4]),
         Some("spec-generate") if args.len() >= 6 => cmd_spec_generate(&args[1], &args[2], &args[3], &args[4], &args[5..]),
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-gemv" => cmd_kbench_mxfp4(&args[2..], false),
         Some("kbench") if args.len() >= 5 && args[1] == "mxfp4-mma" => cmd_kbench_mxfp4(&args[2..], true),
@@ -275,6 +276,57 @@ fn cmd_batch_check(path: &str, n: &str, steps: &str) -> Result<bool> {
         println!("prefill {k} x 512 tokens packed: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
     }
     Ok(ok)
+}
+
+/// Diagnostic load generator: `probe <model> decode <n> <secs>` runs batched decode steps of n
+/// rows, `probe <model> prefill <k> <secs>` packed prefills of k x 512 tokens, for `secs`
+/// seconds, printing the time per step / pass every second.
+fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
+    use astral_model::inkling::{DecodeRow, Session, Weights};
+    let bad = |m: String| astral_core::AstralError::Invalid(m);
+    let n: usize = n.parse().map_err(|_| bad("probe: n must be a number".into()))?;
+    let secs: f64 = secs.parse().map_err(|_| bad("probe: secs must be a number".into()))?;
+    let ctx = astral_gpu::Context::new(astral_gpu::Device::get(0)?)?;
+    let g = astral_loader::open_model(path)?;
+    let w = Weights::load(&ctx, &g)?;
+    let cap = std::env::var("ASTRAL_PROBE_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let mut s = Session::with_seqs(&ctx, w, cap, n, n)?;
+    let long: Vec<u32> = (0..512).map(|j| (j * 7919 % 150000 + 1000) as u32).collect();
+    let t_end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+    let (mut cnt, mut tick) = (0usize, std::time::Instant::now());
+    match what {
+        "decode" => {
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 600, token: 1000 }).collect();
+            while std::time::Instant::now() < t_end {
+                s.decode_batch(&rows)?;
+                cnt += 1;
+                if tick.elapsed().as_secs_f64() >= 1.0 {
+                    println!("decode {n}: {:.2} ms per step", tick.elapsed().as_secs_f64() * 1e3 / cnt as f64);
+                    (cnt, tick) = (0, std::time::Instant::now());
+                }
+            }
+        }
+        _ => {
+            let jobs: Vec<(usize, &[u32])> = (0..n).map(|i| (i, long.as_slice())).collect();
+            while std::time::Instant::now() < t_end {
+                for i in 0..n {
+                    s.reset_seq(i)?;
+                }
+                s.prefill_many(&jobs)?;
+                cnt += 1;
+                if tick.elapsed().as_secs_f64() >= 1.0 {
+                    let ms = tick.elapsed().as_secs_f64() * 1e3 / cnt as f64;
+                    println!("prefill {n} x 512: {ms:.1} ms per pass, {:.0} tok/s", (n * 512) as f64 * 1e3 / ms);
+                    (cnt, tick) = (0, std::time::Instant::now());
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Max |a - b| over the printed first/last three values of each row.

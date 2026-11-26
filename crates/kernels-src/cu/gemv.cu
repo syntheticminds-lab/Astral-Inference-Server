@@ -2344,3 +2344,283 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_items_x(
     }
     }
 }
+
+// =============================================================================================
+// Batched decode GEMMs on tensor cores. A work item (QItem) is one matrix and up to 8 activation
+// rows: the 8 columns of an m16n8 tile. A block is 4 warps x 16 weight rows, and streams its
+// rows once per item. grid = (n_items, ceil(N / 64)): the items of one row block run next to
+// each other, so items of the same matrix (dense rows in groups of 8, or an expert's tokens) read
+// the weights from L2 after the first. The item's activation rows are staged in shared memory.
+
+// NVFP4 in the fragment layout (astral_quant::nvfp4_frag_layout, see astral_gemm_nvfp4_mma5):
+// per 16-row tile and 64-column stage, lane l holds one 16-byte word quad (its A fragments for 4
+// k16-steps) and row group g = l / 4 one 8-byte scale pair. Activations are the f16 copy.
+// N % 64 == 0, K % 64 == 0, dynamic shared memory 8 * (K + 8) * 2 bytes.
+extern "C" __global__ void __launch_bounds__(128) astral_gemv_nvfp4_frag_items(
+    const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
+    unsigned K, const QItem* __restrict__ items, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale,
+    unsigned n_mats) { PDL_WAIT();
+    const QItem* itp = items + blockIdx.x;
+    const unsigned cnt = min(itp->n, (unsigned)NB);
+    if (cnt == 0u) return;
+    extern __shared__ uint4 xs4[];
+    __half* xs = reinterpret_cast<__half*>(xs4);
+    const unsigned stride = K + 8u;   // halves; 16 bytes of padding per row spreads the 8 rows over the banks
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned e = min(itp->e, n_mats - 1u);
+    {
+        const unsigned per_row = K >> 3;   // uint4 per activation row
+        for (unsigned i = tid; i < NB * per_row; i += blockDim.x) {
+            const unsigned r = i / per_row, c = i - r * per_row;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (r < cnt) v = __ldg(reinterpret_cast<const uint4*>(xh + (u64)min(itp->xi[r], x_rows - 1u) * K) + c);
+            *reinterpret_cast<uint4*>(xs + r * stride + c * 8u) = v;
+        }
+    }
+    __syncthreads();
+    const unsigned KC = K >> 6, NT = N >> 4;
+    const unsigned tile = blockIdx.y * 4u + warp;
+    if (tile >= NT) return;
+    const uint4* fa = reinterpret_cast<const uint4*>(frag) + ((u64)e * NT + tile) * KC * 32u + lane;
+    const uint2* fs = reinterpret_cast<const uint2*>(fscale) + ((u64)e * NT + tile) * KC * 8u + g;
+    const __half* xb = xs + g * stride + 2u * t;
+    const __half2 k8 = __float2half2_rn(256.0f);
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    constexpr unsigned P = 4;   // stages of loads in flight
+    uint4 wq[P];
+    uint2 sq[P];
+#pragma unroll
+    for (unsigned p = 0; p < P; ++p) {
+        if (p < KC) { wq[p] = __ldg(fa + p * 32u); sq[p] = __ldg(fs + p * 8u); }
+    }
+    for (unsigned kc0 = 0; kc0 < KC; kc0 += P) {
+#pragma unroll
+        for (unsigned p = 0; p < P; ++p) {
+            const unsigned kc = kc0 + p;
+            if (kc < KC) {
+            const uint4 w = wq[p];
+            const uint2 sb = sq[p];
+            if (kc + P < KC) { wq[p] = __ldg(fa + (kc + P) * 32u); sq[p] = __ldg(fs + (kc + P) * 8u); }
+            const unsigned w4[4] = {w.x, w.y, w.z, w.w};
+            const unsigned s4[2] = {sb.x, sb.y};
+#pragma unroll
+            for (unsigned ks = 0; ks < 4; ++ks) {
+                const unsigned sbytes = (s4[ks >> 1] >> ((ks & 1u) * 16u)) & 0xffffu;
+                const unsigned sbits = ((sbytes & 0xffu) << 7) | ((sbytes >> 8) << 23);
+                const __half2 s2 = __hmul2(*reinterpret_cast<const __half2*>(&sbits), k8);
+                const __half2 dl = __low2half2(s2), dh = __high2half2(s2);
+                unsigned a[4];
+                a[0] = hmul2u(fp4pair(w4[ks]), dl);
+                a[1] = hmul2u(fp4pair(w4[ks] << 4), dh);
+                a[2] = hmul2u(fp4pair(w4[ks] << 8), dl);
+                a[3] = hmul2u(fp4pair(w4[ks] << 12), dh);
+                const __half* xk = xb + kc * 64u + ks * 16u;
+                const unsigned b0 = *reinterpret_cast<const unsigned*>(xk);
+                const unsigned b1 = *reinterpret_cast<const unsigned*>(xk + 8u);
+                mma_f16(acc, a, b0, b1);
+            }
+            }
+        }
+    }
+    const float ms = (mat_scale ? mat_scale[e] : 1.0f) * 16384.0f;
+    const unsigned r_lo = tile * 16u + g, r_hi = r_lo + 8u;
+    const unsigned j0 = 2u * t, j1 = j0 + 1u;
+    if (j0 < cnt) {
+        float* yr = y + (u64)min(itp->yi[j0], y_rows - 1u) * N;
+        yr[r_lo] = acc[0] * ms;
+        yr[r_hi] = acc[2] * ms;
+    }
+    if (j1 < cnt) {
+        float* yr = y + (u64)min(itp->yi[j1], y_rows - 1u) * N;
+        yr[r_lo] = acc[1] * ms;
+        yr[r_hi] = acc[3] * ms;
+    }
+}
+
+// Q8_0 (qs: K bytes per row, aux: K / 32 f16 scales per row; matrices mat_qs / mat_aux bytes
+// apart) with int8 activations, on int8 mma.sync m16n8k32: one Q8_0 block per k-step, its int32
+// result scaled into f32 by (weight scale x activation scale). Within a block a lane takes 8
+// consecutive bytes of its rows and of its token (bytes 8t..8t+7 in the fragment positions of
+// bytes 4t..4t+3 and 16+4t..16+4t+3): the same permutation of the 32 products on both sides, so
+// the dot product is unchanged and each row's 32 bytes are read by one coalesced 8-byte load
+// per lane. A block is 8 warps on 32 rows: warp w takes row tile w % 2 and the K quarter w / 2
+// (many loads in flight even for few rows), and the quarters are added in shared memory.
+// N any, K % 128 == 0.
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_mma_items(
+    const u8* __restrict__ qs, const u8* __restrict__ aux, const signed char* __restrict__ xq, const float* __restrict__ xd,
+    float* __restrict__ y, unsigned N, unsigned K, u64 mat_qs, u64 mat_aux, const QItem* __restrict__ items, unsigned x_rows,
+    unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const QItem* itp = items + blockIdx.x;
+    const unsigned cnt = min(itp->n, (unsigned)NB);
+    if (cnt == 0u) return;
+    __shared__ float red[8][32][4];
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned e = min(itp->e, n_mats - 1u);
+    const unsigned KB = K >> 5, KQ = KB >> 2;
+    const unsigned row0 = blockIdx.y * 32u + (warp & 1u) * 16u;
+    const unsigned kb0 = (warp >> 1) * KQ;
+    const unsigned ra = min(row0 + g, N - 1u), rb = min(row0 + g + 8u, N - 1u);
+    const u8* wbase = qs + e * mat_qs;
+    const uint2* wa = reinterpret_cast<const uint2*>(wbase + (u64)ra * K) + t + kb0 * 4u;
+    const uint2* wb = reinterpret_cast<const uint2*>(wbase + (u64)rb * K) + t + kb0 * 4u;
+    const u16* da = reinterpret_cast<const u16*>(aux + e * mat_aux) + (u64)ra * KB + kb0;
+    const u16* db = reinterpret_cast<const u16*>(aux + e * mat_aux) + (u64)rb * KB + kb0;
+    // Token g's activation bytes (B operand) and tokens 2t, 2t + 1's scales; tokens beyond the
+    // item read row cnt - 1 and are not stored.
+    const unsigned tg = min(g, cnt - 1u), t0 = min(2u * t, cnt - 1u), t1 = min(2u * t + 1u, cnt - 1u);
+    const uint2* xa = reinterpret_cast<const uint2*>(xq + (u64)min(itp->xi[tg], x_rows - 1u) * K) + t + kb0 * 4u;
+    const float* s0 = xd + (u64)min(itp->xi[t0], x_rows - 1u) * KB + kb0;
+    const float* s1 = xd + (u64)min(itp->xi[t1], x_rows - 1u) * KB + kb0;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    constexpr unsigned P = 3;   // k-steps per batch of loads; KQ % P == 0 is not required
+    for (unsigned k = 0; k < KQ; k += P) {
+        uint2 qa[P], qb[P], bx[P];
+        u16 sa[P], sb[P];
+        float x0[P], x1[P];
+#pragma unroll
+        for (unsigned p = 0; p < P; ++p) {
+            const unsigned kk = min(k + p, KQ - 1u);
+            qa[p] = __ldg(wa + kk * 4u);
+            qb[p] = __ldg(wb + kk * 4u);
+            bx[p] = __ldg(xa + kk * 4u);
+            sa[p] = __ldg(da + kk);
+            sb[p] = __ldg(db + kk);
+            x0[p] = __ldg(s0 + kk);
+            x1[p] = __ldg(s1 + kk);
+        }
+#pragma unroll
+        for (unsigned p = 0; p < P; ++p) {
+            const unsigned a[4] = {qa[p].x, qb[p].x, qa[p].y, qb[p].y};
+            int c[4];
+            mma_s8_16832(c, a, bx[p].x, bx[p].y);
+            // A repeated last step (KQ % P != 0) contributes nothing.
+            const float live = (k + p < KQ) ? 1.0f : 0.0f;
+            const float wsa = __half2float(__ushort_as_half(sa[p])) * live, wsb = __half2float(__ushort_as_half(sb[p])) * live;
+            acc[0] = fmaf((float)c[0], wsa * x0[p], acc[0]);
+            acc[1] = fmaf((float)c[1], wsa * x1[p], acc[1]);
+            acc[2] = fmaf((float)c[2], wsb * x0[p], acc[2]);
+            acc[3] = fmaf((float)c[3], wsb * x1[p], acc[3]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[warp][lane][i] = acc[i];
+    __syncthreads();
+    if (warp >= 2) return;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = red[warp][lane][i] + red[warp + 2][lane][i] + red[warp + 4][lane][i] + red[warp + 6][lane][i];
+    const float ms = mat_scale ? mat_scale[e] : 1.0f;
+    const unsigned r_lo = row0 + g, r_hi = r_lo + 8u;
+    const unsigned j0 = 2u * t, j1 = j0 + 1u;
+    if (j0 < cnt) {
+        float* yr = y + (u64)min(itp->yi[j0], y_rows - 1u) * N;
+        if (r_lo < N) yr[r_lo] = v[0] * ms;
+        if (r_hi < N) yr[r_hi] = v[2] * ms;
+    }
+    if (j1 < cnt) {
+        float* yr = y + (u64)min(itp->yi[j1], y_rows - 1u) * N;
+        if (r_lo < N) yr[r_lo] = v[1] * ms;
+        if (r_hi < N) yr[r_hi] = v[3] * ms;
+    }
+#endif
+}
+
+// Dense Q8_0 products for a batch of T tokens, every weight row read once per 8 * NT tokens:
+// astral_gemv_q8_0_mma_items with NT tiles of 8 tokens per block (each weight fragment feeds NT
+// MMAs) over up to 8 matrices (MultiQ8, blocks per matrix = ceil(n / 32)). grid = (blocks,
+// ceil(T / (8 * NT))), 256 threads (2 row tiles x 4 K quarters), K % 128 == 0.
+template <unsigned NT>
+__device__ __forceinline__ void q8_dense_mma(const MultiQ8& m, unsigned K, unsigned T) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ float red[8][32][4 * NT];
+    const unsigned bx = blockIdx.x;
+    unsigned i = 0;
+    while (i + 1 < m.count && bx >= m.start[i + 1]) ++i;
+    const unsigned N = m.n[i];
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned KB = K >> 5, KQ = KB >> 2;
+    const unsigned row0 = (bx - m.start[i]) * 32u + (warp & 1u) * 16u;
+    const unsigned kb0 = (warp >> 1) * KQ;
+    const unsigned tb = blockIdx.y * 8u * NT;
+    const unsigned ra = min(row0 + g, N - 1u), rb = min(row0 + g + 8u, N - 1u);
+    const uint2* wa = reinterpret_cast<const uint2*>(m.qs[i] + (u64)ra * K) + t + kb0 * 4u;
+    const uint2* wb = reinterpret_cast<const uint2*>(m.qs[i] + (u64)rb * K) + t + kb0 * 4u;
+    const u16* da = reinterpret_cast<const u16*>(m.aux[i]) + (u64)ra * KB + kb0;
+    const u16* db = reinterpret_cast<const u16*>(m.aux[i]) + (u64)rb * KB + kb0;
+    const uint2* xa[NT];
+    const float* s0[NT];
+    const float* s1[NT];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        const unsigned tg = min(tb + 8u * j + g, T - 1u), t0 = min(tb + 8u * j + 2u * t, T - 1u), t1 = min(tb + 8u * j + 2u * t + 1u, T - 1u);
+        xa[j] = reinterpret_cast<const uint2*>(m.xq[i] + (u64)tg * K) + t + kb0 * 4u;
+        s0[j] = m.xd[i] + (u64)t0 * KB + kb0;
+        s1[j] = m.xd[i] + (u64)t1 * KB + kb0;
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    constexpr unsigned P = NT >= 4 ? 2 : 3;
+    for (unsigned k = 0; k < KQ; k += P) {
+        uint2 qa[P], qb[P], bxv[P][NT];
+        u16 sa[P], sb[P];
+        float x0[P][NT], x1[P][NT];
+#pragma unroll
+        for (unsigned p = 0; p < P; ++p) {
+            const unsigned kk = min(k + p, KQ - 1u);
+            qa[p] = __ldg(wa + kk * 4u);
+            qb[p] = __ldg(wb + kk * 4u);
+            sa[p] = __ldg(da + kk);
+            sb[p] = __ldg(db + kk);
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j) {
+                bxv[p][j] = __ldg(xa[j] + kk * 4u);
+                x0[p][j] = __ldg(s0[j] + kk);
+                x1[p][j] = __ldg(s1[j] + kk);
+            }
+        }
+#pragma unroll
+        for (unsigned p = 0; p < P; ++p) {
+            const unsigned a[4] = {qa[p].x, qb[p].x, qa[p].y, qb[p].y};
+            const float live = (k + p < KQ) ? 1.0f : 0.0f;
+            const float wsa = __half2float(__ushort_as_half(sa[p])) * live, wsb = __half2float(__ushort_as_half(sb[p])) * live;
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j) {
+                int c[4];
+                mma_s8_16832(c, a, bxv[p][j].x, bxv[p][j].y);
+                acc[j][0] = fmaf((float)c[0], wsa * x0[p][j], acc[j][0]);
+                acc[j][1] = fmaf((float)c[1], wsa * x1[p][j], acc[j][1]);
+                acc[j][2] = fmaf((float)c[2], wsb * x0[p][j], acc[j][2]);
+                acc[j][3] = fmaf((float)c[3], wsb * x1[p][j], acc[j][3]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) red[warp][lane][4 * j + q] = acc[j][q];
+    __syncthreads();
+    if (warp >= 2) return;
+    const unsigned r_lo = row0 + g, r_hi = r_lo + 8u;
+    float* y = m.y[i];
+#pragma unroll
+    for (unsigned j = 0; j < NT; ++j) {
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = red[warp][lane][4 * j + q] + red[warp + 2][lane][4 * j + q] + red[warp + 4][lane][4 * j + q] + red[warp + 6][lane][4 * j + q];
+        const unsigned j0 = tb + 8u * j + 2u * t, j1 = j0 + 1u;
+        if (j0 < T) {
+            if (r_lo < N) y[(u64)j0 * N + r_lo] = v[0];
+            if (r_hi < N) y[(u64)j0 * N + r_hi] = v[2];
+        }
+        if (j1 < T) {
+            if (r_lo < N) y[(u64)j1 * N + r_lo] = v[1];
+            if (r_hi < N) y[(u64)j1 * N + r_hi] = v[3];
+        }
+    }
+#endif
+}
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n2(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<2>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n4(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<4>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n8(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<8>(m, K, T); }

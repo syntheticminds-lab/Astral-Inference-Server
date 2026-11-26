@@ -906,6 +906,83 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine3_t(Ctr
     }
 }
 
+// Batched (not batch-exact) loop controllers for many tokens. down: block = 8 ranks x 8 tokens
+// of one job, warp w on rank 8 * blockIdx.x + w; the 8 tokens' rows are read by all 8 warps
+// (shared through L1), each weight row by one warp. grid (rank / 8, ceil(ntok / 8), jobs).
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down3_b(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                          unsigned ntok) { PDL_WAIT();
+    const unsigned j = blockIdx.z, t0 = blockIdx.y * CT, warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned nt = min(CT, ntok - t0);
+    const unsigned rank = gridDim.x * 8u, r = blockIdx.x * 8u + warp;
+    const float4* wa = reinterpret_cast<const float4*>(c.wd[j] + (u64)r * 2u * dim);
+    const float4* wb = reinterpret_cast<const float4*>(c.wd[j] + (u64)r * 2u * dim + dim);
+    const float4* xr[CT];
+    const float4* mr[CT];
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) {
+        const unsigned tt = t0 + min(t, nt - 1u);
+        xr[t] = reinterpret_cast<const float4*>(c.x[j] + (u64)tt * x_stride);
+        mr[t] = reinterpret_cast<const float4*>(c.msg[j] + (u64)tt * msg_stride);
+    }
+    float sx[CT], sm[CT], dx[CT], dm[CT];
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) sx[t] = sm[t] = dx[t] = dm[t] = 0.0f;
+    for (unsigned i = lane; i < (dim >> 2); i += 32u) {
+        const float4 a = __ldg(wa + i), b = __ldg(wb + i);
+#pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            const float4 x = __ldg(xr[t] + i), m = __ldg(mr[t] + i);
+            sx[t] = fmaf(x.x, x.x, fmaf(x.y, x.y, fmaf(x.z, x.z, fmaf(x.w, x.w, sx[t]))));
+            sm[t] = fmaf(m.x, m.x, fmaf(m.y, m.y, fmaf(m.z, m.z, fmaf(m.w, m.w, sm[t]))));
+            dx[t] = fmaf(a.x, x.x, fmaf(a.y, x.y, fmaf(a.z, x.z, fmaf(a.w, x.w, dx[t]))));
+            dm[t] = fmaf(b.x, m.x, fmaf(b.y, m.y, fmaf(b.z, m.z, fmaf(b.w, m.w, dm[t]))));
+        }
+    }
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) {
+        const float vsx = warp_sum(sx[t]), vsm = warp_sum(sm[t]), vdx = warp_sum(dx[t]), vdm = warp_sum(dm[t]);
+        if (lane == 0 && t < nt) c.cd[j][(u64)(t0 + t) * rank + r] = vdx * rsqrtf(vsx / (float)dim + 1e-6f) + vdm * rsqrtf(vsm / (float)dim + 1e-6f);
+    }
+}
+// combine: thread n of block x covers output n = 256 * blockIdx.x + threadIdx.x for 8 tokens;
+// the tokens' rank vectors sit in shared memory. rank % 4 == 0, rank <= 64.
+// grid (ceil(dim / 256), ceil(ntok / 8), jobs).
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_combine3_b(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                             unsigned rank, unsigned ntok) { PDL_WAIT();
+    const unsigned j = blockIdx.z, t0 = blockIdx.y * CT;
+    const unsigned nt = min(CT, ntok - t0);
+    __shared__ float cds[CT][64];
+    for (unsigned i = threadIdx.x; i < CT * rank; i += blockDim.x) {
+        const unsigned t = i / rank, q = i - t * rank;
+        cds[t][q] = t < nt ? c.cd[j][(u64)(t0 + t) * rank + q] : 0.0f;
+    }
+    __syncthreads();
+    const unsigned n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= dim) return;
+    const float4* wg = reinterpret_cast<const float4*>(c.wgf[j] + (u64)n * rank);
+    const float4* wf = reinterpret_cast<const float4*>(c.wgf[j] + (u64)(dim + n) * rank);
+    float g[CT], f[CT];
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) g[t] = f[t] = 0.0f;
+    for (unsigned q = 0; q < (rank >> 2); ++q) {
+        const float4 a = __ldg(wg + q), b = __ldg(wf + q);
+#pragma unroll
+        for (unsigned t = 0; t < CT; ++t) {
+            const float4 v = *reinterpret_cast<const float4*>(&cds[t][4u * q]);
+            g[t] = fmaf(a.x, v.x, fmaf(a.y, v.y, fmaf(a.z, v.z, fmaf(a.w, v.w, g[t]))));
+            f[t] = fmaf(b.x, v.x, fmaf(b.y, v.y, fmaf(b.z, v.z, fmaf(b.w, v.w, f[t]))));
+        }
+    }
+#pragma unroll
+    for (unsigned t = 0; t < CT; ++t) {
+        if (t < nt) {
+            const unsigned tok = t0 + t;
+            const float xv = c.x[j][(u64)tok * x_stride + n];
+            c.out[j][(u64)tok * dim + n] = (xv - tanhf(f[t]) * xv) + tanhf(g[t]) * c.msg[j][(u64)tok * msg_stride + n];
+        }
+    }
+}
+
 // Up to three rms_q8 jobs (blockIdx.y = job): y_j = rms_norm(x_j) * w_j, quantised. Rows of x_j at
 // t * x_stride; grid (ntok, jobs).
 struct Rms3 {

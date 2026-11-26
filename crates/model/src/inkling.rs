@@ -1550,6 +1550,7 @@ fn forward(
         ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
         ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
         match w.output.ty {
+            GemvType::Q8_0 if fast_batch(ntok) => ex.gemv.launch_q_dense(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
             GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa[0], &mut *b.logits, ntok)?,
             _ => ex.mm(&w.output, &s.qa[0], b.logits, ntok, &s.items_dense, &s.work[0])?,
         }
@@ -1602,6 +1603,13 @@ fn split_prefill() -> bool {
 
 /// Passes of 2..=8 tokens (speculative verification) use the grouped dp4a GEMV instead of the
 /// tensor-core prefill GEMMs (`ASTRAL_SMALL_MMA=1` to keep the latter).
+/// Batched decode of more than [`QITEM_ROWS`] rows on the prefill tensor-core GEMMs (the
+/// default). `ASTRAL_EXACT_BATCH=1` keeps the batch-exact kernels, which give every row the
+/// same result as decoding it alone.
+fn fast_batch(ntok: usize) -> bool {
+    ntok > QITEM_ROWS && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
+}
+
 fn small_batch(ntok: usize) -> bool {
     ntok > 1 && ntok <= QITEM_ROWS && std::env::var_os("ASTRAL_SMALL_MMA").is_none()
 }
@@ -1704,6 +1712,8 @@ fn layer(
     let prefill = segs.is_some();
     // Per-token decode kernels: a single token, or one token of each batched sequence.
     let per_tok = batch.is_some() || (ntok == 1 && !prefill);
+    // Large batched decode: grouped tensor-core products (not batch-exact).
+    let fast = batch.is_some() && fast_batch(ntok);
     let hoff = hist.as_ref().map(|h| crate::dspark::hist_offsets(h.rows, cfg.kv_width(), cfg.dim));
     let (st, d, du, nt) = (ex.st, cfg.dim, cfg.dim as u32, ntok as u32);
     let (heads, kvh, hd, n_rel) = (cfg.heads as u32, cfg.kv_heads as u32, cfg.head_dim as u32, cfg.n_rel);
@@ -1769,7 +1779,7 @@ fn layer(
                 (&lp.down[1], &lp.gain_forget[1], &xs[1], &ms[1], c1, &mut *i1),
                 (&lp.down[2], &lp.gain_forget[2], &xs[2], &ms[2], c2, &mut *i2),
             ];
-            ex.ops.ctrl_multi(st, &mut jobs, x_stride, 4 * d, du, nt)?;
+            ex.ops.ctrl_multi(st, &mut jobs, x_stride, 4 * d, du, nt, !fast)?;
         }
         let norm = |j: usize| -> Result<&DeviceBuffer<f32>> {
             match (&l.attn_norm, &l.qkv_inp_norm) {
@@ -1849,6 +1859,9 @@ fn layer(
             ex.gemv.launch_q_multi_mma(st, &mut items, 1)?;
         } else if ntok == 1 {
             ex.gemv.launch_q_multi(st, &mut items)?;
+        } else if fast {
+            // Large batched decode: one launch, each weight row read once for the batch.
+            ex.gemv.launch_q_dense(st, &mut items, nt)?;
         } else if batch.is_some() {
             // Batched decode: every row exactly as the one-token launch computes it.
             if decode_mma {
@@ -2081,7 +2094,9 @@ fn layer(
     if !gated {
         ex.ops.gate_q8(st, &mut s.attn, &s.gate, &mut s.qa_attn, nt)?;
     }
-    if per_tok {
+    if fast {
+        ex.gemv.launch_q_dense(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;
+    } else if per_tok {
         ex.mm_decode(&l.wo, &s.qa_attn, &mut s.o, ntok)?;
     } else {
         ex.mm_any(&l.wo, &s.qa_attn, &mut s.o, ntok, &s.items_dense, &s.work[0], prefill)?;
@@ -2143,7 +2158,7 @@ fn layer(
             let mut cdv = cd.view_mut(0, ntok * rank)?;
             #[allow(clippy::type_complexity)]
             let mut jobs: [(&GemvMatrix, &GemvMatrix, &dyn Dev<f32>, &dyn Dev<f32>, &mut dyn DevMut<f32>, &mut dyn DevMut<f32>); 1] = [(&lp.down[3], &lp.gain_forget[3], &*m, &msg, &mut cdv, &mut *ctmp)];
-            ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt)?;
+            ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt, !fast)?;
         } else {
             let msg = s.msgs.view(3 * d, s.msgs.len() - 3 * d)?;
             ex.ops.ctrl_t(st, &lp.down[3], &lp.gain_forget[3], &s.m, d, &msg, 4 * d, &mut s.crms, &mut s.cd, &mut s.gu, &mut s.ctmp, du, nt)?;
@@ -2176,7 +2191,15 @@ fn layer(
         ex.gemv.launch_q(st, &l.down, &s.qa_ff, &mut s.y, Some(&ids as &dyn Dev<i32>))?;
     } else {
         let p32 = pairs as u32;
-        if batch.is_some() {
+        if fast {
+            // Large batched decode: tensor-core grouped products, each expert's weights read
+            // once per 8 of its tokens.
+            let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);
+            ex.ops.moe_group_q(st, &s.ids, p32, k, cfg.n_expert as u32, &mut s.items_gu, &mut s.items_dn, mi)?;
+            ex.gemv.launch_items_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &s.items_gu, mi)?;
+            ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            ex.gemv.launch_items_mma(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &s.items_dn, mi)?;
+        } else if batch.is_some() {
             // Batched decode, every (token, expert) pair as the one-token dp4a GEMV computes it.
             let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);
             ex.ops.moe_group_q(st, &s.ids, p32, k, cfg.n_expert as u32, &mut s.items_gu, &mut s.items_dn, mi)?;

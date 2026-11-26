@@ -70,6 +70,8 @@ pub struct InklingOps {
     sum_splits: Function,
     ctrl_down3_t: Function,
     ctrl_combine3_t: Function,
+    /// Batched controllers for large batches (not batch-exact): 8 ranks or 256 outputs x 8 tokens per block.
+    ctrl_b: [Function; 2],
     ctrl_down: Function,
     ctrl_combine: Function,
     gate_q8: Function,
@@ -192,6 +194,7 @@ impl InklingOps {
             sum_splits: f("astral_ink_sum_splits")?,
             ctrl_down3_t: f("astral_ink_ctrl_down3_t")?,
             ctrl_combine3_t: f("astral_ink_ctrl_combine3_t")?,
+            ctrl_b: [f("astral_ink_ctrl_down3_b")?, f("astral_ink_ctrl_combine3_b")?],
             ctrl_down: f("astral_ink_ctrl_down")?,
             ctrl_combine: f("astral_ink_ctrl_combine")?,
             gate_q8: f("astral_ink_gate_q8")?,
@@ -742,7 +745,8 @@ impl InklingOps {
     }
     /// Both loop-controller parts for up to three independent jobs `(down, gain_forget, x, msg,
     /// cd, out)` (a looped layer's Q, K, V inputs) in two launches. All share `x_stride`,
-    /// `msg_stride`, `dim` and the rank.
+    /// `msg_stride`, `dim` and the rank. `exact`: each token computed as by the one-token
+    /// kernels (else, for more than 8 tokens, the faster tiled kernels).
     #[allow(clippy::too_many_arguments)]
     pub fn ctrl_multi(
         &self,
@@ -752,6 +756,7 @@ impl InklingOps {
         msg_stride: usize,
         dim: u32,
         ntok: u32,
+        exact: bool,
     ) -> Result<()> {
         #[repr(C)]
         struct Ctrl3 {
@@ -785,6 +790,15 @@ impl InklingOps {
         }
         let (mut xs, mut ms, mut dd) = (x_stride as u32, msg_stride as u32, dim);
         let mut c2 = Ctrl3 { wd: c.wd, wgf: c.wgf, x: c.x, msg: c.msg, cd: c.cd, out: c.out };
+        if !exact && ntok > 8 && rank <= 64 && rank.is_multiple_of(8) && dim.is_multiple_of(4) && x_stride.is_multiple_of(4) && msg_stride.is_multiple_of(4) {
+            let tb = ntok.div_ceil(8);
+            let mut nt1 = ntok;
+            let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1)];
+            Self::go(&self.ctrl_b[0], s, LaunchConfig { grid: (rank / 8, tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            let (mut xs2, mut ms2, mut dd2, mut r, mut nt2) = (x_stride as u32, msg_stride as u32, dim, rank, ntok);
+            let mut p2 = [param(&mut c2), param(&mut xs2), param(&mut ms2), param(&mut dd2), param(&mut r), param(&mut nt2)];
+            return Self::go(&self.ctrl_b[1], s, LaunchConfig { grid: (dim.div_ceil(256), tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p2);
+        }
         if ntok > 1 && rank <= 64 {
             // Several tokens: 8 per block, each weight load shared (same per-token arithmetic).
             let tb = ntok.div_ceil(8);

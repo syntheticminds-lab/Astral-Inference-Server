@@ -1934,7 +1934,7 @@ fn layer(
         // Q, K and V controllers in two launches, then their three input norms in one.
         let lp = &w.loops[li];
         let rank = lp.down[0].n as usize;
-        let Scratch { mixed, cur, msgs, cd, inputs, normed, qa, .. } = &mut *s;
+        let Scratch { mixed, cur, msgs, cd, inputs, normed, qa, crms, .. } = &mut *s;
         let xs: Vec<_> = (0..3).map(|j| if nq > 0 { mixed.view(row(j) * d, mixed.len() - row(j) * d) } else { cur.view(0, cur.len()) }).collect::<Result<_>>()?;
         let ms: Vec<_> = (0..3).map(|j| msgs.view(j * d, msgs.len() - j * d)).collect::<Result<_>>()?;
         let (cd0, rest) = cd.split_at_mut_views(ntok * rank)?;
@@ -1948,7 +1948,7 @@ fn layer(
                 (&lp.down[1], &lp.gain_forget[1], &xs[1], &ms[1], c1, &mut *i1),
                 (&lp.down[2], &lp.gain_forget[2], &xs[2], &ms[2], c2, &mut *i2),
             ];
-            ex.ops.ctrl_multi(st, &mut jobs, x_stride, 4 * d, du, nt, !fast)?;
+            ex.ops.ctrl_multi(st, &mut jobs, x_stride, 4 * d, du, nt, !fast, &mut *crms)?;
         }
         let norm = |j: usize| -> Result<&DeviceBuffer<f32>> {
             match (&l.attn_norm, &l.qkv_inp_norm) {
@@ -2529,13 +2529,13 @@ fn layer(
         if per_tok || (!prefill && small_batch(ntok)) {
             // The same launch as the attention-input controllers (one job), so one token or many
             // share the kernels and their per-token arithmetic.
-            let Scratch { msgs, m, cd, ctmp, .. } = &mut *s;
+            let Scratch { msgs, m, cd, ctmp, crms, .. } = &mut *s;
             let msg = msgs.view(3 * d, msgs.len() - 3 * d)?;
             let rank = lp.down[3].n as usize;
             let mut cdv = cd.view_mut(0, ntok * rank)?;
             #[allow(clippy::type_complexity)]
             let mut jobs: [(&GemvMatrix, &GemvMatrix, &dyn Dev<f32>, &dyn Dev<f32>, &mut dyn DevMut<f32>, &mut dyn DevMut<f32>); 1] = [(&lp.down[3], &lp.gain_forget[3], &*m, &msg, &mut cdv, &mut *ctmp)];
-            ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt, !fast)?;
+            ex.ops.ctrl_multi(st, &mut jobs, d, 4 * d, du, nt, !fast, &mut *crms)?;
         } else {
             let msg = s.msgs.view(3 * d, s.msgs.len() - 3 * d)?;
             ex.ops.ctrl_t(st, &lp.down[3], &lp.gain_forget[3], &s.m, d, &msg, 4 * d, &mut s.crms, &mut s.cd, &mut s.gu, &mut s.ctmp, du, nt)?;

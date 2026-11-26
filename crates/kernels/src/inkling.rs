@@ -74,6 +74,8 @@ pub struct InklingOps {
     ctrl_combine3_t: Function,
     /// Batched controllers for large batches (not batch-exact): 8 ranks or 256 outputs x 8 tokens per block.
     ctrl_b: [Function; 2],
+    /// Tensor-core controller down projection: norms, then the K-sliced bf16 GEMM.
+    ctrl_tc: [Function; 2],
     ctrl_down: Function,
     ctrl_combine: Function,
     gate_q8: Function,
@@ -242,6 +244,7 @@ impl InklingOps {
             ctrl_down3_t: f("astral_ink_ctrl_down3_t")?,
             ctrl_combine3_t: f("astral_ink_ctrl_combine3_t")?,
             ctrl_b: [f("astral_ink_ctrl_down3_b")?, f("astral_ink_ctrl_combine3_b")?],
+            ctrl_tc: [f("astral_ink_ctrl_norms")?, f("astral_ink_ctrl_down_tc")?],
             ctrl_down: f("astral_ink_ctrl_down")?,
             ctrl_combine: f("astral_ink_ctrl_combine")?,
             gate_q8: f("astral_ink_gate_q8")?,
@@ -892,6 +895,7 @@ impl InklingOps {
         dim: u32,
         ntok: u32,
         exact: bool,
+        scratch: &mut dyn DevMut<f32>,
     ) -> Result<()> {
         #[repr(C)]
         struct Ctrl3 {
@@ -927,9 +931,21 @@ impl InklingOps {
         let mut c2 = Ctrl3 { wd: c.wd, wgf: c.wgf, x: c.x, msg: c.msg, cd: c.cd, out: c.out };
         if !exact && ntok > 8 && rank <= 64 && rank.is_multiple_of(8) && dim.is_multiple_of(4) && x_stride.is_multiple_of(4) && msg_stride.is_multiple_of(4) {
             let tb = ntok.div_ceil(8);
-            let mut nt1 = ntok;
-            let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1)];
-            Self::go(&self.ctrl_b[0], s, LaunchConfig { grid: (rank / 8, tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            let tc = rank == 64 && ntok <= 64 && dim.is_multiple_of(128) && scratch.dlen() >= 2 * 3 * ntok as usize && std::env::var_os("ASTRAL_CTRL_SIMT").is_none();
+            if tc {
+                // Norm scales (and zeroed cd), then the down projection on bf16 tensor cores.
+                let (mut nt1, mut rk, mut psc) = (ntok, rank, scratch.dptr());
+                let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1), param(&mut rk), param(&mut psc)];
+                Self::go(&self.ctrl_tc[0], s, LaunchConfig { grid: (ntok, nj as u32, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+                let mut c1 = Ctrl3 { wd: c.wd, wgf: c.wgf, x: c.x, msg: c.msg, cd: c.cd, out: c.out };
+                let (mut xs1, mut ms1, mut dd1, mut nt2, mut psc2) = (x_stride as u32, msg_stride as u32, dim, ntok, scratch.dptr());
+                let mut p = [param(&mut c1), param(&mut xs1), param(&mut ms1), param(&mut dd1), param(&mut nt2), param(&mut psc2)];
+                Self::go(&self.ctrl_tc[1], s, LaunchConfig { grid: (2 * dim / 128, nj as u32, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            } else {
+                let mut nt1 = ntok;
+                let mut p = [param(&mut c), param(&mut xs), param(&mut ms), param(&mut dd), param(&mut nt1)];
+                Self::go(&self.ctrl_b[0], s, LaunchConfig { grid: (rank / 8, tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            }
             let (mut xs2, mut ms2, mut dd2, mut r, mut nt2) = (x_stride as u32, msg_stride as u32, dim, rank, ntok);
             let mut p2 = [param(&mut c2), param(&mut xs2), param(&mut ms2), param(&mut dd2), param(&mut r), param(&mut nt2)];
             return Self::go(&self.ctrl_b[1], s, LaunchConfig { grid: (dim.div_ceil(256), tb, nj as u32), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p2);

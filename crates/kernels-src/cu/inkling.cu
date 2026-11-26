@@ -972,6 +972,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down3_b(Ctrl3 
     float sx[CT], sm[CT], dx[CT], dm[CT];
 #pragma unroll
     for (unsigned t = 0; t < CT; ++t) sx[t] = sm[t] = dx[t] = dm[t] = 0.0f;
+#pragma unroll 4
     for (unsigned i = lane; i < (dim >> 2); i += 32u) {
         const float4 a = __ldg(wa + i), b = __ldg(wb + i);
 #pragma unroll
@@ -2247,4 +2248,79 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prep_segs(
     astral_ink_attn_prep_body(q + r0 * heads * hd, r + r0 * heads * n_rel, k + r0 * kvw, v + r0 * kvw, q_scale, r_scale, conv_kv + sg[4],
                               k_conv_w, v_conv_w, nullptr, nullptr, 0u, kc + sg[2], vc + sg[2], pos_p + sg[3], heads, kv_heads, hd, n_rel,
                               thr_qk, thr_rel, eps, global, floor_len, alpha, capacity, 0u, nullptr, 0u, 0u);
+}
+
+// Loop controllers for many tokens on bf16 tensor cores. ctrl_norms: per (token, job) the RMS
+// scales of x and msg (scales[(j * ntok + t) * 2 + {0, 1}]) and a zeroed rank row of cd.
+// ctrl_down_tc: cd[j][t][r] += scale(t, part) * W_down[r][part K slice] . row(t)[slice] for one
+// 128-wide K slice per block (grid (2 * dim / 128, jobs)); 64 ranks x up to 64 tokens per block.
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_norms(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                        unsigned ntok, unsigned rank, float* __restrict__ scales) { PDL_WAIT();
+    const unsigned t = blockIdx.x, j = blockIdx.y;
+    const float* x = c.x[j] + (u64)t * x_stride;
+    const float* m = c.msg[j] + (u64)t * msg_stride;
+    float sx = 0.0f, sm = 0.0f;
+    for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float a = x[i], b = m[i];
+        sx = fmaf(a, a, sx);
+        sm = fmaf(b, b, sm);
+    }
+    sx = block_sum(sx);
+    sm = block_sum(sm);
+    if (threadIdx.x == 0) {
+        scales[((u64)j * ntok + t) * 2u] = rsqrtf(sx / (float)dim + 1e-6f);
+        scales[((u64)j * ntok + t) * 2u + 1u] = rsqrtf(sm / (float)dim + 1e-6f);
+    }
+    for (unsigned r = threadIdx.x; r < rank; r += blockDim.x) c.cd[j][(u64)t * rank + r] = 0.0f;
+}
+extern "C" __global__ void __launch_bounds__(256) astral_ink_ctrl_down_tc(Ctrl3 c, unsigned x_stride, unsigned msg_stride, unsigned dim,
+                                                                          unsigned ntok, const float* __restrict__ scales) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr unsigned RK = 64, KS = 128, RW = KS / 2 + 4;   // words per smem row (bf16 pairs + pad)
+    __shared__ unsigned Ws[RK * RW], Xs[64 * RW];
+    const unsigned j = blockIdx.y, kbase = blockIdx.x * KS;
+    const unsigned part = kbase < dim ? 0u : 1u, koff = kbase - part * dim;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const float* w = c.wd[j];
+    for (unsigned i = tid; i < RK * (KS / 4); i += 256u) {
+        const unsigned r = i / (KS / 4), q = i % (KS / 4);
+        const float4 v = __ldg(reinterpret_cast<const float4*>(w + (u64)r * 2u * dim + kbase) + q);
+        Ws[r * RW + 2u * q] = bf16x2(v.x, v.y);
+        Ws[r * RW + 2u * q + 1u] = bf16x2(v.z, v.w);
+    }
+    for (unsigned i = tid; i < 64u * (KS / 4); i += 256u) {
+        const unsigned r = i / (KS / 4), q = i % (KS / 4);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r < ntok) {
+            const float* src = part ? c.msg[j] + (u64)r * msg_stride : c.x[j] + (u64)r * x_stride;
+            v = __ldg(reinterpret_cast<const float4*>(src + koff) + q);
+        }
+        Xs[r * RW + 2u * q] = bf16x2(v.x, v.y);
+        Xs[r * RW + 2u * q + 1u] = bf16x2(v.z, v.w);
+    }
+    __syncthreads();
+    const unsigned rt = (warp & 3u) * 16u, tb = (warp >> 2) * 32u;
+    float acc[4][4];
+#pragma unroll
+    for (unsigned n = 0; n < 4; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+#pragma unroll
+    for (unsigned ks = 0; ks < KS / 16; ++ks) {
+        const unsigned a[4] = {Ws[(rt + g) * RW + ks * 8u + t], Ws[(rt + g + 8u) * RW + ks * 8u + t],
+                               Ws[(rt + g) * RW + ks * 8u + 4u + t], Ws[(rt + g + 8u) * RW + ks * 8u + 4u + t]};
+#pragma unroll
+        for (unsigned n = 0; n < 4; ++n) {
+            const unsigned tok = tb + n * 8u + g;
+            mma_bf16_16816(acc[n], a, Xs[tok * RW + ks * 8u + t], Xs[tok * RW + ks * 8u + 4u + t]);
+        }
+    }
+    float* cd = c.cd[j];
+#pragma unroll
+    for (unsigned n = 0; n < 4; ++n) {
+#pragma unroll
+        for (unsigned e = 0; e < 4; ++e) {
+            const unsigned r = rt + g + (e >> 1) * 8u, tok = tb + n * 8u + 2u * t + (e & 1u);
+            if (tok < ntok) atomicAdd(cd + (u64)tok * RK + r, acc[n][e] * scales[((u64)j * ntok + tok) * 2u + part]);
+        }
+    }
+#endif
 }

@@ -52,6 +52,7 @@ pub struct InklingOps {
     embed: Function,
     clip: Function,
     tau: Function,
+    mix_all: Function,
     mix: Function,
     concat_rms2: Function,
     control: Function,
@@ -225,6 +226,7 @@ impl InklingOps {
             clip: f("astral_ink_clip_heads")?,
             tau: f("astral_ink_scale_tau")?,
             mix: f("astral_ink_mix")?,
+            mix_all: f("astral_ink_mix_all")?,
             concat_rms2: f("astral_ink_concat_rms2")?,
             control: f("astral_ink_control_combine")?,
             conv: f("astral_ink_conv_step")?,
@@ -346,8 +348,14 @@ impl InklingOps {
         let mut di = DepthIdx { v: [0; MAX_DEPTH] };
         di.v[..idx.len()].copy_from_slice(idx);
         let (mut pb, mut depth, mut rs, mut pc, mut pq, mut po, mut dm) = (bank.dptr(), idx.len() as u32, row_stride as u32, cur.dptr(), query.dptr(), out.dptr(), dim);
-        let mut p = [param(&mut pb), param(&mut di), param(&mut depth), param(&mut rs), param(&mut pc), param(&mut pq), param(&mut po), param(&mut dm)];
         let block = (dim / 4).next_multiple_of(32).clamp(32, 1024);
+        // Several queries: one block per token reads each state once for all of them.
+        if (2..=4).contains(&nq) && dim / 4 <= 1024 && std::env::var_os("ASTRAL_MIX_PER_QUERY").is_none() {
+            let mut nqq = nq;
+            let mut p2 = [param(&mut pb), param(&mut di), param(&mut depth), param(&mut rs), param(&mut pc), param(&mut pq), param(&mut nqq), param(&mut po), param(&mut dm)];
+            return Self::go(&self.mix_all, s, LaunchConfig { grid: (ntok, 1, 1), block: (block, 1, 1), shared_mem_bytes: 0 }, &mut p2);
+        }
+        let mut p = [param(&mut pb), param(&mut di), param(&mut depth), param(&mut rs), param(&mut pc), param(&mut pq), param(&mut po), param(&mut dm)];
         Self::go(&self.mix, s, LaunchConfig { grid: (nq, ntok, 1), block: (block, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 

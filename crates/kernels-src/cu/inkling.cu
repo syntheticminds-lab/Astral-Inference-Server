@@ -185,6 +185,75 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_mix(const float* _
     }
 }
 
+// astral_ink_mix for all queries of a token in one block (grid = tokens): each thread keeps its
+// float4 of every state in registers, so each state row is read once per token instead of twice
+// per query. blockDim >= dim / 4, nq <= MIX_NQ.
+#define MIX_NQ 4
+extern "C" __global__ void __launch_bounds__(1024) astral_ink_mix_all(const float* __restrict__ bank, DepthIdx idx, unsigned depth,
+                                                                      unsigned row_stride, const float* __restrict__ cur,
+                                                                      const float* __restrict__ query, unsigned nq, float* __restrict__ out,
+                                                                      unsigned dim) { PDL_WAIT();
+    constexpr unsigned S = MAX_DEPTH + 1, NV = S * (MIX_NQ + 1);
+    const unsigned t = blockIdx.x, i = threadIdx.x, d4 = dim >> 2;
+    const unsigned n_states = depth + 1;
+    const bool live = i < d4;
+    const float* bt = bank + (u64)t * dim;
+    const float* ct = cur + (u64)t * dim;
+    float4 v[S];
+    float red[NV];
+#pragma unroll
+    for (unsigned k = 0; k < NV; ++k) red[k] = 0.0f;
+#pragma unroll
+    for (unsigned s = 0; s < S; ++s) {
+        v[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (live && s < n_states) v[s] = __ldg(reinterpret_cast<const float4*>(s < depth ? bt + (u64)idx.v[s] * row_stride : ct) + i);
+        red[s] = v[s].x * v[s].x + v[s].y * v[s].y + v[s].z * v[s].z + v[s].w * v[s].w;
+    }
+#pragma unroll
+    for (unsigned j = 0; j < MIX_NQ; ++j) {
+        if (j < nq) {
+            const float4 qi = live ? __ldg(reinterpret_cast<const float4*>(query + (u64)j * dim) + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+            for (unsigned s = 0; s < S; ++s) red[S + j * S + s] = v[s].x * qi.x + v[s].y * qi.y + v[s].z * qi.z + v[s].w * qi.w;
+        }
+    }
+    __shared__ float part[32][NV];
+    __shared__ float p[MIX_NQ][S];
+    const unsigned lane = i & 31u, warp = i >> 5, nw = blockDim.x >> 5;
+#pragma unroll
+    for (unsigned k = 0; k < NV; ++k) {
+        const float a = warp_sum(red[k]);
+        if (lane == 0) part[warp][k] = a;
+    }
+    __syncthreads();
+    if (warp < nq) {
+        const unsigned j = warp;
+        float sc = -INFINITY, inv = 0.0f;
+        if (lane < n_states) {
+            float a = 0.0f, b = 0.0f;
+            for (unsigned w = 0; w < nw; ++w) { a += part[w][lane]; b += part[w][S + j * S + lane]; }
+            inv = rsqrtf(a / (float)dim + 1e-6f);
+            sc = b * inv * rsqrtf((float)dim);
+        }
+        const float m = warp_max(sc);
+        const float e = lane < n_states ? expf(sc - m) : 0.0f;
+        const float sum = warp_sum(e);
+        if (lane < S) p[j][lane] = lane < n_states ? e / sum * inv : 0.0f;
+    }
+    __syncthreads();
+    if (!live) return;
+    for (unsigned j = 0; j < nq; ++j) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (unsigned s = 0; s < S; ++s) {
+            const float w = p[j][s];
+            acc.x = fmaf(w, v[s].x, acc.x); acc.y = fmaf(w, v[s].y, acc.y);
+            acc.z = fmaf(w, v[s].z, acc.z); acc.w = fmaf(w, v[s].w, acc.w);
+        }
+        reinterpret_cast<float4*>(out + ((u64)t * nq + j) * dim)[i] = acc;
+    }
+}
+
 // astral_ink_mix fused with the RMSNorm + int8 quantisation that follows it (rms_q8): for query
 // j the mixed row (written to `out` when given) is normalised with weight w[j], stored to y[j]
 // (optional, [t][dim]) and quantised into (xq[j], xd[j], xh[j]) (token-major). Needs

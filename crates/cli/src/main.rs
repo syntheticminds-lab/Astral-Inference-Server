@@ -180,90 +180,17 @@ fn cmd_batch_check(path: &str, n: &str, steps: &str) -> Result<bool> {
     }
     // Reference: each sequence alone (sequence 0, one-token graph).
     let (mut rt, mut rl) = (Vec::new(), Vec::new());
-    // ASTRAL_CHECK_REF=batch: the reference is the one-row batched pass on the same slot.
-    let ref_batch = std::env::var("ASTRAL_CHECK_REF").is_ok_and(|v| v == "batch");
-    for (i, p) in prompts.iter().enumerate() {
-        let mut t;
-        let mut lg;
-        if ref_batch {
-            s.reset_seq(i)?;
-            t = s.prefill_seq(i, 0, p)?;
-            lg = vec![s.logits()?];
-        } else {
-            s.reset()?;
-            t = s.prefill(p)?;
-            lg = vec![s.logits()?];
-        }
-        let mut toks = vec![t];
-        let ref_prefill = std::env::var("ASTRAL_CHECK_REF").is_ok_and(|v| v == "prefill");
-        for k in 1..steps {
-            if ref_prefill {
-                // Teacher-forced: the prompt and the tokens so far through the prefill path.
-                let mut seq_toks = p.clone();
-                seq_toks.extend(&toks);
-                s.reset()?;
-                t = s.prefill(&seq_toks)?;
-                lg.push(s.logits()?);
-            } else if ref_batch {
-                t = s.decode_batch(&[DecodeRow { seq: i, pos: (p.len() + k - 1) as u32, token: t }])?[0];
-                lg.push(s.batch_logits(1)?);
-            } else {
-                t = s.step(t)?;
-                lg.push(s.logits()?);
-            }
+    for p in &prompts {
+        s.reset()?;
+        let mut t = s.prefill(p)?;
+        let (mut toks, mut lg) = (vec![t], vec![s.logits()?]);
+        for _ in 1..steps {
+            t = s.step(t)?;
             toks.push(t);
+            lg.push(s.logits()?);
         }
         rt.push(toks);
         rl.push(lg);
-    }
-    // ASTRAL_CHECK_SLOTS=1: first step of sequence 0, every slot's output, step() vs batch.
-    if std::env::var_os("ASTRAL_CHECK_SLOTS").is_some() {
-        let ci: usize = std::env::var("ASTRAL_CHECK_IDX").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n - 1);
-        let cs: usize = std::env::var("ASTRAL_CHECK_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n - 1);
-        s.reset()?;
-        s.prefill(&prompts[ci])?;
-        let taps = std::env::var_os("ASTRAL_CHECK_TAPS").is_some();
-        s.capture = true;
-        s.set_debug(taps);
-        s.step(rt[ci][0])?;
-        let a = std::mem::take(&mut s.captured);
-        let ta = s.take_debug();
-        s.set_debug(false);
-        let mode = std::env::var("ASTRAL_CHECK_SLOTS").unwrap_or_default();
-        s.reset()?;
-        let pre = |s: &mut Session| -> astral_core::Result<()> {
-            s.set_debug(taps);
-            Ok(())
-        };
-        if mode == "step" {
-            s.prefill(&prompts[ci])?;
-            pre(&mut s)?;
-            s.step(rt[ci][0])?;
-        } else if mode == "seqstep" {
-            s.prefill_seq(cs, 0, &prompts[ci])?;
-            s.pos = prompts[ci].len() as u32;
-            pre(&mut s)?;
-            s.step(rt[ci][0])?;
-        } else if mode == "prefillbatch" {
-            s.prefill(&prompts[ci])?;
-            pre(&mut s)?;
-            s.decode_batch(&[DecodeRow { seq: cs, pos: prompts[ci].len() as u32, token: rt[ci][0] }])?;
-        } else {
-            s.prefill_seq(cs, 0, &prompts[ci])?;
-            pre(&mut s)?;
-            s.decode_batch(&[DecodeRow { seq: cs, pos: prompts[ci].len() as u32, token: rt[ci][0] }])?;
-        }
-        s.capture = false;
-        let tb = s.take_debug();
-        s.set_debug(false);
-        for ((na, va), (_, vb)) in ta.iter().zip(tb.iter()) {
-            let d = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            println!("tap {na}: max |diff| {d:.3e}");
-        }
-        for ((sa, va), (_, vb)) in a.iter().zip(s.captured.iter()) {
-            let d = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            println!("slot {sa:2}: max |diff| {d:.3e}");
-        }
     }
     s.reset()?;
     let mut ok = true;
@@ -278,40 +205,6 @@ fn cmd_batch_check(path: &str, n: &str, steps: &str) -> Result<bool> {
             println!("seq {i}: prefill pick {t} != {}", rt[i][0]);
             ok = false;
         }
-    }
-    // ASTRAL_CHECK_BATCH_SLOTS=i: row i of the first batched step vs its single-sequence step.
-    if let Some(ci) = std::env::var("ASTRAL_CHECK_BATCH_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
-        let ci = ci.min(n - 1);
-        s.reset()?;
-        s.prefill(&prompts[ci])?;
-        let taps = std::env::var_os("ASTRAL_CHECK_TAPS").is_some();
-        s.capture = true;
-        s.set_debug(taps);
-        s.step(rt[ci][0])?;
-        let ta = s.take_debug();
-        s.set_debug(false);
-        let a = std::mem::take(&mut s.captured);
-        for (i, p) in prompts.iter().enumerate() {
-            s.reset_seq(i)?;
-            s.prefill_seq(i, 0, p)?;
-        }
-        s.set_debug(taps);
-        let rows: Vec<DecodeRow> = (0..n).map(|i| DecodeRow { seq: i, pos: prompts[i].len() as u32, token: rt[i][0] }).collect();
-        s.decode_batch(&rows)?;
-        s.capture = false;
-        let tb = s.take_debug();
-        s.set_debug(false);
-        for ((na, va), (_, vb)) in ta.iter().zip(tb.iter()) {
-            let m = va.iter().zip(vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            println!("tap {na}: max |diff| {m:.3e}");
-        }
-        let d = a[0].1.len();
-        for ((sa, va), (_, vb)) in a.iter().zip(s.captured.iter()) {
-            let r = &vb[ci * d..(ci + 1) * d];
-            let m = va.iter().zip(r).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            println!("slot {sa:2}: row {ci} max |diff| {m:.3e}");
-        }
-        return Ok(true);
     }
     let vocab = rl[0][0].len();
     for k in 0..steps - 1 {

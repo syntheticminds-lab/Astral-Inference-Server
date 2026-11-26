@@ -46,6 +46,7 @@ Astral is fast with:
 Astral is flexible and easy to use with:
 
 - An OpenAI-compatible API server: `/v1/completions`, `/v1/chat/completions`, streaming, stop strings, reasoning output and tool calls
+- [Continuous batching](docs/serving/continuous_batching.md) with packed multi-prompt prefill; a request's greedy output is bit-identical alone or batched
 - The checkpoint's own tokenizer and chat template, matching reference token ids exactly
 - Loads native safetensors checkpoints directly, as well as GGUF files
 - A bounded request queue with cancel-on-disconnect

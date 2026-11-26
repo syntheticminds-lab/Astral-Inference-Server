@@ -19,6 +19,9 @@ All notable changes to Astral Inference Server are documented here.
 - Programmatic dependent launch on compute capability 9.0+.
 - Qwen3.8-27B: native 4-bit decode, wgmma prefill on Hopper.
 - Benchmark client and prompt sets (`bench/serving/`).
+- Continuous batching in `astral serve`: one sequence slot per running request, admission between decode steps, packed multi-prompt prefill, per-request stop and eviction, `--max-seqs`. Batched greedy output is bit-identical to single-sequence output (`astral batch-check`).
+- Deterministic prefill: split-K partial sums are added in a fixed order (`ASTRAL_SPLITK=1` restores the atomic split).
+- Rust toolchain pinned to 1.100 (`rust-toolchain.toml`).
 
 ### Performance (H100 PCIe, Inkling 2 Mini, single stream)
 

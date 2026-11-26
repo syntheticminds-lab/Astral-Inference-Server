@@ -224,7 +224,12 @@ impl Loader<'_> {
             Some(st) => Some(astral_quant::dequantize(st.ty, &self.g.read_tensor(st)?, st.n_elements as usize)?),
             None => None,
         };
-        let m = GemvMatrix::upload(self.ctx, ty, n as u32, k as u32, mats as u32, &qs, &aux, scale.as_deref())?;
+        let mut m = GemvMatrix::upload(self.ctx, ty, n as u32, k as u32, mats as u32, &qs, &aux, scale.as_deref())?;
+        // Experts: the prefill fragment layout for the warpgroup-MMA GEMM (a second copy of the
+        // weights; ASTRAL_NO_FRAG=1 to skip it and use the mma.sync prefill kernels).
+        if ty == GemvType::Nvfp4 && mats > 1 && n % 128 == 0 && k % 64 == 0 && std::env::var_os("ASTRAL_NO_FRAG").is_none() {
+            m.add_frag(self.ctx, &qs, &aux)?;
+        }
         self.bytes += m.bytes();
         Ok(m)
     }
@@ -2163,19 +2168,7 @@ fn layer(
         ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
     }
     let pairs = ntok * k as usize;
-    // Decode (one token or a batch): picks grouped by expert on the GPU, then the pipelined int8
-    // tensor-core GEMM, whose per-token results do not depend on the batch.
-    let moe_mma = std::env::var_os("ASTRAL_DECODE_MOE_MMA").is_some() && [&l.gate_up, &l.down].iter().all(|m| matches!(m.ty, GemvType::Q8_0 | GemvType::Nvfp4) && m.mx_scale.is_none() && m.n.is_multiple_of(64) && m.k.is_multiple_of(64));
-    if per_tok && moe_mma {
-        let p32 = pairs as u32;
-        let max_items = ((s.work[1].items.len() / 3) as u32).min((p32.div_ceil(64) + cfg.n_expert as u32).min(p32));
-        let [_, w1, w2] = &mut s.work;
-        ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items)?;
-        let (w1, w2) = (&s.work[1], &s.work[2]);
-        ex.gemv.launch_mma_i8(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32, nt)?;
-        ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
-        ex.gemv.launch_mma_i8(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32, nt)?;
-    } else if ntok == 1 && !prefill {
+    if ntok == 1 && !prefill {
         let ids = s.ids.view(0, k as usize)?;
         ex.gemv.launch_q(st, &l.gate_up, &s.qa[0], &mut s.gu, Some(&ids as &dyn Dev<i32>))?;
         ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, k, cfg.situ_beta, cfg.situ_lb)?;
@@ -2204,9 +2197,19 @@ fn layer(
             let [_, w1, w2] = &mut s.work;
             ex.ops.moe_group(st, &s.ids, p32, k, cfg.n_expert as u32, (&mut w1.items, &mut w1.xidx, &mut w1.yidx), (&mut w2.items, &mut w2.xidx, &mut w2.yidx), max_items)?;
             let (w1, w2) = (&s.work[1], &s.work[2]);
-            ex.gemv.launch_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+            // Experts with a fragment layout: the warpgroup-MMA GEMM (Hopper).
+            let wg = |m: &GemvMatrix| m.frag.is_some() && Gemv::has_wgmma(st);
+            if wg(&l.gate_up) {
+                ex.gemv.launch_mma5(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+            } else {
+                ex.gemv.launch_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &w1.items, max_items, &w1.xidx, &w1.yidx, p32)?;
+            }
             ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
-            ex.gemv.launch_mma(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+            if wg(&l.down) {
+                ex.gemv.launch_mma5(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+            } else {
+                ex.gemv.launch_mma(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &w2.items, max_items, &w2.xidx, &w2.yidx, p32)?;
+            }
         } else {
             // Group the (token, expert) pairs by expert on the host, so each expert's weights are
             // read once per 8 (dp4a) or 64 (tensor cores) of its tokens.

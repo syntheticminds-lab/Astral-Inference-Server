@@ -1233,11 +1233,11 @@ impl InklingOps {
         self.sgemm(s, a.dptr(), 0, lda as u32, lda as u32, w.k, 0, w.qs.device_ptr(), w.k, c.dptr(), w.n, m, w.n, w.k, w.k.next_multiple_of(32), false)
     }
 
-    /// [`InklingOps::gemm_f32`] with K split across blocks when the grid would be small: the
+    /// [`InklingOps::gemm_f32`] with K split across blocks (up to 8 ways, by K alone): the
     /// per-split partials go to `ws` and are summed in a fixed order (deterministic).
     pub fn gemm_f32_ws(&self, s: &Stream, a: &dyn Dev<f32>, lda: usize, w: &GemvMatrix, c: &mut dyn DevMut<f32>, m: u32, ws: &mut dyn DevMut<f32>) -> Result<()> {
-        let tiles = w.n.div_ceil(32) * m.div_ceil(32);
-        let splits = (256u32.div_ceil(tiles)).clamp(1, 8).min(w.k.div_ceil(32));
+        // The split depends on K only, so a row's sum does not depend on how many rows there are.
+        let splits = 8u32.min(w.k.div_ceil(256));
         if splits == 1 || ws.dlen() < (splits * m * w.n) as usize {
             return self.gemm_f32(s, a, lda, w, c, m);
         }

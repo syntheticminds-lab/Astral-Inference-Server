@@ -17,9 +17,10 @@ astral serve <model> [options]
 | `--k <n>` | `6` | Most drafted tokens verified per round (1–7) |
 | `--host <addr>` | `0.0.0.0` | Listen address |
 | `--port <port>` | `8000` | Listen port |
-| `--ctx <n>` | `8192` | Context length in tokens (prompt + output) |
+| `--ctx <n>` | `8192` | Context length in tokens (prompt + output) of each request |
+| `--max-seqs <n>` | as many as fit, up to 64 | Requests decoded together (continuous batching); each reserves `--ctx` positions of KV cache |
 | `--name <id>` | `inkling-2-mini` | Model id reported by `/v1/models` |
-| `--queue <n>` | `64` | Requests that may wait; more get `503` |
+| `--queue <n>` | `64` | Requests that may wait beyond the running ones; more get `503` |
 
 ## Endpoints
 
@@ -44,7 +45,7 @@ astral serve <model> [options]
 | `ignore_eos` | both | Keep generating past the end-of-answer token |
 | `reasoning_effort` | chat | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number in [0, 0.99] |
 | `tools` | chat | Function tools; calls come back in `tool_calls` |
-| `speculative` | both | `false` turns speculative decoding off for this request |
+| `speculative` | both | `false` turns speculative decoding off for this request (see [continuous batching](continuous_batching.md) for when the draft runs) |
 
 ## Responses
 
@@ -54,4 +55,6 @@ Chat responses follow the OpenAI schema. The model's thinking is returned in `me
 
 - Decoding is greedy. `temperature`, `top_p` and `seed` are accepted and ignored.
 - Text input only; image parts are rejected.
-- Requests run one at a time, in arrival order, from a bounded queue. A client that disconnects cancels its request.
+- Requests are batched continuously (up to `--max-seqs` at a time, see [continuous batching](continuous_batching.md)); more wait in a bounded queue. A client that disconnects cancels its request.
+- Each running request reserves a full `--ctx` of KV cache (there is no paged KV pool yet), so `--ctx` and `--max-seqs` trade against each other: 64 requests of 2,048 positions take about 25 GB.
+- The DSpark draft runs only while a request is alone; with other requests running it decodes in the batch without it.

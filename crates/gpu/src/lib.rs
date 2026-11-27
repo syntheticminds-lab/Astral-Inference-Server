@@ -771,6 +771,38 @@ impl Function {
         check("cuFuncSetAttribute", unsafe { (d.fns.cuFuncSetAttribute)(self.raw, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, percent) })
     }
 
+    /// Launches the kernel on `stream` in thread-block clusters of `cluster` blocks.
+    ///
+    /// # Safety
+    /// As [`Function::launch`]; the kernel must be written for clusters of `cluster` blocks and
+    /// the grid divisible by it.
+    pub unsafe fn launch_cluster(&self, cfg: LaunchConfig, cluster: (u32, u32, u32), stream: &Stream, params: &mut [*mut c_void]) -> Result<()> {
+        self.module.ctx.bind()?;
+        let d = drv()?;
+        let mut attrs = [
+            sys::CUlaunchAttribute { id: sys::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION, pad: [0; 4], value: [0; 64] },
+            sys::CUlaunchAttribute { id: sys::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, pad: [0; 4], value: [0; 64] },
+        ];
+        attrs[0].value[..4].copy_from_slice(&cluster.0.to_le_bytes());
+        attrs[0].value[4..8].copy_from_slice(&cluster.1.to_le_bytes());
+        attrs[0].value[8..12].copy_from_slice(&cluster.2.to_le_bytes());
+        attrs[1].value[0] = 1;
+        let lc = sys::CUlaunchConfig {
+            grid_x: cfg.grid.0,
+            grid_y: cfg.grid.1,
+            grid_z: cfg.grid.2,
+            block_x: cfg.block.0,
+            block_y: cfg.block.1,
+            block_z: cfg.block.2,
+            shared_mem_bytes: cfg.shared_mem_bytes,
+            stream: stream.raw,
+            attrs: attrs.as_mut_ptr(),
+            num_attrs: if self.module.ctx.pdl() { 2 } else { 1 },
+        };
+        // SAFETY: the caller guarantees `params` matches the kernel signature (see `launch`).
+        check("cuLaunchKernelEx", unsafe { (d.fns.cuLaunchKernelEx)(&lc, self.raw, params.as_mut_ptr(), std::ptr::null_mut()) })
+    }
+
     /// Launches the kernel asynchronously on `stream`.
     ///
     /// # Safety

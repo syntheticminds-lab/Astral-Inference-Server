@@ -189,6 +189,18 @@ pub struct Weights {
 /// Reorders the rows of each `[n][..]` matrix of `raw` (gate rows then up rows, `n / 2` each)
 /// to the interleaved order: row `16 b + i` is gate row `8 b + i`, row `16 b + 8 + i` up row
 /// `8 b + i`. Rows are whole quantisation blocks, so this is type-agnostic.
+/// The two-block-cluster dense prefill GEMM (`ASTRAL_DENSE_MC=1`; measured no faster).
+fn dense_mc() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_DENSE_MC").is_ok_and(|v| v == "1"))
+}
+
+/// The persistent dense prefill GEMM (`ASTRAL_DENSE_P=0` turns it off).
+fn dense_p() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_DENSE_P").map_or(true, |v| v != "0"))
+}
+
 /// The expert activation in the gate_up GEMM's epilogue (`ASTRAL_FUSE_SITU=0` turns it off).
 fn fuse_situ() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1799,6 +1811,14 @@ fn fast_batch(ntok: usize) -> bool {
 fn mm_tma(ex: &Exec, m: &GemvMatrix, qa: &QAct, y: &mut DeviceBuffer<f32>, ntok: usize, w128: &DevWork, w256: &DevWork) -> Result<()> {
     let (_, tm) = m.w16.as_ref().ok_or_else(|| bad("mm_tma: no f16 copy".into()))?;
     let wide = (m.n as usize / 128) * ntok.div_ceil(256) >= 2 * 132;
+    // The persistent dense GEMM (contiguous tokens; ASTRAL_DENSE_P=0: the per-tile kernel, and
+    // ASTRAL_DENSE_MC=1 the two-block-cluster one).
+    if m.n_mats == 1 && dense_p() {
+        return ex.gemv.launch_gemm_f16_dense(ex.st, tm, m.n, m.k, qa.f16_ptr()?, ntok as u32, y);
+    }
+    if wide && m.n.is_multiple_of(256) && m.n_mats == 1 && dense_mc() {
+        return ex.gemv.launch_gemm_f16_mc(ex.st, tm, m.n, m.k, qa.f16_ptr()?, ntok as u32, y);
+    }
     let (w, tile) = if wide { (w256, 256) } else { (w128, 128) };
     let n = ntok as u32;
     ex.gemv.launch_gemm_f16_tma(ex.st, tile, tm, m.n, m.k, 1, None, qa.f16_ptr()?, n, y, n, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)

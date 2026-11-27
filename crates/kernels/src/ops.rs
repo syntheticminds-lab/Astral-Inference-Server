@@ -458,6 +458,12 @@ pub struct Gemv {
     /// Tiles 128, 64, 32 (256 rows), 256 (128 rows x 256 tokens) and 128 with two blocks per
     /// SM (128 rows, 256 threads).
     ws256: [Function; 5],
+    /// Dense prefill GEMM in two-block clusters (activation multicast).
+    gemm_mc: Function,
+    /// Persistent dense prefill GEMM (contiguous tokens, TMA for both operands).
+    gemm_dense_p: Function,
+    /// Persistent dense TMA GEMMs (tiles 128, 256).
+    gemm_tma_p: [Function; 2],
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
     rows_t: [Function; 2],
     /// Tensor-core multi-matrix Q8_0 GEMV for 9..=64 tokens (2, 4, 8 tiles of 8).
@@ -518,6 +524,8 @@ impl MmaWork {
 const WGMMA2_SMEM: u32 = 5 * 21504;
 /// Dynamic shared memory of `astral_gemm_nvfp4_ws256`: 5 stages of 25 KB.
 const WS256_SMEM: u32 = 5 * 25600;
+/// Dynamic shared memory of `astral_gemm_f16_mc`: 4 stages of 128 x 64 weights + 256 x 64 activations.
+const GEMM_MC_SMEM: u32 = 4 * (128 * 64 * 2 + 256 * 64 * 2);
 /// Bytes of one pipeline stage of the 256-token ws256 variant: activations 256 x 64 f16, 8 row
 /// tiles of fragments and their scales, rounded to 1 KB (`FWStage<256, 1>`).
 /// One stage of the two-blocks-per-SM variant (`FWStage<128, 4>`: 64 weight rows).
@@ -534,6 +542,11 @@ const Q_TILED_SMEM: u32 = 3 * 19968;
 /// Dynamic shared memory of `astral_gemm_f16_tma`: 6 stages of 32 KB (or, with 256-token
 /// tiles, 4 of 48 KB).
 const GEMM_TMA_SMEM: u32 = 6 * 32768;
+
+fn tma_persist() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_TMA_PERSIST").is_ok_and(|v| v == "1"))
+}
 /// Dynamic shared memory of `astral_gemm_f16_wgmma`: 3 stages of 32 KB.
 const WGMMA_F16_SMEM: u32 = 3 * 32768;
 
@@ -712,6 +725,23 @@ impl Gemv {
                 let _ = d.set_max_dynamic_shared(5 * WS_T256_STAGE);
                 let _ = e.set_max_dynamic_shared(5 * WS_X2_STAGE);
                 [a, b, c, d, e]
+            },
+            gemm_tma_p: {
+                let a = f("astral_gemm_f16_tma_p")?;
+                let b = f("astral_gemm_f16_tma_t256_p")?;
+                let _ = a.set_max_dynamic_shared(GEMM_TMA_SMEM);
+                let _ = b.set_max_dynamic_shared(GEMM_TMA_SMEM);
+                [a, b]
+            },
+            gemm_dense_p: {
+                let k = f("astral_gemm_f16_dense_p")?;
+                let _ = k.set_max_dynamic_shared(GEMM_MC_SMEM);
+                k
+            },
+            gemm_mc: {
+                let k = f("astral_gemm_f16_mc")?;
+                let _ = k.set_max_dynamic_shared(GEMM_MC_SMEM);
+                k
             },
             gemm_tma: {
                 let a = f("astral_gemm_f16_tma")?;
@@ -1543,6 +1573,44 @@ impl Gemv {
         unsafe { self.wgmma_f16.launch(cfg, stream, &mut params) }
     }
 
+    /// Dense prefill product `y[t][n] = x[t] . w[n]` for `ntok` contiguous f16 token rows `xh`
+    /// (row stride k) on the persistent TMA GEMM (one block per SM, 128 x 256 output tiles).
+    pub fn launch_gemm_f16_dense(&self, stream: &Stream, w: &astral_gpu::TensorMap, n: u32, k: u32, xh: DevicePtr, ntok: u32, y: &mut dyn DevMut<f32>) -> Result<()> {
+        if !n.is_multiple_of(128) || !k.is_multiple_of(64) || ntok == 0 || y.dlen() < ntok as usize * n as usize {
+            return Err(invalid(format!("launch_gemm_f16_dense: n {n} k {k} tokens {ntok}")));
+        }
+        static SMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let sms = *SMS.get_or_init(|| stream.context().device().attribute(astral_gpu::attr::MULTIPROCESSOR_COUNT).map_or(132, |v| v.max(1) as u32));
+        let mut tw = *w;
+        let mut tx = astral_gpu::TensorMap::f16_2d_sw128(xh, ntok as u64, k as u64, 128, 64)?;
+        let (mut py, mut nn, mut kk, mut nt) = (y.dptr(), n, k, ntok);
+        let mut params = [param(&mut tw), param(&mut tx), param(&mut py), param(&mut nn), param(&mut kk), param(&mut nt)];
+        let tiles = (n / 128) * ntok.div_ceil(256);
+        let cfg = LaunchConfig { grid: (tiles.min(sms), 1, 1), block: (288, 1, 1), shared_mem_bytes: GEMM_MC_SMEM };
+        // SAFETY: params match astral_gemm_f16_dense_p (two tensor maps by value, y, n, k, ntok);
+        // the tensor maps bound every read (token rows past ntok read as zero) and the kernel
+        // writes only rows < ntok of y, which holds them (checked).
+        unsafe { self.gemm_dense_p.launch(cfg, stream, &mut params) }
+    }
+
+    /// Dense prefill product `y[t][n] = x[t] . w[n]` for `ntok` contiguous f16 token rows `xh`
+    /// (row stride k) on the two-block-cluster TMA GEMM (activation tiles multicast across the
+    /// cluster): `w` is the weights' tensor map, `n / 128` must be even.
+    pub fn launch_gemm_f16_mc(&self, stream: &Stream, w: &astral_gpu::TensorMap, n: u32, k: u32, xh: DevicePtr, ntok: u32, y: &mut dyn DevMut<f32>) -> Result<()> {
+        if !n.is_multiple_of(256) || !k.is_multiple_of(64) || ntok == 0 || y.dlen() < ntok as usize * n as usize {
+            return Err(invalid(format!("launch_gemm_f16_mc: n {n} k {k} tokens {ntok}")));
+        }
+        let mut tw = *w;
+        let mut tx = astral_gpu::TensorMap::f16_2d_sw128(xh, ntok as u64, k as u64, 128, 64)?;
+        let (mut py, mut nn, mut kk, mut nt) = (y.dptr(), n, k, ntok);
+        let mut params = [param(&mut tw), param(&mut tx), param(&mut py), param(&mut nn), param(&mut kk), param(&mut nt)];
+        let cfg = LaunchConfig { grid: (n / 128, ntok.div_ceil(256), 1), block: (384, 1, 1), shared_mem_bytes: GEMM_MC_SMEM };
+        // SAFETY: params match astral_gemm_f16_mc (two tensor maps by value, y, n, k, ntok); the
+        // tensor maps bound every read (rows past ntok read as zero), the kernel writes rows < ntok
+        // of y (checked to hold them); grid.x is even for the 2-block clusters.
+        unsafe { self.gemm_mc.launch_cluster(cfg, (2, 1, 1), stream, &mut params) }
+    }
+
     /// Grouped f16 GEMM on Hopper with TMA-loaded weights: `y[yidx[j]] = mat_scale[e] W_e
     /// x[xidx[j]]` for the tokens `j` of each item (`items`: 3 words per item, `(e, start,
     /// count <= 128)`). `w` is the tensor map of the row-major f16 weights of all `n_mats`
@@ -1610,6 +1678,28 @@ impl Gemv {
             param(&mut nm),
             param(&mut kcps),
         ];
+        // ASTRAL_TMA_PERSIST=1, one split: the persistent kernel, one block per SM (spills at
+        // 384 threads and measured slower; dense rows use launch_gemm_f16_dense instead).
+        if splits == 1 && tma_persist() {
+            static SMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let sms = match SMS.get() {
+                Some(&v) => v,
+                None => *SMS.get_or_init(|| stream.context().device().attribute(astral_gpu::attr::MULTIPROCESSOR_COUNT).map_or(132, |v| v.max(1) as u32)),
+            };
+            let tiles = (n / 128) * n_items;
+            let mut ni = n_items;
+            let [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, _] = params;
+            let mut pp = [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, param(&mut ni)];
+            let f = match tile {
+                128 => &self.gemm_tma_p[0],
+                256 => &self.gemm_tma_p[1],
+                _ => return Err(invalid(format!("launch_gemm_f16_tma: tile {tile}"))),
+            };
+            let cfg = LaunchConfig { grid: (tiles.min(sms), 1, 1), block: (384, 1, 1), shared_mem_bytes: GEMM_TMA_SMEM };
+            // SAFETY: as below; the persistent kernel takes the item count in place of the
+            // split size and walks every (row tile, item) pair.
+            return unsafe { f.launch(cfg, stream, &mut pp) };
+        }
         let cfg = LaunchConfig { grid: (n / 128, n_items, splits), block: (384, 1, 1), shared_mem_bytes: GEMM_TMA_SMEM };
         // SAFETY: params match astral_gemm_f16_tma; the tensor map covers n_mats * n rows of k
         // (built by the caller for these weights), the activations hold x_rows rows of k

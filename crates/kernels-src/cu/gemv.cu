@@ -2911,6 +2911,140 @@ __device__ __forceinline__ void gemm_f16_tma(
     __trap();
 #endif
 }
+// Persistent form of gemm_f16_tma (one K split): grid = SM count, each block walks the
+// (row tile, item) pairs tile = blockIdx.x, + gridDim.x, ... (row tile fastest). The stage
+// ring and its barrier phases run on across tiles, so the loader fills the next tile's stages
+// while the consumers write the previous tile's outputs.
+template <unsigned BT>
+__device__ __forceinline__ void gemm_f16_tma_persist(
+    const CUtensorMapStub& tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
+    const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned n_items) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    extern __shared__ __align__(1024) unsigned char tfsmem[];
+    constexpr unsigned STAGES = BT == 256 ? 4u : TF_STAGES;
+    constexpr unsigned STAGE_BYTES = 128u * 64u * 2u + BT * 64u * 2u;
+    unsigned char* smb = tfsmem;
+    __shared__ __align__(8) unsigned long long full[6], empty[6];
+    const unsigned tid = threadIdx.x, wg = tid >> 7;
+    const unsigned KC = K / 64u, ntn = N / 128u, n_tiles = ntn * n_items;
+    if (tid == 0) {
+        for (unsigned s = 0; s < STAGES; ++s) {
+            tf_mbar_init(&full[s], 129);
+            tf_mbar_init(&empty[s], 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+    // An item's tokens: [start, start + count); count 0 marks an unused item (skipped by both
+    // roles alike, so their stage counters stay in step).
+    auto item_of = [&](unsigned tile, unsigned& e, unsigned& start, unsigned& count) {
+        const unsigned* it = items + 3u * (tile / ntn);
+        e = min(it[0], n_mats - 1u);
+        start = min(it[1], idx_len);
+        count = min(min(it[2], BT), idx_len - start);
+    };
+    if (wg == 0) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
+        const unsigned lt = tid;
+        constexpr unsigned PER = BT * 8u / 128u;
+        unsigned g = 0;   // stages issued so far
+        for (unsigned tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+            unsigned e, start, count;
+            item_of(tile, e, start, count);
+            if (count == 0) continue;
+            const unsigned row0 = (tile % ntn) * 128u;
+            const int wrow = (int)(e * N + row0);
+            const __half* src[PER];
+            unsigned dst[PER];
+#pragma unroll
+            for (unsigned q = 0; q < PER; ++q) {
+                const unsigned c = lt + q * 128u, j = c >> 3, part = c & 7u;
+                src[q] = xh + (u64)min(xidx[start + min(j, count - 1u)], x_rows - 1u) * K + part * 8u;
+                dst[q] = j * 64u + ((part ^ (j & 7u)) * 8u);
+            }
+            for (unsigned i = 0; i < KC; ++i, ++g) {
+                const unsigned s = g % STAGES;
+                if (g >= STAGES) tf_mbar_wait(&empty[s], ((g / STAGES) - 1u) & 1u);
+                __half* sa = reinterpret_cast<__half*>(smb + s * STAGE_BYTES);
+                __half* sbb = sa + 128u * 64u;
+                if (lt == 0) {
+                    tf_mbar_expect_tx(&full[s], 128u * 64u * 2u);
+                    tf_tma_2d(sa, &tw, (int)(i * 64u), wrow, &full[s]);
+                }
+                const unsigned k0 = i * 64u;
+#pragma unroll
+                for (unsigned q = 0; q < PER; ++q) cp_async16(sbb + dst[q], src[q] + k0);
+                tf_mbar_cp_async_arrive(&full[s]);
+            }
+        }
+        return;
+    }
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
+    const unsigned ct = tid - 128u, cw = ct >> 7, warp = ct >> 5, lane = ct & 31u, t = lane & 3u, g4 = lane >> 2;
+    constexpr unsigned ND = BT / 2u;
+    unsigned g = 0;   // stages consumed so far
+    for (unsigned tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+        unsigned e, start, count;
+        item_of(tile, e, start, count);
+        if (count == 0) continue;
+        const unsigned row0 = (tile % ntn) * 128u;
+        float d[ND];
+#pragma unroll
+        for (unsigned i = 0; i < ND; ++i) d[i] = 0.0f;
+        for (unsigned i = 0; i < KC; ++i, ++g) {
+            const unsigned s = g % STAGES;
+            tf_mbar_wait(&full[s], (g / STAGES) & 1u);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            const __half* sa = reinterpret_cast<const __half*>(smb + s * STAGE_BYTES);
+            const unsigned long long da = wgmma_desc(sa + cw * 64u * 64u), db = wgmma_desc(sa + 128u * 64u);
+            asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+            for (unsigned ks = 0; ks < 4; ++ks) {
+                if constexpr (BT == 256) wgmma_ss_m64n256k16(d, da + (unsigned long long)(ks * 2u), db + (unsigned long long)(ks * 2u));
+                else wgmma_ss_m64n128k16(d, da + (unsigned long long)(ks * 2u), db + (unsigned long long)(ks * 2u));
+            }
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+            if (i > 0) {
+                __syncwarp();
+                if (lane == 0) tf_mbar_arrive(&empty[(g - 1u) % STAGES]);
+            }
+        }
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        // Release the tile's last stage before the epilogue: the loader is already filling
+        // the next tile.
+        __syncwarp();
+        if (lane == 0) tf_mbar_arrive(&empty[(g - 1u) % STAGES]);
+        const float ms = mat_scale ? mat_scale[e] : 1.0f;
+        const unsigned r_lo = row0 + warp * 16u + g4, r_hi = r_lo + 8u;
+#pragma unroll
+        for (unsigned nt = 0; nt < BT / 8u; ++nt) {
+            const unsigned j0 = nt * 8u + 2u * t, j1 = j0 + 1u;
+            if (j0 < count) {
+                float* yr = y + (u64)min(yidx[start + j0], y_rows - 1u) * N;
+                yr[r_lo] = d[4 * nt] * ms;
+                yr[r_hi] = d[4 * nt + 2] * ms;
+            }
+            if (j1 < count) {
+                float* yr = y + (u64)min(yidx[start + j1], y_rows - 1u) * N;
+                yr[r_lo] = d[4 * nt + 1] * ms;
+                yr[r_hi] = d[4 * nt + 3] * ms;
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma_p(
+    const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
+    const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned n_items) { PDL_WAIT(); gemm_f16_tma_persist<128>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, n_items); }
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma_t256_p(
+    const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
+    const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
+    unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned n_items) { PDL_WAIT(); gemm_f16_tma_persist<256>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, n_items); }
 extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma(
     const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
@@ -2919,6 +3053,215 @@ extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_tma_t256(
     const __grid_constant__ CUtensorMapStub tw, const __half* __restrict__ xh, float* __restrict__ y, unsigned N, unsigned K,
     const unsigned* __restrict__ items, const unsigned* __restrict__ xidx, const unsigned* __restrict__ yidx, unsigned idx_len,
     unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale, unsigned n_mats, unsigned kc_per_split) { PDL_WAIT(); gemm_f16_tma<256>(tw, xh, y, N, K, items, xidx, yidx, idx_len, x_rows, y_rows, mat_scale, n_mats, kc_per_split); }
+
+// Dense prefill GEMM y[t][n] = sum_k x[t][k] w[n][k] (f16 in, f32 out) for contiguous token
+// rows, in clusters of two blocks along N: both blocks of a cluster need the same 256-token
+// activation tile, so each loads half of it by TMA and multicasts it to both, halving the
+// activation traffic through L2 (the bound of the unclustered kernel). Weights by TMA too.
+// Block = 128 weight rows x 256 tokens; warpgroup 0 is the loader (one thread), warpgroups 1
+// and 2 each m64n256 over 64 rows. A stage is free again only when the consumers of both
+// blocks have released it (each consumer warp arrives on its own and its peer's barrier).
+// grid = (N / 128 (even), ceil(ntok / 256)), cluster (2, 1, 1), 384 threads.
+#define MC_STAGES 4
+#define MC_STAGE_BYTES (128u * 64u * 2u + 256u * 64u * 2u)
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+__device__ __forceinline__ unsigned mc_rank() {
+    unsigned r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(r));
+    return r;
+}
+__device__ __forceinline__ void mc_cluster_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+}
+__device__ __forceinline__ void mc_arrive_peer(unsigned long long* b, unsigned peer) {
+    unsigned remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(remote) : "r"((unsigned)__cvta_generic_to_shared(b)), "r"(peer));
+    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];\n" :: "r"(remote) : "memory");
+}
+__device__ __forceinline__ void mc_wait_cluster(unsigned long long* b, unsigned parity) {
+    asm volatile("{\n .reg .pred p;\n MCW_%=:\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n @!p bra MCW_%=;\n}\n"
+                 :: "r"((unsigned)__cvta_generic_to_shared(b)), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void mc_tma_2d_multicast(void* dst, const void* tmap, int c0, int c1, unsigned long long* bar, unsigned short mask) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1, {%2, %3}], [%4], %5;\n"
+                 :: "r"((unsigned)__cvta_generic_to_shared(dst)), "l"(tmap), "r"(c0), "r"(c1), "r"((unsigned)__cvta_generic_to_shared(bar)), "h"(mask)
+                 : "memory");
+}
+#endif
+extern "C" __global__ void __launch_bounds__(384, 1) astral_gemm_f16_mc(
+    const __grid_constant__ CUtensorMapStub tw, const __grid_constant__ CUtensorMapStub tx, float* __restrict__ y, unsigned N, unsigned K,
+    unsigned ntok) { PDL_WAIT();
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    extern __shared__ __align__(1024) unsigned char mcsmem[];
+    __shared__ __align__(8) unsigned long long full[MC_STAGES], empty[MC_STAGES];
+    const unsigned tid = threadIdx.x, wg = tid >> 7, rank = mc_rank(), peer = rank ^ 1u;
+    const unsigned row0 = blockIdx.x * 128u, t0 = blockIdx.y * 256u;
+    const unsigned KC = K / 64u;
+    if (tid == 0) {
+        for (unsigned s = 0; s < MC_STAGES; ++s) {
+            tf_mbar_init(&full[s], 1);     // the loader's expect_tx arrival
+            tf_mbar_init(&empty[s], 16);   // the 8 consumer warps of each block of the cluster
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+    mc_cluster_sync();   // the peer's barriers exist before anything signals them
+
+    if (wg == 0) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
+        if (tid == 0) {
+            for (unsigned i = 0; i < KC; ++i) {
+                const unsigned s = i % MC_STAGES;
+                if (i >= MC_STAGES) mc_wait_cluster(&empty[s], ((i / MC_STAGES) - 1u) & 1u);
+                unsigned char* st = mcsmem + s * MC_STAGE_BYTES;
+                tf_mbar_expect_tx(&full[s], MC_STAGE_BYTES);
+                tf_tma_2d(st, &tw, (int)(i * 64u), (int)row0, &full[s]);
+                // This block's half of the activation tile, into both blocks.
+                mc_tma_2d_multicast(st + 128u * 64u * 2u + rank * 128u * 64u * 2u, &tx, (int)(i * 64u), (int)(t0 + rank * 128u), &full[s], (unsigned short)3);
+            }
+        }
+    } else {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
+        const unsigned ct = tid - 128u, cw = ct >> 7, warp = ct >> 5, lane = ct & 31u, t = lane & 3u, g = lane >> 2;
+        float d[128];
+#pragma unroll
+        for (unsigned i = 0; i < 128; ++i) d[i] = 0.0f;
+        for (unsigned i = 0; i < KC; ++i) {
+            const unsigned s = i % MC_STAGES;
+            tf_mbar_wait(&full[s], (i / MC_STAGES) & 1u);
+            const __half* sa = reinterpret_cast<const __half*>(mcsmem + s * MC_STAGE_BYTES);
+            const unsigned long long da = wgmma_desc(sa + cw * 64u * 64u), db = wgmma_desc(sa + 128u * 64u);
+            asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+            for (unsigned ks = 0; ks < 4; ++ks) wgmma_ss_m64n256k16(d, da + (unsigned long long)(ks * 2u), db + (unsigned long long)(ks * 2u));
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+            if (i > 0) {
+                __syncwarp();
+                if (lane == 0) {
+                    const unsigned sp = (i - 1u) % MC_STAGES;
+                    tf_mbar_arrive(&empty[sp]);
+                    mc_arrive_peer(&empty[sp], peer);
+                }
+            }
+        }
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        // Release the last stage too, so the peer's loader (which may still be waiting to reuse
+        // it) never blocks; then write this warp's outputs.
+        __syncwarp();
+        if (lane == 0 && KC > 0) {
+            const unsigned sp = (KC - 1u) % MC_STAGES;
+            tf_mbar_arrive(&empty[sp]);
+            mc_arrive_peer(&empty[sp], peer);
+        }
+        const unsigned r_lo = row0 + cw * 64u + (warp & 3u) * 16u + g, r_hi = r_lo + 8u;
+#pragma unroll
+        for (unsigned nt = 0; nt < 32u; ++nt) {
+            const unsigned j0 = t0 + nt * 8u + 2u * t, j1 = j0 + 1u;
+            if (j0 < ntok) {
+                float* yr = y + (u64)j0 * N;
+                yr[r_lo] = d[4 * nt];
+                yr[r_hi] = d[4 * nt + 2];
+            }
+            if (j1 < ntok) {
+                float* yr = y + (u64)j1 * N;
+                yr[r_lo] = d[4 * nt + 1];
+                yr[r_hi] = d[4 * nt + 3];
+            }
+        }
+    }
+    __syncwarp();
+    mc_cluster_sync();   // no block exits while its peer may still signal or write into it
+#else
+    __trap();
+#endif
+}
+
+// Dense prefill GEMM y[t][n] = x[t] . w[n] (f16 in, f32 out) over contiguous token rows,
+// persistent: grid = SM count, each block walks the (128-row, 256-token) output tiles
+// blockIdx.x, + gridDim.x, ... Warps 0-7 (two warpgroups, m64n256 each) compute; warp 8 is
+// the loader: one thread issues the weight and activation TMA copies into a 4-stage ring
+// whose phases run on across tiles, so the next tile's loads overlap this tile's epilogue.
+// 288 threads leave the consumers 224 registers each without setmaxnreg.
+extern "C" __global__ void __launch_bounds__(288, 1) astral_gemm_f16_dense_p(
+    const __grid_constant__ CUtensorMapStub tw, const __grid_constant__ CUtensorMapStub tx, float* __restrict__ y, unsigned N, unsigned K,
+    unsigned ntok) { PDL_WAIT();
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    extern __shared__ __align__(1024) unsigned char dpsmem[];
+    __shared__ __align__(8) unsigned long long full[MC_STAGES], empty[MC_STAGES];
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+    const unsigned KC = K / 64u, ntn = N / 128u, n_tiles = ntn * ((ntok + 255u) / 256u);
+    if (tid == 0) {
+        for (unsigned s = 0; s < MC_STAGES; ++s) {
+            tf_mbar_init(&full[s], 1);
+            tf_mbar_init(&empty[s], 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+    if (warp == 8) {
+        if (lane == 0) {
+            unsigned g = 0;
+            for (unsigned tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+                const int row0 = (int)((tile % ntn) * 128u), t0 = (int)((tile / ntn) * 256u);
+                for (unsigned i = 0; i < KC; ++i, ++g) {
+                    const unsigned s = g % MC_STAGES;
+                    if (g >= MC_STAGES) tf_mbar_wait(&empty[s], ((g / MC_STAGES) - 1u) & 1u);
+                    unsigned char* st = dpsmem + s * MC_STAGE_BYTES;
+                    tf_mbar_expect_tx(&full[s], MC_STAGE_BYTES);
+                    tf_tma_2d(st, &tw, (int)(i * 64u), row0, &full[s]);
+                    tf_tma_2d(st + 128u * 64u * 2u, &tx, (int)(i * 64u), t0, &full[s]);
+                    tf_tma_2d(st + 128u * 64u * 2u + 128u * 64u * 2u, &tx, (int)(i * 64u), t0 + 128, &full[s]);
+                }
+            }
+        }
+        return;
+    }
+    const unsigned cw = warp >> 2, t = lane & 3u, g4 = lane >> 2;
+    unsigned g = 0;
+    for (unsigned tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+        const unsigned row0 = (tile % ntn) * 128u, t0 = (tile / ntn) * 256u;
+        float d[128];
+#pragma unroll
+        for (unsigned i = 0; i < 128; ++i) d[i] = 0.0f;
+        for (unsigned i = 0; i < KC; ++i, ++g) {
+            const unsigned s = g % MC_STAGES;
+            tf_mbar_wait(&full[s], (g / MC_STAGES) & 1u);
+            const __half* sa = reinterpret_cast<const __half*>(dpsmem + s * MC_STAGE_BYTES);
+            const unsigned long long da = wgmma_desc(sa + cw * 64u * 64u), db = wgmma_desc(sa + 128u * 64u);
+            asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+            for (unsigned ks = 0; ks < 4; ++ks) wgmma_ss_m64n256k16(d, da + (unsigned long long)(ks * 2u), db + (unsigned long long)(ks * 2u));
+            asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+            asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+            if (i > 0) {
+                __syncwarp();
+                if (lane == 0) tf_mbar_arrive(&empty[(g - 1u) % MC_STAGES]);
+            }
+        }
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        __syncwarp();
+        if (lane == 0) tf_mbar_arrive(&empty[(g - 1u) % MC_STAGES]);
+        const unsigned r_lo = row0 + warp * 16u + g4, r_hi = r_lo + 8u;
+#pragma unroll
+        for (unsigned nt = 0; nt < 32u; ++nt) {
+            const unsigned j0 = t0 + nt * 8u + 2u * t, j1 = j0 + 1u;
+            if (j0 < ntok) {
+                float* yr = y + (u64)j0 * N;
+                yr[r_lo] = d[4 * nt];
+                yr[r_hi] = d[4 * nt + 2];
+            }
+            if (j1 < ntok) {
+                float* yr = y + (u64)j1 * N;
+                yr[r_lo] = d[4 * nt + 1];
+                yr[r_hi] = d[4 * nt + 3];
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
 
 // =============================================================================================
 // NVFP4 expert GEMM for prefill, warp-specialised with 256-row blocks (fragment layout, as

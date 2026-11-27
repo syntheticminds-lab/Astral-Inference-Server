@@ -95,7 +95,8 @@ main() {
             ;;
     esac
     echo
-    echo "Start serving with: astral serve /path/to/Inkling-2-Mini/"
+    echo "Start serving Inkling 2 Mini (downloaded on first use) with:"
+    echo "  astral serve thinkingmachines/Inkling-2-Mini"
 }
 
 # nvcc compiles the kernels. Look on PATH, then in the usual CUDA install locations.

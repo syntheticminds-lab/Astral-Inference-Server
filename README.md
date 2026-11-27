@@ -16,7 +16,7 @@ Fast, lean LLM inference and serving in Rust and CUDA
 | <a href="https://www.syntheticmindslab.com/astral"><b>Website</b></a> | <a href="docs/README.md"><b>Documentation</b></a> | <a href="docs/getting_started/quickstart.md"><b>Quickstart</b></a> | <a href="docs/benchmarks/inkling2_mini.md"><b>Benchmarks</b></a> | <a href="docs/models/supported_models.md"><b>Supported Models</b></a> | <a href="CONTRIBUTING.md"><b>Contributing</b></a> |
 </p>
 
-## Astral Inference Server Version: {version number}
+## Astral Inference Server Version: 2.6
 
 Astral now runs Inkling 2 Mini directly from its native safetensors checkpoint, with the model's own MTP draft and a new set of custom CUDA kernels. Tested on a GH200 against vLLM on the same model, **Astral is 54% faster** than vLLM with MTP enabled; vLLM without a draft is slower still.
 
@@ -28,7 +28,7 @@ Astral now runs Inkling 2 Mini directly from its native safetensors checkpoint, 
 Single-stream decode, 512-token prompts and 128 output tokens, through each engine's OpenAI-compatible server.
 
 
-> **Status:** Version 2.5 is now open source and ready for testing.
+> **Status:** Version 2.6 is open source and ready for testing.
 
 ---
 

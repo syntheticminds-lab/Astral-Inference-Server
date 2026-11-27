@@ -2,7 +2,7 @@
 
 All notable changes to Astral Inference Server are documented here.
 
-## [Unreleased]
+## [2.6]
 
 ### Changed
 

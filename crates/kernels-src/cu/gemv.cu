@@ -2349,6 +2349,18 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_items_x(
     }
 }
 
+// The SITU activation (situ_act in inkling.cu) with the hardware tanh and exp approximations
+// (relative error about 2^-11, the f16 rounding the result gets anyway).
+__device__ __forceinline__ float tanh_fast(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float situ_act(float g, float u, float beta, float lb) {
+    const float a = beta * tanh_fast(g * (1.0f / beta)) * __frcp_rn(1.0f + __expf(-g));
+    return a * (lb > 0.0f ? lb * tanh_fast(u * (1.0f / lb)) : u);
+}
+
 // =============================================================================================
 // Batched decode GEMMs on tensor cores. A work item (QItem) is one matrix and up to 8 activation
 // rows: the 8 columns of an m16n8 tile. A block is 4 warps x 16 weight rows, and streams its
@@ -2363,7 +2375,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_items_x(
 extern "C" __global__ void __launch_bounds__(512) astral_gemv_nvfp4_frag_items(
     const u8* __restrict__ frag, const u8* __restrict__ fscale, const __half* __restrict__ xh, float* __restrict__ y, unsigned N,
     unsigned K, const QItem* __restrict__ items, unsigned x_rows, unsigned y_rows, const float* __restrict__ mat_scale,
-    unsigned n_mats) { PDL_WAIT();
+    unsigned n_mats, __half* __restrict__ act, float beta, float lb) { PDL_WAIT();
     const QItem* itp = items + blockIdx.x;
     const unsigned cnt = min(itp->n, (unsigned)NB);
     if (cnt == 0u) return;
@@ -2433,6 +2445,14 @@ extern "C" __global__ void __launch_bounds__(512) astral_gemv_nvfp4_frag_items(
     const float ms = (mat_scale ? mat_scale[e] : 1.0f) * 16384.0f;
     const unsigned r_lo = tile * 16u + g, r_hi = r_lo + 8u;
     const unsigned j0 = 2u * t, j1 = j0 + 1u;
+    if (act) {
+        // Fused SITU (gate_up rows interleaved by eight: r_lo is channel tile * 8 + g's gate,
+        // r_hi its up): f16 activations act[yrow][N / 2] for the down projection.
+        const unsigned nff = N / 2u, c = tile * 8u + g;
+        if (j0 < cnt) act[(u64)min(itp->yi[j0], y_rows - 1u) * nff + c] = __float2half_rn(situ_act(acc[0] * ms, acc[2] * ms, beta, lb));
+        if (j1 < cnt) act[(u64)min(itp->yi[j1], y_rows - 1u) * nff + c] = __float2half_rn(situ_act(acc[1] * ms, acc[3] * ms, beta, lb));
+        return;
+    }
     if (j0 < cnt) {
         float* yr = y + (u64)min(itp->yi[j0], y_rows - 1u) * N;
         yr[r_lo] = acc[0] * ms;
@@ -3349,17 +3369,6 @@ __device__ __forceinline__ void wgmma_m64n32k16(float (&d)[16], const unsigned (
 }
 #endif
 #define FW_STAGES 5
-// The SITU activation (situ_act in inkling.cu) with the hardware tanh and exp approximations
-// (relative error about 2^-11, the f16 rounding the result gets anyway).
-__device__ __forceinline__ float tanh_fast(float x) {
-    float y;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-__device__ __forceinline__ float situ_act(float g, float u, float beta, float lb) {
-    const float a = beta * tanh_fast(g * (1.0f / beta)) * __frcp_rn(1.0f + __expf(-g));
-    return a * (lb > 0.0f ? lb * tanh_fast(u * (1.0f / lb)) : u);
-}
 template <unsigned BT, unsigned TILES = 16>
 struct __align__(1024) FWStage {
     __half b[BT * 64];        // activations, 128-byte swizzle (BT * 128 bytes)

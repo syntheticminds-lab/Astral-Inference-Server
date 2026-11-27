@@ -1464,6 +1464,17 @@ impl Gemv {
     /// not bit-identical to [`Gemv::launch_q`]; see [`Gemv::launch_items_exact`] for that.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_items_mma(&self, stream: &Stream, m: &GemvMatrix, x: &QAct, x_rows: u32, y: &mut dyn DevMut<f32>, y_rows: u32, items: &DeviceBuffer<u32>, n_items: u32) -> Result<()> {
+        self.launch_items_mma_act(stream, m, x, x_rows, y, y_rows, items, n_items, None)
+    }
+
+    /// [`Gemv::launch_items_mma`] with, for NVFP4 gate_up matrices (rows interleaved by eight),
+    /// the SITU activation applied in the epilogue: `situ = (out, beta, lb)` writes f16
+    /// activations `[y_rows][n / 2]` into `out`'s f16 plane instead of `y`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_items_mma_act(&self, stream: &Stream, m: &GemvMatrix, x: &QAct, x_rows: u32, y: &mut dyn DevMut<f32>, y_rows: u32, items: &DeviceBuffer<u32>, n_items: u32, situ: Option<(&mut QAct, f32, f32)>) -> Result<()> {
+        if situ.is_some() && m.ty != GemvType::Nvfp4 {
+            return Err(invalid("launch_items_mma_act: fused SITU needs NVFP4 weights".into()));
+        }
         if m.k != x.k || x_rows == 0 || x_rows > x.max_slots || n_items == 0 || m.mx_scale.is_some() {
             return Err(invalid(format!("launch_items_mma: {:?} matrix k {} for activations k {} x {x_rows}", m.ty, m.k, x.k)));
         }
@@ -1513,6 +1524,14 @@ impl Gemv {
                     return Err(invalid(format!("launch_items_mma: NVFP4 k {}", m.k)));
                 }
                 let (mut pq, mut pa, mut ph, mut py) = (fq.device_ptr(), fs.device_ptr(), h.device_ptr(), y.dptr());
+                let (mut pact, mut beta, mut lb) = (0u64, 0f32, 0f32);
+                if let Some((a, b, l)) = situ {
+                    if a.k * 2 != m.n || a.max_slots < y_rows {
+                        return Err(invalid(format!("launch_items_mma_act: SITU output k {} for n {}", a.k, m.n)));
+                    }
+                    pact = a.f16_ptr()?;
+                    (beta, lb) = (b, l);
+                }
                 let mut params = [
                     param(&mut pq),
                     param(&mut pa),
@@ -1525,6 +1544,9 @@ impl Gemv {
                     param(&mut yr),
                     param(&mut psc),
                     param(&mut nm),
+                    param(&mut pact),
+                    param(&mut beta),
+                    param(&mut lb),
                 ];
                 // Warps per block (16 rows each): more rows share each staged activation tile.
                 let warps = std::env::var("ASTRAL_FRAG_WARPS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(8).clamp(4, 16);

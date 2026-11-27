@@ -99,6 +99,7 @@ pub struct InklingOps {
     sgemm_tn: Function,
     ctrl_apply: Function,
     ctrl_gf_apply: Function,
+    router_b_full: Function,
     moe_combine_t16: Function,
     attn_prefill: Function,
     attn_prefill_segs: Function,
@@ -271,6 +272,7 @@ impl InklingOps {
             tgemm_tn: f("astral_ink_tgemm_tn")?,
             ctrl_apply: f("astral_ink_ctrl_apply")?,
             ctrl_gf_apply: f("astral_ink_ctrl_gf_apply")?,
+            router_b_full: f("astral_ink_router_b_full")?,
             moe_combine_t16: f("astral_ink_moe_combine_t16")?,
             attn_prefill: {
                 let k = f("astral_ink_attn_prefill")?;
@@ -595,6 +597,47 @@ impl InklingOps {
         let (mut pw, mut px, mut kk, mut pl, mut n, mut nt) = (router.qs.device_ptr(), x.dptr(), k, logits.dptr(), ne, ntok);
         let mut p = [param(&mut pw), param(&mut px), param(&mut kk), param(&mut pl), param(&mut n), param(&mut nt)];
         Self::go(&self.router_b, s, LaunchConfig { grid: (ne, ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// The batched-decode router in one launch: logits, top-k (`ids`, `weights`: k per token)
+    /// and the small-batch work items of [`InklingOps::moe_group_q`]. `counters` holds
+    /// ceil(ntok / 8) + 1 zeroed words (left zeroed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn router_b_full(
+        &self,
+        s: &Stream,
+        router: &GemvMatrix,
+        x: &dyn Dev<f32>,
+        logits: &mut dyn DevMut<f32>,
+        bias: Option<&dyn Dev<f32>>,
+        ids: &mut dyn DevMut<i32>,
+        weights: &mut dyn DevMut<f32>,
+        k: u32,
+        w_scale: f32,
+        ntok: u32,
+        counters: &mut dyn DevMut<u32>,
+        items_gu: &mut dyn DevMut<u32>,
+        items_dn: &mut dyn DevMut<u32>,
+        max_items: u32,
+    ) -> Result<()> {
+        let (ne, kk) = (router.n, router.k);
+        if router.ty != GemvType::F32 || router.n_mats != 1 || !kk.is_multiple_of(4) || ntok == 0 || ne > 256 || k == 0 || k > 32 || max_items < moe_items_bound(ntok * k, ne) {
+            return Err(invalid(format!("router_b_full: {:?} {ne} x {kk}, k {k}", router.ty)));
+        }
+        need("router x", x.dlen(), (ntok * kk) as usize)?;
+        need("router logits", logits.dlen(), (ne * ntok) as usize)?;
+        need("router ids", ids.dlen(), (ntok * k) as usize)?;
+        need("router weights", weights.dlen(), (ntok * k) as usize)?;
+        need("router counters", counters.dlen(), ntok.div_ceil(8) as usize + 1)?;
+        need("router items", items_gu.dlen().min(items_dn.dlen()), (max_items * (2 + 2 * 8)) as usize)?;
+        let (mut pw, mut px, mut kq, mut pl, mut n, mut nt) = (router.qs.device_ptr(), x.dptr(), kk, logits.dptr(), ne, ntok);
+        let (mut pb, mut pi, mut pwt, mut kp, mut ws, mut pc) = (bias.map_or(0, |b| b.dptr()), ids.dptr(), weights.dptr(), k, w_scale, counters.dptr());
+        let (mut ig, mut idn, mut mi) = (items_gu.dptr(), items_dn.dptr(), max_items);
+        let mut p = [
+            param(&mut pw), param(&mut px), param(&mut kq), param(&mut pl), param(&mut n), param(&mut nt), param(&mut pb), param(&mut pi), param(&mut pwt),
+            param(&mut kp), param(&mut ws), param(&mut pc), param(&mut ig), param(&mut idn), param(&mut mi),
+        ];
+        Self::go(&self.router_b_full, s, LaunchConfig { grid: (ne, ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
     pub fn router_fused(

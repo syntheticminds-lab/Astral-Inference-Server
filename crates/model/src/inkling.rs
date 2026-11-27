@@ -2622,10 +2622,20 @@ fn layer(
     }
     tap!("ffn_normed", mn);
     let (ne, k) = (cfg.n_expert as u32, cfg.n_expert_used as u32);
+    // Set when the router launch also wrote the small-batch expert work items.
+    let mut grouped = false;
     if fast && l.router.ty == GemvType::F32 && s.dbg.is_none() {
-        // Large batches: tiled logits, then the top-k.
-        ex.ops.router_logits_b(st, &l.router, &s.mn, &mut s.rlogits, nt)?;
-        ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
+        // Large batches: tiled logits, then the top-k. ASTRAL_ROUTER_FULL=1: logits, top-k and
+        // the expert work items in one launch (its serial last-block tail measured slower).
+        if std::env::var_os("ASTRAL_ROUTER_FULL").is_some() {
+            let bias = l.probs_b.as_ref().map(|b| b as &dyn Dev<f32>);
+            let mi = astral_kernels::inkling::moe_items_bound(nt * k, ne);
+            ex.ops.router_b_full(st, &l.router, &s.mn, &mut s.rlogits, bias, &mut s.ids, &mut s.w, k, cfg.expert_scale, nt, &mut s.router_cnt, &mut s.items_gu, &mut s.items_dn, mi)?;
+            grouped = true;
+        } else {
+            ex.ops.router_logits_b(st, &l.router, &s.mn, &mut s.rlogits, nt)?;
+            ex.ops.router_topk(st, &s.rlogits, l.probs_b.as_ref(), &mut s.ids, &mut s.w, ne, k, cfg.expert_scale, nt)?;
+        }
     } else if l.router.ty == GemvType::F32 && !prefill && (ntok <= QITEM_ROWS || batch.is_some()) && s.dbg.is_none() && std::env::var_os("ASTRAL_NO_FUSE_ROUTER").is_none() {
         // Router GEMV + top-k in one kernel (the last block per token selects).
         let bias = l.probs_b.as_ref().map(|b| b as &dyn Dev<f32>);
@@ -2656,9 +2666,16 @@ fn layer(
             // Large batched decode: tensor-core grouped products, each expert's weights read
             // once per 8 of its tokens.
             let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);
-            ex.ops.moe_group_q(st, &s.ids, p32, k, cfg.n_expert as u32, &mut s.items_gu, &mut s.items_dn, mi)?;
-            ex.gemv.launch_items_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &s.items_gu, mi)?;
-            ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            if !grouped {
+                ex.ops.moe_group_q(st, &s.ids, p32, k, cfg.n_expert as u32, &mut s.items_gu, &mut s.items_dn, mi)?;
+            }
+            // NVFP4 experts: SITU in the gate_up epilogue (the down kernel reads the f16 copy).
+            if fuse_situ() && l.gate_up.ty == GemvType::Nvfp4 && l.down.ty == GemvType::Nvfp4 {
+                ex.gemv.launch_items_mma_act(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &s.items_gu, mi, Some((&mut s.qa_ff, cfg.situ_beta, cfg.situ_lb)))?;
+            } else {
+                ex.gemv.launch_items_mma(st, &l.gate_up, &s.qa[0], nt, &mut s.gu, p32, &s.items_gu, mi)?;
+                ex.ops.situ_q8(st, &s.gu, &mut s.qa_ff, p32, cfg.situ_beta, cfg.situ_lb)?;
+            }
             ex.gemv.launch_items_mma(st, &l.down, &s.qa_ff, p32, &mut s.y, p32, &s.items_dn, mi)?;
         } else if batch.is_some() {
             // Batched decode, every (token, expert) pair as the one-token dp4a GEMV computes it.

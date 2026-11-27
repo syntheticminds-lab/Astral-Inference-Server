@@ -2628,6 +2628,137 @@ extern "C" __global__ void __launch_bounds__(1024) astral_ink_moe_group_q(const 
     }
 }
 
+// Batched-decode router in one launch: astral_ink_router_b's logits, then the last expert
+// block of each 8-token group (counter cnt[group]) runs astral_ink_router_topk for those tokens,
+// and the last group to finish (counter cnt[groups]) builds astral_ink_moe_group_q's work items.
+// Counters are reset after use (graph replays start from zero). grid (n_expert, ceil(ntok / 8)),
+// 256 threads; n_expert <= 256, k <= 32.
+extern "C" __global__ void __launch_bounds__(256) astral_ink_router_b_full(
+    const float* __restrict__ w, const float* __restrict__ x, unsigned K, float* __restrict__ logits, unsigned n_expert, unsigned ntok,
+    const float* __restrict__ bias, int* __restrict__ ids, float* __restrict__ weights, unsigned k, float w_scale, unsigned* __restrict__ cnt,
+    unsigned* __restrict__ items_gu, unsigned* __restrict__ items_dn, unsigned max_items) { PDL_WAIT();
+    constexpr unsigned TT = 8;
+    __shared__ float red[8][TT];
+    __shared__ float prob[256], sel[256], wsel[32];
+    __shared__ unsigned ecnt[256], ibase[256], ecur[256];
+    __shared__ unsigned flag, total;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+    const unsigned e = blockIdx.x, grp = blockIdx.y, t0 = grp * TT, groups = gridDim.y;
+    const unsigned nt = min(TT, ntok - t0);
+    {
+        const unsigned K4 = K >> 2, per = (K4 + 7u) / 8u, i0 = warp * per, i1 = min(K4, i0 + per);
+        const float4* wv = reinterpret_cast<const float4*>(w + (u64)e * K);
+        const float4* xr[TT];
+#pragma unroll
+        for (unsigned t = 0; t < TT; ++t) xr[t] = reinterpret_cast<const float4*>(x + (u64)(t0 + min(t, nt - 1u)) * K);
+        float acc[TT];
+#pragma unroll
+        for (unsigned t = 0; t < TT; ++t) acc[t] = 0.0f;
+        for (unsigned i = i0 + lane; i < i1; i += 32u) {
+            const float4 a = __ldg(wv + i);
+#pragma unroll
+            for (unsigned t = 0; t < TT; ++t) {
+                const float4 b = __ldg(xr[t] + i);
+                acc[t] = fmaf(a.x, b.x, fmaf(a.y, b.y, fmaf(a.z, b.z, fmaf(a.w, b.w, acc[t]))));
+            }
+        }
+#pragma unroll
+        for (unsigned t = 0; t < TT; ++t) {
+            const float v = warp_sum(acc[t]);
+            if (lane == 0) red[warp][t] = v;
+        }
+        __syncthreads();
+        if (tid < nt) {
+            float v = 0.0f;
+#pragma unroll
+            for (unsigned q = 0; q < 8; ++q) v += red[q][tid];
+            logits[(u64)(t0 + tid) * n_expert + e] = v;
+        }
+    }
+    // Last expert block of this token group: the top-k of its tokens.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned old = atomicAdd(&cnt[grp], 1u);
+        flag = old == n_expert - 1u;
+        if (flag) cnt[grp] = 0u;
+    }
+    __syncthreads();
+    if (!flag) return;
+    for (unsigned tt = 0; tt < nt; ++tt) {
+        const unsigned tok = t0 + tt;
+        if (tid < n_expert) {
+            const float lg = __ldcg(logits + (u64)tok * n_expert + tid);
+            const float pr = 1.0f / (1.0f + expf(-lg));
+            prob[tid] = pr;
+            sel[tid] = bias ? pr + bias[tid] : pr;
+        }
+        __syncthreads();
+        if (tid < n_expert) {
+            const float v = sel[tid];
+            unsigned rank = 0;
+            for (unsigned j = 0; j < n_expert; ++j) {
+                const float o = sel[j];
+                rank += (o > v || (o == v && j < tid)) ? 1u : 0u;
+            }
+            if (rank < k) { ids[(u64)tok * k + rank] = (int)tid; wsel[rank] = prob[tid]; }
+        }
+        __syncthreads();
+        if (tid < k) {
+            float sum = 0.0f;
+            for (unsigned j = 0; j < k; ++j) sum += wsel[j];
+            weights[(u64)tok * k + tid] = wsel[tid] / (sum + 1e-20f) * w_scale;
+        }
+        __syncthreads();
+    }
+    // Last group: the grouped work items of all picks.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned old = atomicAdd(&cnt[groups], 1u);
+        flag = old == groups - 1u;
+        if (flag) cnt[groups] = 0u;
+    }
+    __syncthreads();
+    if (!flag) return;
+    const unsigned P = ntok * k;
+    for (unsigned q = tid; q < 256u; q += blockDim.x) { ecnt[q] = 0u; ecur[q] = 0u; }
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += blockDim.x) atomicAdd(&ecnt[min((unsigned)max(__ldcg(ids + p), 0), n_expert - 1u)], 1u);
+    __syncthreads();
+    if (tid == 0) {
+        unsigned ib = 0;
+        for (unsigned q = 0; q < n_expert; ++q) {
+            ibase[q] = ib;
+            ib += (ecnt[q] + QITEM_NB - 1u) / QITEM_NB;
+        }
+        total = ib;
+    }
+    __syncthreads();
+    for (unsigned q = tid; q < n_expert; q += blockDim.x) {
+        const unsigned chunks = (ecnt[q] + QITEM_NB - 1u) / QITEM_NB;
+        for (unsigned c = 0; c < chunks; ++c) {
+            const unsigned i = ibase[q] + c;
+            if (i >= max_items) break;
+            const unsigned n = min(QITEM_NB, ecnt[q] - c * QITEM_NB);
+            items_gu[QITEM_WORDS * i] = q; items_gu[QITEM_WORDS * i + 1] = n;
+            items_dn[QITEM_WORDS * i] = q; items_dn[QITEM_WORDS * i + 1] = n;
+        }
+    }
+    for (unsigned i = total + tid; i < max_items; i += blockDim.x) {
+        items_gu[QITEM_WORDS * i] = 0u; items_gu[QITEM_WORDS * i + 1] = 0u;
+        items_dn[QITEM_WORDS * i] = 0u; items_dn[QITEM_WORDS * i + 1] = 0u;
+    }
+    for (unsigned p = tid; p < P; p += blockDim.x) {
+        const unsigned q = min((unsigned)max(__ldcg(ids + p), 0), n_expert - 1u);
+        const unsigned slot = atomicAdd(&ecur[q], 1u);
+        const unsigned i = ibase[q] + slot / QITEM_NB, b = slot % QITEM_NB;
+        if (i >= max_items) continue;
+        items_gu[QITEM_WORDS * i + 2 + b] = p / k; items_gu[QITEM_WORDS * i + 2 + QITEM_NB + b] = p;
+        items_dn[QITEM_WORDS * i + 2 + b] = p;     items_dn[QITEM_WORDS * i + 2 + QITEM_NB + b] = p;
+    }
+}
+
 // Packed prefill: the per-sequence kernels above for every segment of the pass in one launch
 // (blockIdx.z = segment). seg holds 8 words per segment: first row, rows, KV-cache offset (in
 // halves), index of its start position in pos_p, conv-state offset (in floats). Base pointers

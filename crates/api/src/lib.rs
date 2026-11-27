@@ -14,9 +14,12 @@
 pub mod chat;
 pub mod engine;
 pub mod http;
+pub mod qwen_chat;
+mod qwen_engine;
 
 use astral_core::{AstralError, Result};
 use chat::{OutputParser, Part, Specials};
+use qwen_chat::QwenSpecials;
 use engine::{Engine, EngineConfig, Event, Job};
 use serde_json::{json, Value};
 use std::net::{TcpListener, TcpStream};
@@ -39,15 +42,30 @@ pub struct ServerConfig {
 struct App {
     engine: Arc<Engine>,
     tok: tokenizers::Tokenizer,
-    sp: Specials,
+    sp: Family,
     model: String,
     next_id: AtomicU64,
+}
+
+/// The model family served: its special tokens, chat template and output parsing.
+enum Family {
+    Inkling(Specials),
+    Qwen(QwenSpecials),
+}
+
+impl Family {
+    fn stop_ids(&self) -> Vec<u32> {
+        match self {
+            Family::Inkling(s) => s.stop_ids(),
+            Family::Qwen(q) => q.stop_ids(),
+        }
+    }
 }
 
 /// Loads the model and serves until the process is stopped.
 pub fn serve(cfg: ServerConfig) -> Result<()> {
     let tok = tokenizers::Tokenizer::from_file(cfg.tokenizer_dir.join("tokenizer.json")).map_err(|e| AstralError::Invalid(format!("tokenizer: {e}")))?;
-    let sp = Specials::from_tokenizer(&tok).map_err(AstralError::Invalid)?;
+    let sp = if cfg.engine.qwen { Family::Qwen(QwenSpecials::from_tokenizer(&tok).map_err(AstralError::Invalid)?) } else { Family::Inkling(Specials::from_tokenizer(&tok).map_err(AstralError::Invalid)?) };
     let engine = Engine::start(cfg.engine.clone())?;
     let app = Arc::new(App { engine, tok, sp, model: cfg.model_name.clone(), next_id: AtomicU64::new(1) });
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -105,8 +123,13 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
 fn prompt_ids(app: &App, body: &Value, chat_req: bool) -> std::result::Result<Vec<u32>, String> {
     let text = if chat_req || body.get("messages").is_some() {
         let msgs = body.get("messages").ok_or("missing messages")?;
-        let effort = body.get("reasoning_effort").or_else(|| body.get("chat_template_kwargs").and_then(|k| k.get("reasoning_effort")));
-        chat::render(msgs, body.get("tools"), effort)?
+        match &app.sp {
+            Family::Inkling(_) => {
+                let effort = body.get("reasoning_effort").or_else(|| body.get("chat_template_kwargs").and_then(|k| k.get("reasoning_effort")));
+                chat::render(msgs, body.get("tools"), effort)?
+            }
+            Family::Qwen(_) => qwen_chat::render(msgs, body.get("tools"), qwen_chat::thinking_enabled(body))?,
+        }
     } else {
         match body.get("prompt") {
             Some(Value::String(s)) => s.clone(),
@@ -176,7 +199,10 @@ fn generate(app: &App, stream: &mut TcpStream, body: &Value, chat_req: bool) -> 
             http::sse_send(stream, &first.to_string())?;
         }
     }
-    let mut parser = OutputParser::new(app.sp.clone());
+    let mut parser = match &app.sp {
+        Family::Inkling(sp) => OutputParser::new(sp.clone()),
+        Family::Qwen(q) => OutputParser::new_qwen(q.clone(), qwen_chat::thinking_enabled(body)),
+    };
     let mut ids: Vec<u32> = Vec::new();
     let mut text_emitted = 0usize; // completions: bytes of decoded text already sent
     let mut finish = "length";

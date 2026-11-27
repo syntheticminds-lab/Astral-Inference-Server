@@ -233,17 +233,38 @@ pub struct OutputParser {
     pub reasoning: String,
     pub content: String,
     tool_raw: Vec<String>,
+    /// Qwen3.5: the answer starts in `part`; `</think>` switches from reasoning to content.
+    qwen: Option<crate::qwen_chat::QwenSpecials>,
 }
 
 impl OutputParser {
     pub fn new(sp: Specials) -> Self {
-        Self { sp, part: Part::Header, seg: Vec::new(), seg_emitted: 0, reasoning: String::new(), content: String::new(), tool_raw: Vec::new() }
+        Self { sp, part: Part::Header, seg: Vec::new(), seg_emitted: 0, reasoning: String::new(), content: String::new(), tool_raw: Vec::new(), qwen: None }
+    }
+
+    /// A parser for Qwen3.5 output. A generation prompt that opened a thinking block starts in
+    /// reasoning (`thinking`), otherwise in the answer.
+    pub fn new_qwen(q: crate::qwen_chat::QwenSpecials, thinking: bool) -> Self {
+        let mut p = Self::new(Specials { message_model: 0, content_text: 0, content_thinking: 0, end_message: 0, end_sampling: 0, invoke_tool_json: None, endoftext: q.endoftext });
+        p.part = if thinking { Part::Reasoning } else { Part::Content };
+        p.qwen = Some(q);
+        p
     }
 
     /// Feeds one generated token; returns a text delta of the reasoning or the content.
     pub fn push(&mut self, tok: u32, tk: &tokenizers::Tokenizer) -> Option<(Part, String)> {
+        if let Some(q) = &self.qwen {
+            if tok == q.think_end || tok == q.think_start {
+                self.part = if tok == q.think_end { Part::Content } else { Part::Reasoning };
+                self.seg.clear();
+                self.seg_emitted = 0;
+                return None;
+            }
+        }
         let sp = &self.sp;
-        let new_part = if tok == sp.content_thinking {
+        let new_part = if self.qwen.is_some() {
+            None
+        } else if tok == sp.content_thinking {
             Some(Part::Reasoning)
         } else if tok == sp.content_text {
             Some(Part::Content)
@@ -272,8 +293,18 @@ impl OutputParser {
         if text.ends_with('\u{FFFD}') || text.len() <= self.seg_emitted || !text.is_char_boundary(self.seg_emitted) {
             return None;
         }
-        let delta = text[self.seg_emitted..].to_string();
+        let mut delta = text[self.seg_emitted..].to_string();
         self.seg_emitted = text.len();
+        // Qwen: the blank lines after `<think>` and `</think>` are not part of the text.
+        if self.qwen.is_some() {
+            let empty = if self.part == Part::Reasoning { self.reasoning.is_empty() } else { self.content.is_empty() };
+            if empty {
+                delta = delta.trim_start().to_string();
+                if delta.is_empty() {
+                    return None;
+                }
+            }
+        }
         match self.part {
             Part::Reasoning => self.reasoning.push_str(&delta),
             Part::Content => self.content.push_str(&delta),

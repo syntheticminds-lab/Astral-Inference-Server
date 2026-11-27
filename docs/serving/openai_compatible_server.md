@@ -23,6 +23,8 @@ Repositories are downloaded on first use to `~/.cache/astral/hub` (or `--downloa
 
 A GGUF file has no chat template or draft, so it needs `--tokenizer`, a directory or repository with `tokenizer.json` (the native checkpoint). Speculative decoding runs when the checkpoint has its DSpark draft (`mtp.safetensors`).
 
+`astral serve Qwen/Qwen3.5-4B` serves the Qwen3.5-4B text model: one request at a time, greedy, with the model's reasoning returned as `reasoning_content` (disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`). Image input, tools and the `mtp` draft layer are not supported. Batching and draft options do not apply to it. See [supported models](../models/supported_models.md#qwen35-4b).
+
 ## Options
 
 The names follow vLLM's, so existing launch scripts carry over. `--flag value` and `--flag=value` both work; `astral serve --help` lists everything.

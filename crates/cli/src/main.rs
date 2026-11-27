@@ -888,8 +888,8 @@ fn cmd_serve(a: &[String]) -> Result<bool> {
     }
     let model = a[0].clone();
     let mut opts = astral_loader::hub::HubOptions::default();
-    // `astral serve` serves Inkling 2 Mini (checkpoint `model_type` inkling2_loop).
-    opts.model_types = vec!["inkling2_loop".to_string()];
+    // `astral serve` serves Inkling 2 Mini (`model_type` inkling2_loop) and Qwen3.5 (qwen3_5).
+    opts.model_types = vec!["inkling2_loop".to_string(), "qwen3_5".to_string()];
     let (mut tokenizer, mut name, mut draft, mut k, mut host, mut port, mut ctx, mut queue, mut max_seqs) = (None::<String>, None::<String>, true, 6usize, "0.0.0.0".to_string(), 8000u16, 8192u32, 64usize, 0usize);
     let (mut util, mut batched) = (None::<f32>, None::<usize>);
     let mut i = 1;
@@ -950,13 +950,15 @@ fn cmd_serve(a: &[String]) -> Result<bool> {
     if !tok_dir.join("tokenizer.json").exists() {
         return Err(bad(format!("serve: {} has no tokenizer.json", tok_dir.display())));
     }
+    let qwen = m.weights.join("config.json").exists() && std::fs::read(m.weights.join("config.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|c| c["model_type"].as_str() == Some("qwen3_5"));
     // The draft lives in the native checkpoint (mtp.safetensors); without it, decode plainly.
     let draft_dir = [m.weights.clone(), tok_dir.clone()].into_iter().find(|d| d.join("mtp.safetensors").exists());
-    if draft && draft_dir.is_none() {
+    if draft && !qwen && draft_dir.is_none() {
         eprintln!("astral: no DSpark draft (mtp.safetensors) found; serving without speculative decoding");
     }
     let draft = draft_dir.filter(|_| draft);
-    let engine = astral_api::engine::EngineConfig { gguf: m.weights.clone(), draft, k, ctx, queue, max_seqs, gpu_memory_utilization: util, max_batched_tokens: batched };
+    let draft = draft.filter(|_| !qwen);
+    let engine = astral_api::engine::EngineConfig { gguf: m.weights.clone(), draft, k, ctx, queue, max_seqs, gpu_memory_utilization: util, max_batched_tokens: batched, qwen };
     let model_name = name.unwrap_or_else(|| m.name.to_ascii_lowercase());
     astral_api::serve(astral_api::ServerConfig { engine, tokenizer_dir: tok_dir, host, port, model_name })?;
     Ok(true)

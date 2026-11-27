@@ -36,6 +36,8 @@ pub struct EngineConfig {
     pub gpu_memory_utilization: Option<f32>,
     /// Tokens per forward pass (prompt chunks plus decoding requests); None: the default.
     pub max_batched_tokens: Option<usize>,
+    /// `gguf` is a Qwen3.5 checkpoint directory (served one request at a time).
+    pub qwen: bool,
 }
 
 pub enum Event {
@@ -56,7 +58,7 @@ pub struct Job {
 }
 
 pub struct Engine {
-    tx: SyncSender<Job>,
+    pub(crate) tx: SyncSender<Job>,
     pub capacity: u32,
     pub draft: bool,
     pub k: usize,
@@ -77,6 +79,9 @@ impl Engine {
         let (tx, rx) = mpsc::sync_channel::<Job>(cfg.queue.max(1));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, bool, usize)>>();
         let k = cfg.k;
+        if cfg.qwen {
+            return crate::qwen_engine::start(cfg, tx, rx);
+        }
         std::thread::Builder::new()
             .name("astral-engine".into())
             .spawn(move || {

@@ -185,6 +185,36 @@ impl Loader<'_> {
             self.bytes += m.bytes();
             return Ok(m);
         }
+        // Dense BF16 checkpoints: the weights are quantised to Q8_0 (the int8-activation kernels
+        // of the prefill and decode paths read them); ASTRAL_BF16_WEIGHTS=1 keeps BF16 (only
+        // valid where the f32-activation path is used).
+        if self.dense_checkpoint() && std::env::var_os("ASTRAL_BF16_WEIGHTS").is_none() {
+            let (mut v, mut n, mut k) = (Vec::new(), 0usize, 0usize);
+            for base in bases {
+                let t = self.t(&format!("{base}.weight"))?.clone();
+                let [rows, cols] = t.shape.as_slice() else { return Err(bad(format!("{base}: shape {:?}", t.shape))) };
+                if (k != 0 && k != *cols as usize) || cols % 32 != 0 {
+                    return Err(bad(format!("{base}: k {cols} (a multiple of 32, the same for stacked matrices)")));
+                }
+                k = *cols as usize;
+                n += *rows as usize;
+                v.extend(self.st.read_f32(&t)?);
+            }
+            let (q, d8) = astral_quant::quantize_q8_0_rows(&v, n, k)?;
+            let m = GemvMatrix::upload(self.ctx, GemvType::Q8_0, n as u32, k as u32, 1, &q, &d8, None)?;
+            self.bytes += m.bytes();
+            return Ok(m);
+        }
+        self.mat_bf16(bases)
+    }
+
+    /// A dense BF16 checkpoint (no MXFP4 weights).
+    fn dense_checkpoint(&self) -> bool {
+        self.st.tensor(&format!("{P}layers.0.mlp.down_proj.weight_packed")).is_none()
+    }
+
+    /// BF16 matrices stacked by rows, kept BF16.
+    fn mat_bf16(&mut self, bases: &[&str]) -> Result<GemvMatrix> {
         let (mut raw, mut n, mut k) = (Vec::new(), 0u64, 0u64);
         for base in bases {
             let t = self.t(&format!("{base}.weight"))?.clone();
@@ -262,7 +292,7 @@ fn convert_parallel(packed: &[u8], scales: &[u8], n: usize, k: usize) -> Result<
 impl Weights {
     pub fn load(ctx: &Arc<Context>, dir: &Path) -> Result<Self> {
         let cfg = Config::from_dir(dir)?;
-        let st = Safetensors::open(dir.join("model.safetensors"))?;
+        let st = Safetensors::open_dir(dir)?;
         let mut l = Loader { st: &st, ctx, bytes: 0, reencoded: 0 };
         let et = l.t(&format!("{P}embed_tokens.weight"))?.clone();
         if et.dtype != "BF16" || et.shape != [cfg.vocab as u64, cfg.dim as u64] {
@@ -276,8 +306,11 @@ impl Weights {
         let norm = l.vec(&format!("{P}norm.weight"), true)?;
         // LM head: BF16 as in the checkpoint; ASTRAL_LM_HEAD_Q8=1 quantises it to Q8_0 (half the
         // bytes per decode step; not bit-identical to the reference).
+        // Tied embeddings (no lm_head.weight): the head is the embedding matrix.
+        let head_base = if st.tensor("lm_head.weight").is_some() { "lm_head".to_string() } else { format!("{P}embed_tokens") };
+        let head = &format!("{head_base}.weight");
         let lm_head = if std::env::var_os("ASTRAL_LM_HEAD_Q8").is_some() {
-            let t = l.t("lm_head.weight")?.clone();
+            let t = l.t(head)?.clone();
             let (n, k) = (t.shape[0] as usize, t.shape[1] as usize);
             let v = st.read_f32(&t)?;
             let (q, d8) = astral_quant::quantize_q8_0_rows(&v, n, k)?;
@@ -285,7 +318,7 @@ impl Weights {
             l.bytes += m.bytes();
             m
         } else {
-            l.mat(&["lm_head"])?
+            l.mat_bf16(&[&head_base])?
         };
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -302,7 +335,7 @@ impl Weights {
                 let neg_a: Vec<f32> = a_log.iter().map(|x| -x.exp()).collect();
                 Mixer::Linear {
                     wqkvz: l.mat(&[&b("linear_attn.in_proj_qkv"), &b("linear_attn.in_proj_z")])?,
-                    wab: l.mat(&[&b("linear_attn.in_proj_a"), &b("linear_attn.in_proj_b")])?,
+                    wab: l.mat_bf16(&[&b("linear_attn.in_proj_a"), &b("linear_attn.in_proj_b")])?,
                     wab32: l.mat_f32(&[&b("linear_attn.in_proj_a"), &b("linear_attn.in_proj_b")])?,
                     conv: l.vec(&b("linear_attn.conv1d.weight"), false)?,
                     neg_a: DeviceBuffer::from_slice(ctx, &neg_a)?,
@@ -596,6 +629,11 @@ impl Session {
     }
 
     /// Logits after the last processed token.
+    /// Context capacity (positions).
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
     pub fn logits(&self) -> Result<Vec<f32>> {
         self.s.logits.to_vec()
     }

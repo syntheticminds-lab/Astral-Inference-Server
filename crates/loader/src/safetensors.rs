@@ -22,6 +22,8 @@ pub struct StTensor {
     /// Absolute byte offset in the file and length.
     pub offset: u64,
     pub len: u64,
+    /// Which file of the set holds it (always 0 for a single file).
+    pub shard: usize,
 }
 
 impl StTensor {
@@ -31,12 +33,58 @@ impl StTensor {
 }
 
 pub struct Safetensors {
-    file: File,
+    files: Vec<File>,
     tensors: BTreeMap<String, StTensor>,
     pub metadata: BTreeMap<String, String>,
 }
 
 impl Safetensors {
+    /// A checkpoint directory: `model.safetensors`, or the shards listed by
+    /// `model.safetensors.index.json` (or every `*.safetensors` file, `mtp.safetensors` aside).
+    pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let single = dir.join("model.safetensors");
+        if single.exists() {
+            return Self::open(single);
+        }
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(b) = std::fs::read(dir.join("model.safetensors.index.json")) {
+            let j: serde_json::Value = serde_json::from_slice(&b).map_err(|e| bad(format!("index JSON: {e}")))?;
+            for f in j["weight_map"].as_object().ok_or_else(|| bad("index has no weight_map".into()))?.values().filter_map(|v| v.as_str()) {
+                if !names.iter().any(|n| n == f) {
+                    names.push(f.to_string());
+                }
+            }
+        } else {
+            for e in std::fs::read_dir(dir)? {
+                let n = e?.file_name().to_string_lossy().to_string();
+                if n.ends_with(".safetensors") && n != "mtp.safetensors" {
+                    names.push(n);
+                }
+            }
+            names.sort();
+        }
+        if names.is_empty() {
+            return Err(bad(format!("no safetensors files in {}", dir.display())));
+        }
+        let mut all: Option<Self> = None;
+        for n in &names {
+            let mut one = Self::open(dir.join(n))?;
+            match all.as_mut() {
+                None => all = Some(one),
+                Some(a) => {
+                    let shard = a.files.len();
+                    a.files.append(&mut one.files);
+                    for (k, mut t) in std::mem::take(&mut one.tensors) {
+                        t.shard = shard;
+                        a.tensors.insert(k, t);
+                    }
+                }
+            }
+        }
+        all.ok_or_else(|| bad("no safetensors files".into()))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
@@ -81,9 +129,9 @@ impl Safetensors {
             if esize != 0 && n.checked_mul(esize) != Some(b - a) {
                 return Err(bad(format!("{name}: {} bytes for {n} x {dtype}", b - a)));
             }
-            tensors.insert(name.clone(), StTensor { name: name.clone(), dtype, shape, offset: base + a, len: b - a });
+            tensors.insert(name.clone(), StTensor { name: name.clone(), dtype, shape, offset: base + a, len: b - a, shard: 0 });
         }
-        Ok(Self { file, tensors, metadata })
+        Ok(Self { files: vec![file], tensors, metadata })
     }
 
     pub fn tensor(&self, name: &str) -> Option<&StTensor> {
@@ -96,7 +144,7 @@ impl Safetensors {
 
     pub fn read(&self, t: &StTensor) -> Result<Vec<u8>> {
         let mut v = vec![0u8; t.len as usize];
-        self.file.read_exact_at(&mut v, t.offset)?;
+        self.files[t.shard].read_exact_at(&mut v, t.offset)?;
         Ok(v)
     }
 

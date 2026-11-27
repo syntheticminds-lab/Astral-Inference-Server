@@ -639,6 +639,11 @@ pub struct Session {
     last_rows: Vec<u32>,
     /// Verification-pass graphs by (parts, tokens per part).
     verify_graphs: std::collections::HashMap<(usize, usize), GraphExec>,
+    /// Chained verification on the decode kernels: per-slot row-state buffers, the device
+    /// pointer tables of conv states and row states, and graphs by row count.
+    rowstates: Vec<DeviceBuffer<f32>>,
+    state_ptrs: Option<(DeviceBuffer<u64>, DeviceBuffer<u64>)>,
+    chain_graphs: std::collections::HashMap<usize, GraphExec>,
 }
 
 /// Device buffers of the batched decode pass.
@@ -655,6 +660,10 @@ struct BatchBufs {
     /// Per-row sequence and position of a packed pass (tmax rows), for verification passes.
     vseq: DeviceBuffer<i32>,
     vpos: DeviceBuffer<i32>,
+    /// Chained verification: per-row chain lengths, and the (sequence, row) commit lists.
+    chain: DeviceBuffer<i32>,
+    commit_seq: DeviceBuffer<i32>,
+    commit_row: DeviceBuffer<i32>,
 }
 
 /// One row of a batched decode step: feed `token` to sequence `seq` at position `pos`.
@@ -776,8 +785,11 @@ impl Session {
             dbg: None,
         };
         let b = BatchBufs {
-            seq: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
-            pos: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            seq: DeviceBuffer::<i32>::zeroed(ctx, vrows_max(max_batch, t))?,
+            pos: DeviceBuffer::<i32>::zeroed(ctx, vrows_max(max_batch, t))?,
+            chain: DeviceBuffer::<i32>::zeroed(ctx, vrows_max(max_batch, t))?,
+            commit_seq: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
+            commit_row: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
             // Rows of a batched pass: decode (max_batch) or verification (up to 4 per sequence).
             logits: z(vrows_max(max_batch, t) * w.output.n as usize)?,
             next: DeviceBuffer::<i32>::zeroed(ctx, vrows_max(max_batch, t))?,
@@ -815,6 +827,9 @@ impl Session {
             phase: (0, [0.0; 4], 0),
             last_rows: Vec::new(),
             verify_graphs: std::collections::HashMap::new(),
+            rowstates: Vec::new(),
+            state_ptrs: None,
+            chain_graphs: std::collections::HashMap::new(),
             w,
         };
         me.capture_graph()?;
@@ -912,7 +927,7 @@ impl Session {
         }
         let tmax = self.s.tmax;
         let mut tok = vec![0i32; tmax];
-        let (mut sq, mut ps) = (vec![0i32; self.max_batch], vec![0i32; self.max_batch]);
+        let (mut sq, mut ps) = (vec![0i32; self.b.seq.len()], vec![0i32; self.b.pos.len()]);
         for (i, r) in rows.iter().enumerate() {
             tok[i] = r.token as i32;
             sq[i] = r.seq as i32;
@@ -928,7 +943,7 @@ impl Session {
             let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, captured, .. } = self;
             let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
             captured.clear();
-            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: None, logits, next, part_v, part_i, dops };
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: None, rowstates: None, logits, next, part_v, part_i, dops };
             forward(&Exec { st: stream, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, Some(captured), &mut SpecIo::none(), 0, Some(&mut io), None)?;
         } else {
             let t1 = std::time::Instant::now();
@@ -967,6 +982,93 @@ impl Session {
         Ok(next[..n].iter().map(|&t| t as u32).collect())
     }
 
+    /// Verification on the batched decode kernels: `rows` hold, per sequence, consecutive
+    /// tokens at consecutive positions (a chain; chains back to back). Every row's greedy pick
+    /// is returned. The short convs run each chain's rows in order and keep every row's state;
+    /// [`Session::commit_verify`] must follow, keeping each sequence's state at its last
+    /// accepted row.
+    pub fn decode_verify(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
+        let n = rows.len();
+        let cap_rows = self.b.chain.len().min(self.s.tmax);
+        if n == 0 || n > cap_rows {
+            return Err(bad(format!("decode_verify: {n} rows, at most {cap_rows}")));
+        }
+        let mut chain = vec![0i32; cap_rows];
+        let mut i = 0usize;
+        while i < n {
+            let r = rows[i];
+            if r.seq >= self.n_seqs || r.pos >= self.capacity {
+                return Err(bad(format!("decode_verify: sequence {} at position {}", r.seq, r.pos)));
+            }
+            let mut j = i + 1;
+            while j < n && rows[j].seq == r.seq {
+                if rows[j].pos != rows[j - 1].pos + 1 {
+                    return Err(bad("decode_verify: a sequence's rows must be at consecutive positions".into()));
+                }
+                j += 1;
+            }
+            chain[i] = (j - i) as i32;
+            i = j;
+        }
+        if self.rowstates.is_empty() {
+            let ctx = self.stream.context().clone();
+            let len = cap_rows * self.w.cfg.conv_len();
+            self.rowstates = (0..self.conv.len()).map(|_| DeviceBuffer::<f32>::zeroed(&ctx, len)).collect::<Result<_>>()?;
+            let sp: Vec<u64> = self.conv.iter().map(|c| c.device_ptr()).collect();
+            let rp: Vec<u64> = self.rowstates.iter().map(|c| c.device_ptr()).collect();
+            self.state_ptrs = Some((DeviceBuffer::from_slice(&ctx, &sp)?, DeviceBuffer::from_slice(&ctx, &rp)?));
+        }
+        self.set_dense(n)?;
+        let tmax = self.s.tmax;
+        let mut tok = vec![0i32; tmax];
+        let (mut sq, mut ps) = (vec![0i32; self.b.seq.len()], vec![0i32; self.b.pos.len()]);
+        for (i, r) in rows.iter().enumerate() {
+            tok[i] = r.token as i32;
+            sq[i] = r.seq as i32;
+            ps[i] = r.pos as i32;
+        }
+        self.s.token.copy_from_slice(&tok)?;
+        self.b.seq.copy_from_slice(&sq)?;
+        self.b.pos.copy_from_slice(&ps)?;
+        self.b.chain.copy_from_slice(&chain)?;
+        if !self.chain_graphs.contains_key(&n) {
+            let conv_stride = self.w.cfg.conv_len() as u32;
+            let n_seqs = self.n_seqs as u32;
+            let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, chain_graphs, rowstates, .. } = self;
+            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, chain, .. } = b;
+            let cp = chain.device_ptr();
+            let g = stream.capture(|st| {
+                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: cp, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: None, rowstates: Some(&rowstates[..]), logits, next, part_v, part_i, dops };
+                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut SpecIo::none(), 0, Some(&mut io), None)
+            })?;
+            chain_graphs.insert(n, g);
+        }
+        self.chain_graphs[&n].launch(&self.stream)?;
+        self.stream.synchronize()?;
+        let next = self.b.next.to_vec()?;
+        Ok(next[..n].iter().map(|&t| t as u32).collect())
+    }
+
+    /// After [`Session::decode_verify`]: sequence `seq` keeps the conv state after verify row
+    /// `row` (its last accepted token), for every `(seq, row)`.
+    pub fn commit_verify(&mut self, keep: &[(usize, usize)]) -> Result<()> {
+        let Some((sp, rp)) = self.state_ptrs.as_ref() else { return Err(bad("commit_verify: no verification pass".into())) };
+        if keep.len() > self.b.commit_seq.len() {
+            return Err(bad("commit_verify: too many sequences".into()));
+        }
+        let mut a = vec![0i32; self.b.commit_seq.len()];
+        let mut c = vec![0i32; self.b.commit_row.len()];
+        for (i, &(q, r)) in keep.iter().enumerate() {
+            a[i] = q as i32;
+            c[i] = r as i32;
+        }
+        self.b.commit_seq.copy_from_slice(&a)?;
+        self.b.commit_row.copy_from_slice(&c)?;
+        let cl = self.w.cfg.conv_len() as u32;
+        self.ops.conv_commit_rows(&self.stream, sp, rp, self.conv.len() as u32, &self.b.commit_seq, &self.b.commit_row, keep.len() as u32, cl, cl)?;
+        self.stream.synchronize()
+    }
+
     /// Logits of the `n` rows of the last [`Session::decode_batch`] (unpadded vocabulary, row-major).
     pub fn batch_logits(&self, n: usize) -> Result<Vec<f32>> {
         let (vp, v) = (self.w.output.n as usize, self.w.cfg.vocab);
@@ -988,7 +1090,7 @@ impl Session {
         let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, batch_graphs, .. } = self;
         let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
         let g = stream.capture(|st| {
-            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: None, logits, next, part_v, part_i, dops };
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: None, rowstates: None, logits, next, part_v, part_i, dops };
             forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut SpecIo::none(), 0, Some(&mut io), None)
         })?;
         batch_graphs[n] = Some(g);
@@ -1144,7 +1246,7 @@ impl Session {
         }
         // Leading one-token parts (decoding sequences) run on the batched decode kernels, which
         // read each row's sequence and position from the batch buffers.
-        let (mut sq, mut ps) = (vec![0i32; self.max_batch], vec![0i32; self.max_batch]);
+        let (mut sq, mut ps) = (vec![0i32; self.b.seq.len()], vec![0i32; self.b.pos.len()]);
         for (i, sg) in segs.iter().enumerate().take_while(|(i, sg)| sg.len == 1 && sg.row0 == *i) {
             sq[i] = sg.seq as i32;
             ps[i] = sg.pos0 as i32;
@@ -1172,7 +1274,7 @@ impl Session {
         let n_seqs = self.n_seqs as u32;
         {
             let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, verify_graphs, .. } = self;
-            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos, vseq, vpos } = b;
+            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos, vseq, vpos, .. } = b;
             let cap = *capacity;
             // Verification passes of equal-length parts (at least two: their segments are all
             // table-driven, so the graph replays for any sequences and positions) reuse a graph
@@ -1185,8 +1287,8 @@ impl Session {
             // PDL off for the large prefill kernels.
             let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
             let g = stream.capture(|st| {
-                let vr = verify.then_some(BatchRows { rows: SeqRows { seq: &*vseq, n_seqs, conv_stride }, pos: &*vpos });
-                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: vr, logits, next, part_v, part_i, dops };
+                let vr = verify.then_some(BatchRows { rows: SeqRows { seq: &*vseq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*vpos });
+                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: vr, rowstates: None, logits, next, part_v, part_i, dops };
                 forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
             });
             stream.context().set_pdl(prev);
@@ -1632,6 +1734,8 @@ struct BatchIo<'a> {
     /// Packed passes of short segments (verification): every row's sequence and position, for
     /// the decode attention over each row's own cache.
     verify: Option<BatchRows<'a>>,
+    /// Chained verification on the decode kernels: every slot's per-row conv-state buffer.
+    rowstates: Option<&'a [DeviceBuffer<f32>]>,
     logits: &'a mut DeviceBuffer<f32>,
     next: &'a mut DeviceBuffer<i32>,
     part_v: &'a mut DeviceBuffer<f32>,
@@ -1669,6 +1773,7 @@ fn forward(
     let cfg = &w.cfg;
     // Packed prefill (segs) reuses the batch buffers only for its outputs.
     let brows = if segs.is_some() { None } else { batch.as_deref().map(|b| BatchRows { rows: b.rows, pos: b.pos }) };
+    let rowstates = batch.as_deref().and_then(|b| b.rowstates);
     // Packed passes: leading one-token segments (sequences that are decoding) take the batched
     // decode kernels, one launch for all of them; their sequences and positions are in the batch
     // buffers.
@@ -1707,6 +1812,15 @@ fn forward(
         }
         visit += 1;
         let mut hist = io.hist.as_deref_mut().map(|h| Hist { buf: &mut h[slot], rows: hist_rows });
+        // Chained verification: this slot's row-state buffer and the conv state it mirrors.
+        let brows = match (brows, rowstates) {
+            (Some(mut b), Some(rs)) => {
+                b.rows.rowstate = rs[slot].device_ptr();
+                b.rows.conv_base = conv[slot].device_ptr();
+                Some(b)
+            }
+            (b, _) => b,
+        };
         layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs, dec, vrows)?;
         if let Some(c) = captured.as_deref_mut() {
             ex.st.synchronize()?;

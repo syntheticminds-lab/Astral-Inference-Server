@@ -100,6 +100,7 @@ pub struct InklingOps {
     ctrl_apply: Function,
     ctrl_gf_apply: Function,
     router_b_full: Function,
+    conv_commit_rows: Function,
     moe_combine_t16: Function,
     attn_prefill: Function,
     attn_prefill_segs: Function,
@@ -205,11 +206,26 @@ pub struct SeqRows<'a> {
     pub seq: &'a dyn Dev<i32>,
     pub n_seqs: u32,
     pub conv_stride: u32,
+    /// Verification passes: per-row chain lengths (consecutive rows of one sequence; the length
+    /// at a chain's first row, 0 elsewhere), and this slot's per-row conv-state buffer
+    /// (`rowstate`, rows `conv_stride` apart) with the conv-state base it mirrors. 0: none.
+    pub chain: DevicePtr,
+    pub rowstate: DevicePtr,
+    pub conv_base: DevicePtr,
 }
 
 impl SeqRows<'_> {
     fn parts(r: Option<&Self>) -> (DevicePtr, u32, u32) {
         r.map_or((0, 1, 0), |r| (r.seq.dptr(), r.n_seqs.max(1), r.conv_stride))
+    }
+
+    /// The chain pointer and the row-state address matching conv state `state` (same offset
+    /// from the row-state buffer as `state` from the conv base), or zeros.
+    fn chain_parts(r: Option<&Self>, state: DevicePtr) -> (DevicePtr, DevicePtr) {
+        match r {
+            Some(r) if r.chain != 0 && r.rowstate != 0 && state >= r.conv_base => (r.chain, r.rowstate + (state - r.conv_base)),
+            _ => (0, 0),
+        }
     }
 }
 
@@ -273,6 +289,7 @@ impl InklingOps {
             ctrl_apply: f("astral_ink_ctrl_apply")?,
             ctrl_gf_apply: f("astral_ink_ctrl_gf_apply")?,
             router_b_full: f("astral_ink_router_b_full")?,
+            conv_commit_rows: f("astral_ink_conv_commit_rows")?,
             moe_combine_t16: f("astral_ink_moe_combine_t16")?,
             attn_prefill: {
                 let k = f("astral_ink_attn_prefill")?;
@@ -640,6 +657,21 @@ impl InklingOps {
         Self::go(&self.router_b_full, s, LaunchConfig { grid: (ne, ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
+    /// After a verification pass: for every layer slot, sequence `seq_of[i]` takes the conv
+    /// state of row `row_of[i]` from that slot's row-state buffer. `states` / `rowstates` hold
+    /// `n_slots` device pointers each.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_commit_rows(&self, s: &Stream, states: &dyn Dev<u64>, rowstates: &dyn Dev<u64>, n_slots: u32, seq_of: &dyn Dev<i32>, row_of: &dyn Dev<i32>, n: u32, conv_len: u32, conv_stride: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        need("commit states", states.dlen().min(rowstates.dlen()), n_slots as usize)?;
+        need("commit rows", seq_of.dlen().min(row_of.dlen()), n as usize)?;
+        let (mut a, mut b, mut c, mut d, mut l, mut st) = (states.dptr(), rowstates.dptr(), seq_of.dptr(), row_of.dptr(), conv_len, conv_stride);
+        let mut p = [param(&mut a), param(&mut b), param(&mut c), param(&mut d), param(&mut l), param(&mut st)];
+        Self::go(&self.conv_commit_rows, s, LaunchConfig { grid: (conv_len.div_ceil(256), n, n_slots), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
     pub fn router_fused(
         &self,
         s: &Stream,
@@ -861,6 +893,7 @@ impl InklingOps {
         let (mut tq, mut tr, mut ep, mut gl, mut fl, mut al, mut cap) = (a.thr_qk, a.thr_rel, a.eps, a.global as u32, a.log_floor, a.log_alpha, a.capacity);
         let mut dc = a.conv as u32;
         let (mut sq, mut ns, mut cst) = SeqRows::parts(a.rows.as_ref());
+        let (mut chn, mut rst) = SeqRows::chain_parts(a.rows.as_ref(), cs);
         let mut p = [
             param(&mut pq),
             param(&mut pr),
@@ -892,6 +925,8 @@ impl InklingOps {
             param(&mut sq),
             param(&mut ns),
             param(&mut cst),
+            param(&mut chn),
+            param(&mut rst),
         ];
         let jobs = 2 * (a.heads + a.kv_heads);
         Self::go(&self.attn_prep, s, LaunchConfig { grid: (jobs, a.ntok, 1), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)
@@ -1173,7 +1208,8 @@ impl InklingOps {
         };
         let (mut px, mut pm, mut sl, mut nn, mut ps, mut pw, mut pc, mut pb, mut ch) = (x.dptr(), moe.map_or(0, |m| m.0.dptr()), slots, ntok, state.dptr(), weight.dptr(), cur.dptr(), pb, channels);
         let (mut sq, mut ns, mut cst) = SeqRows::parts(rows.as_ref());
-        let mut p = [param(&mut px), param(&mut pm), param(&mut sl), param(&mut nn), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut sq), param(&mut ns), param(&mut cst)];
+        let (mut chn, mut rst) = SeqRows::chain_parts(rows.as_ref(), ps);
+        let mut p = [param(&mut px), param(&mut pm), param(&mut sl), param(&mut nn), param(&mut ps), param(&mut pw), param(&mut pc), param(&mut pb), param(&mut ch), param(&mut sq), param(&mut ns), param(&mut cst), param(&mut chn), param(&mut rst)];
         let cfg = if rows.is_some() {
             LaunchConfig { grid: (channels.div_ceil(256), ntok, 1), block: (256, 1, 1), shared_mem_bytes: 0 }
         } else if nt == 1 {

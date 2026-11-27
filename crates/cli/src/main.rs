@@ -353,6 +353,52 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 }
             }
         }
+        "chaincheck" => {
+            // Chained verification on the decode kernels: 3 tokens per sequence must pick what
+            // three decode steps pick; after keeping only the first, the next step must match a
+            // sequence that only saw the first. Then times chains of 1..=4 tokens.
+            let toks: Vec<Vec<u32>> = (0..n).map(|q| (0..4).map(|j| (1000 + (q * 4 + j) * 7919 % 150000) as u32).collect()).collect();
+            let fresh = |s: &mut Session| -> Result<()> {
+                for q in 0..n {
+                    s.reset_seq(q)?;
+                    s.prefill_seq(q, 0, &long[..64])?;
+                }
+                Ok(())
+            };
+            fresh(&mut s)?;
+            let rows: Vec<DecodeRow> = (0..n).flat_map(|q| (0..3).map(move |j| (q, j))).map(|(q, j)| DecodeRow { seq: q, pos: 64 + j as u32, token: toks[q][j] }).collect();
+            let a = s.decode_verify(&rows)?;
+            let keep: Vec<(usize, usize)> = (0..n).map(|q| (q, 3 * q)).collect();
+            s.commit_verify(&keep)?;
+            let after: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 65, token: toks[q][3] }).collect();
+            let a2 = s.decode_batch(&after)?;
+            fresh(&mut s)?;
+            let mut b = vec![Vec::new(); n];
+            for j in 0..3 {
+                let r: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 64 + j as u32, token: toks[q][j] }).collect();
+                for (q, t) in s.decode_batch(&r)?.into_iter().enumerate() {
+                    b[q].push(t);
+                }
+            }
+            fresh(&mut s)?;
+            s.decode_batch(&(0..n).map(|q| DecodeRow { seq: q, pos: 64, token: toks[q][0] }).collect::<Vec<_>>())?;
+            let b2 = s.decode_batch(&after)?;
+            let by: Vec<usize> = (0..3).map(|j| (0..n).filter(|&q| a[3 * q + j] == b[q][j]).count()).collect();
+            let roll = a2.iter().zip(&b2).filter(|(x, y)| x == y).count();
+            println!("chaincheck: picks equal decode's by position {by:?} of {n}; after rollback {roll} / {n}");
+            for v in 1..=4usize {
+                let rows: Vec<DecodeRow> = (0..n).flat_map(|q| (0..v).map(move |j| (q, j))).map(|(q, j)| DecodeRow { seq: q, pos: 600 + j as u32, token: toks[q][j] }).collect();
+                s.decode_verify(&rows)?;
+                let t0 = std::time::Instant::now();
+                let mut c = 0;
+                while t0.elapsed().as_secs_f64() < 2.0 {
+                    s.decode_verify(&rows)?;
+                    c += 1;
+                }
+                println!("chain {n} x {v}: {:.2} ms per pass", t0.elapsed().as_secs_f64() * 1e3 / c as f64);
+            }
+            return Ok(true);
+        }
         "verifycheck" => {
             // A packed pass of 3 tokens per sequence must pick what three decode steps pick.
             let toks: Vec<Vec<u32>> = (0..n).map(|q| (0..3).map(|j| (1000 + (q * 3 + j) * 7919 % 150000) as u32).collect()).collect();

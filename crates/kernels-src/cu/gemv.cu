@@ -2538,24 +2538,33 @@ extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_mma_items(
 // astral_gemv_q8_0_mma_items with NT tiles of 8 tokens per block (each weight fragment feeds NT
 // MMAs) over up to 8 matrices (MultiQ8, blocks per matrix = ceil(n / 32)). grid = (blocks,
 // ceil(T / (8 * NT))), 256 threads (2 row tiles x 4 K quarters), K % 128 == 0.
-template <unsigned NT>
+template <unsigned NT, unsigned RT = 1>
 __device__ __forceinline__ void q8_dense_mma(const MultiQ8& m, unsigned K, unsigned T) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ float red[8][32][4 * NT];
+    // RT row tiles of 16 per warp: each activation fragment feeds RT * NT MMAs (blocks of 32 RT
+    // rows; the launcher counts blocks per matrix as ceil(n / (32 RT))).
+    __shared__ float red[8][32][4 * NT * RT];
     const unsigned bx = blockIdx.x;
     unsigned i = 0;
     while (i + 1 < m.count && bx >= m.start[i + 1]) ++i;
     const unsigned N = m.n[i];
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     const unsigned KB = K >> 5, KQ = KB >> 2;
-    const unsigned row0 = (bx - m.start[i]) * 32u + (warp & 1u) * 16u;
+    const unsigned row0 = (bx - m.start[i]) * 32u * RT + (warp & 1u) * 16u * RT;
     const unsigned kb0 = (warp >> 1) * KQ;
     const unsigned tb = blockIdx.y * 8u * NT;
-    const unsigned ra = min(row0 + g, N - 1u), rb = min(row0 + g + 8u, N - 1u);
-    const uint2* wa = reinterpret_cast<const uint2*>(m.qs[i] + (u64)ra * K) + t + kb0 * 4u;
-    const uint2* wb = reinterpret_cast<const uint2*>(m.qs[i] + (u64)rb * K) + t + kb0 * 4u;
-    const u16* da = reinterpret_cast<const u16*>(m.aux[i]) + (u64)ra * KB + kb0;
-    const u16* db = reinterpret_cast<const u16*>(m.aux[i]) + (u64)rb * KB + kb0;
+    const uint2* wa[RT];
+    const uint2* wb[RT];
+    const u16* da[RT];
+    const u16* db[RT];
+#pragma unroll
+    for (unsigned r = 0; r < RT; ++r) {
+        const unsigned ra = min(row0 + 16u * r + g, N - 1u), rb = min(row0 + 16u * r + g + 8u, N - 1u);
+        wa[r] = reinterpret_cast<const uint2*>(m.qs[i] + (u64)ra * K) + t + kb0 * 4u;
+        wb[r] = reinterpret_cast<const uint2*>(m.qs[i] + (u64)rb * K) + t + kb0 * 4u;
+        da[r] = reinterpret_cast<const u16*>(m.aux[i]) + (u64)ra * KB + kb0;
+        db[r] = reinterpret_cast<const u16*>(m.aux[i]) + (u64)rb * KB + kb0;
+    }
     const uint2* xa[NT];
     const float* s0[NT];
     const float* s1[NT];
@@ -2566,21 +2575,26 @@ __device__ __forceinline__ void q8_dense_mma(const MultiQ8& m, unsigned K, unsig
         s0[j] = m.xd[i] + (u64)t0 * KB + kb0;
         s1[j] = m.xd[i] + (u64)t1 * KB + kb0;
     }
-    float acc[NT][4];
+    float acc[RT][NT][4];
 #pragma unroll
-    for (unsigned j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
-    constexpr unsigned P = NT >= 4 ? 2 : 3;
+    for (unsigned r = 0; r < RT; ++r)
+#pragma unroll
+        for (unsigned j = 0; j < NT; ++j) acc[r][j][0] = acc[r][j][1] = acc[r][j][2] = acc[r][j][3] = 0.0f;
+    constexpr unsigned P = (NT * RT) >= 4 ? 2 : 3;
     for (unsigned k = 0; k < KQ; k += P) {
-        uint2 qa[P], qb[P], bxv[P][NT];
-        u16 sa[P], sb[P];
+        uint2 qa[P][RT], qb[P][RT], bxv[P][NT];
+        u16 sa[P][RT], sb[P][RT];
         float x0[P][NT], x1[P][NT];
 #pragma unroll
         for (unsigned p = 0; p < P; ++p) {
             const unsigned kk = min(k + p, KQ - 1u);
-            qa[p] = __ldg(wa + kk * 4u);
-            qb[p] = __ldg(wb + kk * 4u);
-            sa[p] = __ldg(da + kk);
-            sb[p] = __ldg(db + kk);
+#pragma unroll
+            for (unsigned r = 0; r < RT; ++r) {
+                qa[p][r] = __ldg(wa[r] + kk * 4u);
+                qb[p][r] = __ldg(wb[r] + kk * 4u);
+                sa[p][r] = __ldg(da[r] + kk);
+                sb[p][r] = __ldg(db[r] + kk);
+            }
 #pragma unroll
             for (unsigned j = 0; j < NT; ++j) {
                 bxv[p][j] = __ldg(xa[j] + kk * 4u);
@@ -2590,41 +2604,52 @@ __device__ __forceinline__ void q8_dense_mma(const MultiQ8& m, unsigned K, unsig
         }
 #pragma unroll
         for (unsigned p = 0; p < P; ++p) {
-            const unsigned a[4] = {qa[p].x, qb[p].x, qa[p].y, qb[p].y};
             const float live = (k + p < KQ) ? 1.0f : 0.0f;
-            const float wsa = __half2float(__ushort_as_half(sa[p])) * live, wsb = __half2float(__ushort_as_half(sb[p])) * live;
 #pragma unroll
-            for (unsigned j = 0; j < NT; ++j) {
-                int c[4];
-                mma_s8_16832(c, a, bxv[p][j].x, bxv[p][j].y);
-                acc[j][0] = fmaf((float)c[0], wsa * x0[p][j], acc[j][0]);
-                acc[j][1] = fmaf((float)c[1], wsa * x1[p][j], acc[j][1]);
-                acc[j][2] = fmaf((float)c[2], wsb * x0[p][j], acc[j][2]);
-                acc[j][3] = fmaf((float)c[3], wsb * x1[p][j], acc[j][3]);
+            for (unsigned r = 0; r < RT; ++r) {
+                const unsigned a[4] = {qa[p][r].x, qb[p][r].x, qa[p][r].y, qb[p][r].y};
+                const float wsa = __half2float(__ushort_as_half(sa[p][r])) * live, wsb = __half2float(__ushort_as_half(sb[p][r])) * live;
+#pragma unroll
+                for (unsigned j = 0; j < NT; ++j) {
+                    int c[4];
+                    mma_s8_16832(c, a, bxv[p][j].x, bxv[p][j].y);
+                    acc[r][j][0] = fmaf((float)c[0], wsa * x0[p][j], acc[r][j][0]);
+                    acc[r][j][1] = fmaf((float)c[1], wsa * x1[p][j], acc[r][j][1]);
+                    acc[r][j][2] = fmaf((float)c[2], wsb * x0[p][j], acc[r][j][2]);
+                    acc[r][j][3] = fmaf((float)c[3], wsb * x1[p][j], acc[r][j][3]);
+                }
             }
         }
     }
 #pragma unroll
-    for (unsigned j = 0; j < NT; ++j)
+    for (unsigned r = 0; r < RT; ++r)
 #pragma unroll
-        for (int q = 0; q < 4; ++q) red[warp][lane][4 * j + q] = acc[j][q];
+        for (unsigned j = 0; j < NT; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) red[warp][lane][4 * (r * NT + j) + q] = acc[r][j][q];
     __syncthreads();
     if (warp >= 2) return;
-    const unsigned r_lo = row0 + g, r_hi = r_lo + 8u;
     float* y = m.y[i];
 #pragma unroll
-    for (unsigned j = 0; j < NT; ++j) {
-        float v[4];
+    for (unsigned r = 0; r < RT; ++r) {
+        const unsigned r_lo = row0 + 16u * r + g, r_hi = r_lo + 8u;
 #pragma unroll
-        for (int q = 0; q < 4; ++q) v[q] = red[warp][lane][4 * j + q] + red[warp + 2][lane][4 * j + q] + red[warp + 4][lane][4 * j + q] + red[warp + 6][lane][4 * j + q];
-        const unsigned j0 = tb + 8u * j + 2u * t, j1 = j0 + 1u;
-        if (j0 < T) {
-            if (r_lo < N) y[(u64)j0 * N + r_lo] = v[0];
-            if (r_hi < N) y[(u64)j0 * N + r_hi] = v[2];
-        }
-        if (j1 < T) {
-            if (r_lo < N) y[(u64)j1 * N + r_lo] = v[1];
-            if (r_hi < N) y[(u64)j1 * N + r_hi] = v[3];
+        for (unsigned j = 0; j < NT; ++j) {
+            float v[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const unsigned o = 4 * (r * NT + j) + q;
+                v[q] = red[warp][lane][o] + red[warp + 2][lane][o] + red[warp + 4][lane][o] + red[warp + 6][lane][o];
+            }
+            const unsigned j0 = tb + 8u * j + 2u * t, j1 = j0 + 1u;
+            if (j0 < T) {
+                if (r_lo < N) y[(u64)j0 * N + r_lo] = v[0];
+                if (r_hi < N) y[(u64)j0 * N + r_hi] = v[2];
+            }
+            if (j1 < T) {
+                if (r_lo < N) y[(u64)j1 * N + r_lo] = v[1];
+                if (r_hi < N) y[(u64)j1 * N + r_hi] = v[3];
+            }
         }
     }
 #endif
@@ -2632,6 +2657,10 @@ __device__ __forceinline__ void q8_dense_mma(const MultiQ8& m, unsigned K, unsig
 extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n2(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<2>(m, K, T); }
 extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n4(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<4>(m, K, T); }
 extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_n8(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<8>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_r2_n2(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<2, 2>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_r2_n4(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<4, 2>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_r4_n1(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<1, 4>(m, K, T); }
+extern "C" __global__ void __launch_bounds__(256) astral_gemv_q8_0_dense_r4_n2(MultiQ8 m, unsigned K, unsigned T) { PDL_WAIT(); q8_dense_mma<2, 4>(m, K, T); }
 
 // =============================================================================================
 // Warpgroup-MMA GEMM for dense matrices stored as f16 A fragments (astral_quant::f16_frag_layout:

@@ -592,7 +592,7 @@ impl InklingOps {
         need("router logits", logits.dlen(), (ne * ntok) as usize)?;
         let (mut pw, mut px, mut kk, mut pl, mut n, mut nt) = (router.qs.device_ptr(), x.dptr(), k, logits.dptr(), ne, ntok);
         let mut p = [param(&mut pw), param(&mut px), param(&mut kk), param(&mut pl), param(&mut n), param(&mut nt)];
-        Self::go(&self.router_b, s, LaunchConfig { grid: (ne.div_ceil(8), ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
+        Self::go(&self.router_b, s, LaunchConfig { grid: (ne, ntok.div_ceil(8), 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
     pub fn router_fused(

@@ -581,16 +581,19 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_router_fused(const 
     if (t == 0) counter[tok] = 0u;
 }
 
-// Router logits for many tokens (batched decode): block = 8 experts x 8 tokens, warp w on expert
-// 8 * blockIdx.x + w; the tokens' rows are shared by the warps through L1. grid (n_expert / 8,
-// ceil(ntok / 8)); K % 4 == 0. Top-k follows in astral_ink_router_topk.
+// Router logits for many tokens (batched decode): block = one expert x 8 tokens, its 8 warps
+// splitting K (partial sums reduced in shared memory), so the grid has enough blocks to hide
+// the load latency. grid (n_expert, ceil(ntok / 8)); K % 4 == 0. Top-k follows in
+// astral_ink_router_topk.
 extern "C" __global__ void __launch_bounds__(256) astral_ink_router_b(const float* __restrict__ w, const float* __restrict__ x, unsigned K,
                                                                       float* __restrict__ logits, unsigned n_expert, unsigned ntok) { PDL_WAIT();
     constexpr unsigned TT = 8;
+    __shared__ float red[8][TT];
     const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const unsigned e = blockIdx.x * 8u + warp, t0 = blockIdx.y * TT;
+    const unsigned e = blockIdx.x, t0 = blockIdx.y * TT;
     if (e >= n_expert) return;
     const unsigned nt = min(TT, ntok - t0);
+    const unsigned K4 = K >> 2, per = (K4 + 7u) / 8u, i0 = warp * per, i1 = min(K4, i0 + per);
     const float4* wv = reinterpret_cast<const float4*>(w + (u64)e * K);
     const float4* xr[TT];
 #pragma unroll
@@ -598,7 +601,7 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_router_b(const floa
     float acc[TT];
 #pragma unroll
     for (unsigned t = 0; t < TT; ++t) acc[t] = 0.0f;
-    for (unsigned i = lane; i < (K >> 2); i += 32u) {
+    for (unsigned i = i0 + lane; i < i1; i += 32u) {
         const float4 a = __ldg(wv + i);
 #pragma unroll
         for (unsigned t = 0; t < TT; ++t) {
@@ -609,7 +612,14 @@ extern "C" __global__ void __launch_bounds__(256) astral_ink_router_b(const floa
 #pragma unroll
     for (unsigned t = 0; t < TT; ++t) {
         const float v = warp_sum(acc[t]);
-        if (lane == 0 && t < nt) logits[(u64)(t0 + t) * n_expert + e] = v;
+        if (lane == 0) red[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nt) {
+        float v = 0.0f;
+#pragma unroll
+        for (unsigned q = 0; q < 8; ++q) v += red[q][threadIdx.x];
+        logits[(u64)(t0 + threadIdx.x) * n_expert + e] = v;
     }
 }
 

@@ -1745,7 +1745,7 @@ fn forward(
         ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
         ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
         match w.output.ty {
-            GemvType::Q8_0 if fast_batch(ntok) && q_tiled() && ntok > 32 && ntok <= 64 && w.output.k.is_multiple_of(128) => ex.gemv.launch_q_tiled(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
+            GemvType::Q8_0 if fast_batch(ntok) && q_tiled() && ntok > tiled_min() && ntok <= 64 && w.output.k.is_multiple_of(128) => ex.gemv.launch_q_tiled(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
             GemvType::Q8_0 if fast_batch(ntok) => ex.gemv.launch_q_dense(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?,
             GemvType::Q8_0 => ex.mm_decode(&w.output, &s.qa[0], &mut *b.logits, ntok)?,
             _ => ex.mm(&w.output, &s.qa[0], b.logits, ntok, &s.items_dense, &s.work[0])?,
@@ -1842,6 +1842,12 @@ fn decode_tma() -> bool {
 
 /// Batched decode's dense projections on the shared-memory tiled kernel (`ASTRAL_Q_TILED=0`
 /// for the register kernel).
+/// Rows above which batched decode uses the smem-tiled int8 GEMM (`ASTRAL_TILED_MIN`).
+fn tiled_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_TILED_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(32))
+}
+
 fn q_tiled() -> bool {
     std::env::var("ASTRAL_Q_TILED").map_or(true, |v| v != "0")
 }
@@ -2110,7 +2116,7 @@ fn layer(
             if !rest.is_empty() {
                 ex.gemv.launch_q_dense(st, &mut rest, nt)?;
             }
-        } else if fast && q_tiled() && nt > 32 && nt <= 64 && l.wq.k.is_multiple_of(128) {
+        } else if fast && q_tiled() && nt as usize > tiled_min() && nt <= 64 && l.wq.k.is_multiple_of(128) {
             // Large batched decode: weights and activations staged through shared memory.
             ex.gemv.launch_q_tiled(st, &mut items, nt)?;
         } else if fast {
@@ -2512,7 +2518,7 @@ fn layer(
         let (_, tm) = l.wo.w16.as_ref().expect("checked");
         let w = &s.work128;
         ex.gemv.launch_gemm_f16_tma(st, 128, tm, l.wo.n, l.wo.k, 1, None, s.qa_attn.f16_ptr()?, nt, &mut s.o, nt, &w.items, w.n_items, &w.xidx, &w.yidx, w.idx_len)?;
-    } else if fast && q_tiled() && nt > 32 && nt <= 64 && l.wo.k.is_multiple_of(128) {
+    } else if fast && q_tiled() && nt as usize > tiled_min() && nt <= 64 && l.wo.k.is_multiple_of(128) {
         ex.gemv.launch_q_tiled(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;
     } else if fast {
         ex.gemv.launch_q_dense(st, &mut [MultiItem { m: &l.wo, x: &s.qa_attn, y: &mut s.o }], nt)?;

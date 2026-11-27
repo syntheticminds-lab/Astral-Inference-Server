@@ -302,6 +302,16 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 s.prefill_seq(q, 0, &long[..64])?;
             }
             let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 600, token: (1000 + q * 7919 % 150000) as u32 }).collect();
+            // ASTRAL_PROFILE=1: one warmed-up step under the profiler, then exit.
+            if std::env::var_os("ASTRAL_PROFILE").is_some() {
+                for _ in 0..5 {
+                    s.decode_batch(&rows)?;
+                }
+                astral_gpu::profiler(true)?;
+                s.decode_batch(&rows)?;
+                astral_gpu::profiler(false)?;
+                return Ok(true);
+            }
             while std::time::Instant::now() < t_end {
                 s.decode_batch(&rows)?;
                 cnt += 1;

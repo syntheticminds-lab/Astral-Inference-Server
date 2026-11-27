@@ -460,6 +460,8 @@ pub struct Gemv {
     ws256: [Function; 5],
     /// Dense prefill GEMM in two-block clusters (activation multicast).
     gemm_mc: Function,
+    /// Dense decode int8 GEMMs with 2 or 4 row tiles per warp (r2 n2, r2 n4, r4 n1, r4 n2).
+    dense_rt: [Function; 4],
     /// Persistent expert GEMMs (tiles 128, 64).
     ws_p: [Function; 2],
     /// Persistent dense prefill GEMM (contiguous tokens, TMA for both operands).
@@ -718,6 +720,7 @@ impl Gemv {
                 [q, h]
             },
             dense_mma: [f("astral_gemv_q8_0_dense_n2")?, f("astral_gemv_q8_0_dense_n4")?, f("astral_gemv_q8_0_dense_n8")?],
+            dense_rt: [f("astral_gemv_q8_0_dense_r2_n2")?, f("astral_gemv_q8_0_dense_r2_n4")?, f("astral_gemv_q8_0_dense_r4_n1")?, f("astral_gemv_q8_0_dense_r4_n2")?],
             q_tiled: {
                 let fw = f("astral_gemv_q8_0_tiled")?;
                 let _ = fw.set_max_dynamic_shared(Q_TILED_SMEM);
@@ -1812,6 +1815,9 @@ impl Gemv {
             return Err(invalid(format!("launch_q_dense: {} products for {ntok} tokens do not qualify", items.len())));
         }
         let mut d = MultiQ8 { qs: [0; 8], aux: [0; 8], xq: [0; 8], xd: [0; 8], y: [0; 8], n: [0; 8], start: [0; 9], count: items.len() as u32 };
+        // ASTRAL_DENSE_RT = 2 or 4: that many 16-row tiles per warp (each activation fragment
+        // feeds more MMAs); 1: the original kernels.
+        let rt: u32 = std::env::var("ASTRAL_DENSE_RT").ok().and_then(|v| v.parse().ok()).filter(|v| [1, 2, 4].contains(v)).unwrap_or(1);
         let mut blocks = 0u32;
         for (i, it) in items.iter().enumerate() {
             if it.y.dlen() < (ntok * it.m.n) as usize {
@@ -1824,13 +1830,17 @@ impl Gemv {
             d.y[i] = it.y.dptr();
             d.n[i] = it.m.n;
             d.start[i] = blocks;
-            blocks += it.m.n.div_ceil(32);
+            blocks += it.m.n.div_ceil(32 * rt);
         }
         d.start[items.len()] = blocks;
         // 32-token tiles for larger batches measured best (64 rows: 24.6 vs 25.5 ms per step).
-        let (f, per) = match ntok.min(32) {
-            0..=16 => (&self.dense_mma[0], 16),
-            17..=32 => (&self.dense_mma[1], 32),
+        let (f, per) = match (rt, ntok.min(32)) {
+            (2, 0..=16) => (&self.dense_rt[0], 16),
+            (2, _) => (&self.dense_rt[1], 32),
+            (4, 0..=8) => (&self.dense_rt[2], 8),
+            (4, _) => (&self.dense_rt[3], 16),
+            (_, 0..=16) => (&self.dense_mma[0], 16),
+            (_, 17..=32) => (&self.dense_mma[1], 32),
             _ => (&self.dense_mma[2], 64),
         };
         let (mut kk, mut t) = (k, ntok);

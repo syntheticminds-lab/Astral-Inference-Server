@@ -2327,6 +2327,171 @@ extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_prefill_segs(
                       out + row0 * qw, pos_p + sg[3], n, heads, kv_heads, n_rel, extent, window, scale, capacity);
 }
 
+
+// astral_ink_attn_split_gqa3 on tensor cores: one 64-key chunk per split, K and V staged in
+// shared memory by cp.async; the KV head's 3 query heads are rows 0-2 of an m16 tile (Q in
+// f16, as the prefill kernel), each of the 4 warps takes 16 of the chunk's keys (QK^T and PV
+// with m16n8k16), and the warps' partial softmaxes are merged into the same partials as
+// astral_ink_attn_split_gqa3 (astral_ink_attn_merge* finishes). grid = (kv_heads, splits, rows),
+// 128 threads; head_dim 128, n_rel <= 16.
+extern "C" __global__ void __launch_bounds__(128) astral_ink_attn_split_gqa3_tc(
+    const float* __restrict__ q, const float* __restrict__ r, const float* __restrict__ sink,
+    const __half* __restrict__ kc, const __half* __restrict__ vc, const float* __restrict__ rel_bias,
+    float* __restrict__ part, const int* __restrict__ pos_p, unsigned heads, unsigned kv_heads, unsigned n_rel,
+    unsigned extent, unsigned window, float scale, unsigned capacity, unsigned max_splits,
+    const int* __restrict__ seq_p, unsigned n_seqs) { PDL_WAIT();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr unsigned HD = 128, G = 3;
+    __shared__ __align__(16) __half Ks[64 * FA_ROW];
+    __shared__ __align__(16) __half Vs[64 * FA_ROW];
+    __shared__ float wm[4][G], wl[4][G], wacc[4][G][HD];
+    const unsigned kvh = blockIdx.x, sp = blockIdx.y, z = blockIdx.z;
+    q += (u64)z * heads * HD;
+    r += (u64)z * heads * n_rel;
+    sink += (u64)z * heads;
+    part += (u64)z * heads * max_splits * (HD + 2);
+    {
+        const u64 so = row_seq(seq_p, n_seqs, z) * capacity * kv_heads * HD;
+        kc += so;
+        vc += so;
+    }
+    const unsigned h0 = kvh * G;
+    const unsigned pos = min((unsigned)row_pos(pos_p, seq_p, z), min(capacity, (unsigned)MAX_CTX) - 1u);
+    const unsigned lo = (window && pos + 1 > window) ? pos + 1 - window : 0u;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
+    const unsigned width = kv_heads * HD;
+    const bool row_ok = g < G;
+    const unsigned hg = h0 + (row_ok ? g : 0u);
+    // Q fragments: row g (< 3) is head h0 + g; rows 3-15 are zero.
+    unsigned qa[8][4];
+    {
+        const float* qr = q + (u64)hg * HD;
+#pragma unroll
+        for (unsigned ks = 0; ks < 8; ++ks) {
+            const unsigned c = ks * 16u + 2u * t;
+            qa[ks][0] = row_ok ? pack_h2(qr[c], qr[c + 1]) : 0u;
+            qa[ks][1] = 0u;
+            qa[ks][2] = row_ok ? pack_h2(qr[c + 8], qr[c + 9]) : 0u;
+            qa[ks][3] = 0u;
+        }
+    }
+    float rr[16];
+#pragma unroll
+    for (unsigned i = 0; i < 16; ++i) rr[i] = (row_ok && i < n_rel) ? r[(u64)hg * n_rel + i] : 0.0f;
+    const float skg = row_ok ? sink[hg] : 0.0f;
+    for (unsigned spl = sp; spl < max_splits; spl += gridDim.y) {
+        const unsigned start = lo + spl * ATT_CHUNK;
+        if (start > pos) return;
+        const unsigned end = min(pos + 1, start + ATT_CHUNK);
+        __syncthreads();   // the previous split's tiles and partials are no longer read
+        for (unsigned c = tid; c < 64u * 16u; c += 128u) {
+            const unsigned row = c >> 4, piece = c & 15u;
+            const unsigned j = min(start + row, end - 1u);
+            cp_async16(Ks + row * FA_ROW + piece * 8u, kc + (u64)j * width + (u64)kvh * HD + piece * 8u);
+            cp_async16(Vs + row * FA_ROW + piece * 8u, vc + (u64)j * width + (u64)kvh * HD + piece * 8u);
+        }
+        cp_async_commit();
+        cp_async_wait<0>();
+        __syncthreads();
+        // S = Q K^T for this warp's 16 keys (two n-tiles of 8).
+        float sc[2][4];
+#pragma unroll
+        for (unsigned nt = 0; nt < 2; ++nt) {
+            sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0f;
+            const __half* kr = Ks + (warp * 16u + nt * 8u + g) * FA_ROW + 2u * t;
+#pragma unroll
+            for (unsigned ks = 0; ks < 8; ++ks) {
+                const unsigned b0 = *reinterpret_cast<const unsigned*>(kr + ks * 16u);
+                const unsigned b1 = *reinterpret_cast<const unsigned*>(kr + ks * 16u + 8u);
+                mma_f16(sc[nt], qa[ks], b0, b1);
+            }
+        }
+        // Logits (row g's two keys per n-tile), bias, sink and masks; row maximum.
+        float mx = -INFINITY;
+#pragma unroll
+        for (unsigned nt = 0; nt < 2; ++nt) {
+#pragma unroll
+            for (unsigned u = 0; u < 2; ++u) {
+                const unsigned j = start + warp * 16u + nt * 8u + 2u * t + u;
+                float l = -INFINITY;
+                if (row_ok && j < end) {
+                    const unsigned dist = pos - j;
+                    float bias = 0.0f;
+                    if (dist < extent) {
+                        const float4* br = reinterpret_cast<const float4*>(rel_bias + (u64)dist * n_rel);
+#pragma unroll
+                        for (unsigned v = 0; v < 4; ++v) {
+                            if (v * 4u < n_rel) {
+                                const float4 b4 = __ldg(br + v);
+                                bias = fmaf(b4.x, rr[4 * v], bias);
+                                bias = fmaf(b4.y, rr[4 * v + 1], bias);
+                                bias = fmaf(b4.z, rr[4 * v + 2], bias);
+                                bias = fmaf(b4.w, rr[4 * v + 3], bias);
+                            }
+                        }
+                    }
+                    l = fmaf(scale, sc[nt][u], bias) - skg;
+                }
+                sc[nt][u] = l;
+                mx = fmaxf(mx, l);
+            }
+            sc[nt][2] = sc[nt][3] = 0.0f;   // rows 8-15: none
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        float ps = 0.0f;
+#pragma unroll
+        for (unsigned nt = 0; nt < 2; ++nt) {
+#pragma unroll
+            for (unsigned u = 0; u < 2; ++u) {
+                const float p = mx == -INFINITY ? 0.0f : expf(sc[nt][u] - mx);
+                sc[nt][u] = p;
+                ps += p;
+            }
+        }
+        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+        ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+        // O = P V over the warp's 16 keys.
+        float o[16][4];
+#pragma unroll
+        for (unsigned dn = 0; dn < 16; ++dn) o[dn][0] = o[dn][1] = o[dn][2] = o[dn][3] = 0.0f;
+        const unsigned pa[4] = {pack_h2(sc[0][0], sc[0][1]), pack_h2(sc[0][2], sc[0][3]), pack_h2(sc[1][0], sc[1][1]), pack_h2(sc[1][2], sc[1][3])};
+#pragma unroll
+        for (unsigned dn = 0; dn < 16; ++dn) {
+            unsigned b0, b1;
+            const __half* vp = Vs + (warp * 16u + (lane & 15u)) * FA_ROW + dn * 8u;
+            const unsigned vsp = (unsigned)__cvta_generic_to_shared(vp);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(vsp));
+            mma_f16(o[dn], pa, b0, b1);
+        }
+        if (row_ok) {
+            if (t == 0) { wm[warp][g] = mx; wl[warp][g] = ps; }
+#pragma unroll
+            for (unsigned dn = 0; dn < 16; ++dn) {
+                wacc[warp][g][dn * 8u + 2u * t] = o[dn][0];
+                wacc[warp][g][dn * 8u + 2u * t + 1u] = o[dn][1];
+            }
+        }
+        __syncthreads();
+        const unsigned d = tid;   // 128 threads = HD
+#pragma unroll
+        for (unsigned gg = 0; gg < G; ++gg) {
+            const float M = fmaxf(fmaxf(wm[0][gg], wm[1][gg]), fmaxf(wm[2][gg], wm[3][gg]));
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll
+            for (unsigned w = 0; w < 4; ++w) {
+                const float f = wm[w][gg] == -INFINITY ? 0.0f : expf(wm[w][gg] - M);
+                acc = fmaf(wacc[w][gg][d], f, acc);
+                L = fmaf(wl[w][gg], f, L);
+            }
+            float* out = part + ((u64)(h0 + gg) * max_splits + spl) * (HD + 2);
+            out[2 + d] = acc;
+            if (d == 0) { out[0] = M; out[1] = L; }
+        }
+    }
+#endif
+}
+
 // =============================================================================================
 // Tokens per GEMM work item: `chunk` (64 = MMA_TOK of the mma.sync kernels, 128 for wgmma).
 // MoE grouping on the GPU (prefill): sorts the P = ntok * k (token, expert) picks by expert and

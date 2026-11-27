@@ -109,6 +109,7 @@ pub struct InklingOps {
     attn_split1: Function,
     /// [`InklingOps::attn_decode_split`] one-chunk splits, 3 query heads per KV head in a block.
     attn_split_gqa3: Function,
+    attn_split_gqa3_tc: Function,
     attn_merge_q8: Function,
     mix_rms_q8: Function,
     router_b: Function,
@@ -287,6 +288,7 @@ impl InklingOps {
             attn_merge: f("astral_ink_attn_merge")?,
             attn_split1: f("astral_ink_attn_split1")?,
             attn_split_gqa3: f("astral_ink_attn_split_gqa3")?,
+            attn_split_gqa3_tc: f("astral_ink_attn_split_gqa3_tc")?,
             attn_merge_q8: f("astral_ink_attn_merge_q8")?,
             mix_rms_q8: f("astral_ink_mix_rms_q8")?,
             router_fused: f("astral_ink_router_fused")?,
@@ -1210,7 +1212,14 @@ impl InklingOps {
             // A KV head's 3 query heads in one block: each K / V row read once.
             let f: u32 = std::env::var("ASTRAL_GQA_GY").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
             let gy = (max_splits * f).div_ceil(ntok).clamp(1, max_splits);
-            Self::go(&self.attn_split_gqa3, s, LaunchConfig { grid: (a.kv_heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            // ASTRAL_GQA_TC=1: the tensor-core form (head_dim 128, n_rel <= 16), measured the same
+            // speed in the decode graph, so the warp-shuffle kernel stays the default.
+            let tc = a.head_dim == 128 && a.n_rel <= 16 && a.n_rel.is_multiple_of(4) && std::env::var("ASTRAL_GQA_TC").is_ok_and(|v| v == "1");
+            let f = if tc { &self.attn_split_gqa3_tc } else { &self.attn_split_gqa3 };
+            // Diagnostics: ASTRAL_SKIP_ATTN=1 skips the split kernel (wrong outputs; timing only).
+            if std::env::var_os("ASTRAL_SKIP_ATTN").is_none() {
+                Self::go(f, s, LaunchConfig { grid: (a.kv_heads, gy, ntok), block: (128, 1, 1), shared_mem_bytes: 0 }, &mut p)?;
+            }
         } else {
             let f = if chunk_loop { &self.attn_split } else { &self.attn_split1 };
             // One-chunk splits: blocks loop over splits, so many rows need fewer (mostly idle) blocks.

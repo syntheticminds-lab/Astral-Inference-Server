@@ -10,6 +10,7 @@ All notable changes to Astral Inference Server are documented here.
 
 ### Added
 
+- `install.sh`: one-line install (`curl -fsSL .../install.sh | sh`) that builds Astral for the local GPUs.
 - Inkling 2 Mini loads straight from its native safetensors checkpoint (`astral serve <checkpoint dir>`), converted on load to the same tensors as the GGUF path.
 - OpenAI-compatible server (`astral serve`): `/v1/completions`, `/v1/chat/completions` (streaming, stop strings, reasoning output, tool calls), `/v1/models`, `/tokenize`, `/health`.
 - Inkling 2 Mini chat template and tokenizer, matching reference token ids.

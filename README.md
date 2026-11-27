@@ -75,17 +75,18 @@ The methodology, per-prompt-set results and the vLLM Rust-frontend comparison ar
 
 ## Getting Started
 
-Build Astral from source (Linux, an NVIDIA driver with CUDA 12, `nvcc` 12.8+ and a recent stable Rust toolchain):
+Install Astral with one command (Linux, an NVIDIA GPU, and the CUDA toolkit with `nvcc` 12.8+):
 
 ```bash
-ASTRAL_CUDA_ARCHS=80,90a cargo build --release
-./target/release/astral selftest      # kernel self-tests on your GPU
+curl -fsSL https://raw.githubusercontent.com/syntheticminds-lab/Astral-Inference-Server/main/install.sh | sh
 ```
+
+The script builds Astral for the GPUs in your machine, installs Rust if it is missing, links `astral` into `~/.local/bin` and runs the kernel self-test. To build by hand instead, see [installation](docs/getting_started/installation.md).
 
 Serve Inkling 2 Mini with its DSpark draft, straight from the checkpoint directory:
 
 ```bash
-./target/release/astral serve Inkling-2-Mini/
+astral serve Inkling-2-Mini/
 ```
 
 Visit our [documentation](docs/README.md) to learn more.

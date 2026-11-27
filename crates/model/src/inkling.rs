@@ -1194,21 +1194,27 @@ impl Session {
         if k == 0 || entries.iter().any(|e| e.3.len() != k) {
             return Err(bad("spec_round: batched drafting is not enabled or drafts are not k long".into()));
         }
-        let v = k + 1;
+        // Drafts verified this round (ASTRAL_SPEC_KV, default 2 of the k drafted): fewer rows per
+        // sequence keep the verify pass (a MoE pass touching more experts per row) near the cost
+        // of a plain decode step; 2 measured best serving 8 requests.
+        let kv = std::env::var("ASTRAL_SPEC_KV").ok().and_then(|x| x.parse::<usize>().ok()).unwrap_or(2).clamp(1, k);
+        let v = kv + 1;
         let mut rows = Vec::with_capacity(entries.len() * v);
         for &(q, p, a, ref d) in entries {
             rows.push(DecodeRow { seq: q, pos: p, token: a });
-            for (i, &t) in d.iter().enumerate() {
+            for (i, &t) in d[..kv].iter().enumerate() {
                 rows.push(DecodeRow { seq: q, pos: p + 1 + i as u32, token: t });
             }
         }
+        let tq0 = std::time::Instant::now();
         let picks = self.decode_verify(&rows)?;
+        let tq1 = std::time::Instant::now();
         let mut keep = Vec::with_capacity(entries.len());
         let mut acc = Vec::with_capacity(entries.len());
         let mut blocks = Vec::with_capacity(entries.len());
         for (e, &(q, p, _, ref d)) in entries.iter().enumerate() {
             let pk = &picks[e * v..(e + 1) * v];
-            let j = d.iter().zip(pk).take_while(|(x, y)| x == y).count();
+            let j = d[..kv].iter().zip(pk).take_while(|(x, y)| x == y).count();
             let mut out = d[..j].to_vec();
             out.push(pk[j]);
             keep.push((q, e * v + j));
@@ -1216,6 +1222,7 @@ impl Session {
             acc.push(out);
         }
         self.commit_verify(&keep)?;
+        let tq2 = std::time::Instant::now();
         // The draft context of every verified row (rows past the accepted ones are rewritten
         // by later rounds before they are read).
         {
@@ -1239,10 +1246,23 @@ impl Session {
             }
             sp.batch.as_deref_mut().expect("checked").store_graphs[&nr].launch(stream)?;
         }
+        let tq3 = std::time::Instant::now();
         let drafts = self.batch_draft_run(&blocks)?;
+        if std::env::var_os("ASTRAL_SPEC_TIMING").is_some() {
+            static T: std::sync::Mutex<(u64, [f64; 4])> = std::sync::Mutex::new((0, [0.0; 4]));
+            let mut t = T.lock().unwrap_or_else(|e| e.into_inner());
+            t.0 += 1;
+            for (i, d) in [tq1 - tq0, tq2 - tq1, tq3 - tq2, tq3.elapsed()].iter().enumerate() {
+                t.1[i] += d.as_secs_f64() * 1e3;
+            }
+            if t.0 % 20 == 0 {
+                let n = t.0 as f64;
+                eprintln!("spec_round {} x {}: verify {:.2} commit {:.2} store {:.2} draft {:.2} ms", t.0, entries.len(), t.1[0] / n, t.1[1] / n, t.1[2] / n, t.1[3] / n);
+            }
+        }
         if let Some(sp) = self.spec.as_deref_mut() {
             sp.stats.rounds += entries.len() as u64;
-            sp.stats.drafted += (entries.len() * k) as u64;
+            sp.stats.drafted += (entries.len() * kv) as u64;
             sp.stats.accepted += acc.iter().map(|a| a.len() as u64 - 1).sum::<u64>();
         }
         Ok(acc.into_iter().zip(drafts).collect())

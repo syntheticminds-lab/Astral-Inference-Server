@@ -118,7 +118,7 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
     let (free, _) = ctx.mem_info()?;
     // The draft's weights and buffers come out of the same memory.
     // (Batched drafting adds per-sequence draft caches and verification row states: ~5 GB.)
-    let batch_spec = std::env::var("ASTRAL_BATCH_SPEC").is_ok_and(|v| v == "1");
+    let batch_spec = std::env::var("ASTRAL_BATCH_SPEC").map_or(true, |v| v != "0");
     let reserve = RESERVE_BYTES + if cfg.draft.is_some() { if batch_spec { 7 << 30 } else { 2 << 30 } } else { 0 };
     let fit = free.saturating_sub(reserve) / per_seq.max(1);
     let seqs = if cfg.max_seqs == 0 { fit.clamp(1, AUTO_MAX_SEQS) } else { cfg.max_seqs };
@@ -144,10 +144,9 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
             s.spec_next()?;
         }
         s.reset()?;
-        // ASTRAL_BATCH_SPEC=1: batched drafting for requests that start while few are running.
-        // At 8 concurrent requests its generation is ~24% faster, but its prompt passes cost
-        // more, so serving measured even; off by default until those passes are cheaper.
-        if std::env::var("ASTRAL_BATCH_SPEC").is_ok_and(|v| v == "1") {
+        // Batched drafting for requests that start while few are running (ASTRAL_BATCH_SPEC=0:
+        // lone requests only). At 8 concurrent requests serving measured ~10% faster.
+        if std::env::var("ASTRAL_BATCH_SPEC").map_or(true, |v| v != "0") {
             s.enable_batch_spec(seqs)?;
             s.reset_seq(0)?;
             let first = s.prefill_seq_spec(0, 0, &warm)?;
@@ -241,6 +240,8 @@ struct Scheduler<'a> {
     closed: bool,
     /// `ASTRAL_STEP_STATS=1`: time and tokens of mixed passes and decode-only steps.
     stats: Option<StepStats>,
+    /// Set while the requests without drafts step beside a draft round: no prompt pass then.
+    hold_prefill: bool,
 }
 
 #[derive(Default)]
@@ -269,7 +270,7 @@ impl StepStats {
 impl<'a> Scheduler<'a> {
     fn new(s: &'a mut Session, rx: Receiver<Job>) -> Self {
         let n = s.n_seqs();
-        Self { s, rx, waiting: VecDeque::new(), prefilling: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false, stats: std::env::var_os("ASTRAL_STEP_STATS").map(|_| StepStats::default()) }
+        Self { s, rx, waiting: VecDeque::new(), prefilling: VecDeque::new(), active: Vec::new(), free: vec![true; n], closed: false, stats: std::env::var_os("ASTRAL_STEP_STATS").map(|_| StepStats::default()), hold_prefill: false }
     }
 
     fn run(&mut self) {
@@ -385,7 +386,8 @@ impl<'a> Scheduler<'a> {
             let (spec, rest): (Vec<Active>, Vec<Active>) = std::mem::take(&mut self.active).into_iter().partition(|a| a.drafts.is_some());
             self.active = rest;
             let kept = self.spec_step(spec);
-            let r = if self.active.is_empty() && self.prefilling.is_empty() { Ok(()) } else { self.plain_step() };
+            // The prompts keep waiting (the decision was made with the drafting requests counted).
+            let r = if self.active.is_empty() { Ok(()) } else { self.hold_prefill = true; let r = self.plain_step(); self.hold_prefill = false; r };
             match kept {
                 Ok(k) => self.active.extend(k),
                 Err(e) => return Err(e),
@@ -515,7 +517,7 @@ impl<'a> Scheduler<'a> {
             }
         }
         let mb = self.s.max_batch();
-        if !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= mb && self.prefill_now() {
+        if !self.prefilling.is_empty() && !self.hold_prefill && self.active.len() + self.prefilling.len() <= mb && self.prefill_now() {
             return self.mixed_step();
         }
         // A plain decode step does not store the draft context: drafting stops for these.
@@ -560,11 +562,14 @@ impl<'a> Scheduler<'a> {
     /// wait (at most `ASTRAL_PREFILL_WAIT_MS`, default 0 = never) until `ASTRAL_PREFILL_BATCH`
     /// prompt tokens are pending, and are then prefilled together.
     fn prefill_now(&self) -> bool {
-        let wait_ms: u64 = std::env::var("ASTRAL_PREFILL_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // While requests are drafting, prompts wait (300 ms, or two prompts' worth of tokens)
+        // to share a pass: a pass streams the experts however few tokens it holds.
+        let drafting = self.active.iter().any(|a| a.drafts.is_some());
+        let wait_ms: u64 = std::env::var("ASTRAL_PREFILL_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(if drafting { 300 } else { 0 });
         if wait_ms == 0 || self.active.is_empty() {
             return true;
         }
-        let want: usize = std::env::var("ASTRAL_PREFILL_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(self.s.token_budget() / 2);
+        let want: usize = std::env::var("ASTRAL_PREFILL_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(if drafting { 1024 } else { self.s.token_budget() / 2 });
         let pending: usize = self.prefilling.iter().map(|p| p.job.prompt.len() - p.done).sum();
         let oldest = self.prefilling.front().map_or(0, |p| p.since.elapsed().as_millis() as u64);
         pending >= want || oldest >= wait_ms || self.active.len() + self.prefilling.len() >= self.s.max_batch()

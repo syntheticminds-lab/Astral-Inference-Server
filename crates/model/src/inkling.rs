@@ -635,6 +635,10 @@ pub struct Session {
     dense_rows: usize,
     /// `ASTRAL_STEP_TIMING`: decode_batch calls and seconds in (prepare, launch, wait, read).
     phase: (u64, [f64; 4], u64),
+    /// Every row's pick of the last verification pass.
+    last_rows: Vec<u32>,
+    /// Verification-pass graphs by (parts, tokens per part).
+    verify_graphs: std::collections::HashMap<(usize, usize), GraphExec>,
 }
 
 /// Device buffers of the batched decode pass.
@@ -648,6 +652,9 @@ struct BatchBufs {
     dops: DsparkOps,
     /// First position of each segment of a packed prefill pass.
     seg_pos: DeviceBuffer<i32>,
+    /// Per-row sequence and position of a packed pass (tmax rows), for verification passes.
+    vseq: DeviceBuffer<i32>,
+    vpos: DeviceBuffer<i32>,
 }
 
 /// One row of a batched decode step: feed `token` to sequence `seq` at position `pos`.
@@ -658,13 +665,19 @@ pub struct DecodeRow {
     pub token: u32,
 }
 
+/// Rows of the batched output buffers: decode rows, or verification passes of up to 4 tokens
+/// per sequence.
+fn vrows_max(max_batch: usize, tmax: usize) -> usize {
+    (4 * max_batch).min(tmax).max(max_batch)
+}
+
 /// Floats of attention workspace: decode at full capacity, or `tmax` tokens over 512 positions.
 fn attn_work_len(c: &Config, capacity: u32, tmax: usize, max_batch: usize) -> usize {
     use astral_kernels::inkling::{attn_workspace, ATT_CHUNK};
     let (h, hd) = (c.heads as u32, c.head_dim as u32);
     // Decode (up to `max_batch` sequences), and passes of up to QITEM_ROWS tokens (speculative
     // verification), at full capacity.
-    let decode = attn_workspace(QITEM_ROWS.max(max_batch).min(tmax) as u32, h, hd, capacity.div_ceil(ATT_CHUNK));
+    let decode = attn_workspace(QITEM_ROWS.max(4 * max_batch).min(tmax) as u32, h, hd, capacity.div_ceil(ATT_CHUNK));
     if split_prefill() {
         decode.max(attn_workspace(tmax.min(512) as u32, h, hd, 512u32.div_ceil(ATT_CHUNK)))
     } else {
@@ -765,13 +778,16 @@ impl Session {
         let b = BatchBufs {
             seq: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
             pos: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
-            logits: z(max_batch * w.output.n as usize)?,
-            next: DeviceBuffer::<i32>::zeroed(ctx, max_batch)?,
-            part_v: z(max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
-            part_i: DeviceBuffer::<u32>::zeroed(ctx, max_batch * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            // Rows of a batched pass: decode (max_batch) or verification (up to 4 per sequence).
+            logits: z(vrows_max(max_batch, t) * w.output.n as usize)?,
+            next: DeviceBuffer::<i32>::zeroed(ctx, vrows_max(max_batch, t))?,
+            part_v: z(vrows_max(max_batch, t) * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            part_i: DeviceBuffer::<u32>::zeroed(ctx, vrows_max(max_batch, t) * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
             dops: DsparkOps::new(&reg)?,
             // Start positions, then (packed prefill) the 4-word segment table for attention.
             seg_pos: DeviceBuffer::<i32>::zeroed(ctx, 9 * max_batch)?,
+            vseq: DeviceBuffer::<i32>::zeroed(ctx, t)?,
+            vpos: DeviceBuffer::<i32>::zeroed(ctx, t)?,
         };
         let mut me = Self {
             stream: Stream::new(ctx)?,
@@ -797,6 +813,8 @@ impl Session {
             seq_reset: (0..n_seqs).map(|_| None).collect(),
             dense_rows: 0,
             phase: (0, [0.0; 4], 0),
+            last_rows: Vec::new(),
+            verify_graphs: std::collections::HashMap::new(),
             w,
         };
         me.capture_graph()?;
@@ -910,7 +928,7 @@ impl Session {
             let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, captured, .. } = self;
             let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
             captured.clear();
-            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: None, logits, next, part_v, part_i, dops };
             forward(&Exec { st: stream, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, Some(captured), &mut SpecIo::none(), 0, Some(&mut io), None)?;
         } else {
             let t1 = std::time::Instant::now();
@@ -970,7 +988,7 @@ impl Session {
         let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, batch_graphs, .. } = self;
         let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, .. } = b;
         let g = stream.capture(|st| {
-            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+            let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: None, logits, next, part_v, part_i, dops };
             forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut SpecIo::none(), 0, Some(&mut io), None)
         })?;
         batch_graphs[n] = Some(g);
@@ -1133,6 +1151,19 @@ impl Session {
         }
         self.b.seq.copy_from_slice(&sq)?;
         self.b.pos.copy_from_slice(&ps)?;
+        // Short segments only (verification): every row's sequence and position.
+        let verify = segs.iter().all(|sg| sg.len <= 8) && segs.iter().any(|sg| sg.len > 1);
+        if verify {
+            let (mut vs, mut vp) = (vec![0i32; tmax], vec![0i32; tmax]);
+            for sg in &segs {
+                for r in 0..sg.len {
+                    vs[sg.row0 + r] = sg.seq as i32;
+                    vp[sg.row0 + r] = (sg.pos0 as usize + r) as i32;
+                }
+            }
+            self.b.vseq.copy_from_slice(&vs)?;
+            self.b.vpos.copy_from_slice(&vp)?;
+        }
         self.set_dense(rows)?;
         self.s.token.copy_from_slice(&tok)?;
         self.b.seg_pos.copy_from_slice(&sp)?;
@@ -1140,21 +1171,57 @@ impl Session {
         let conv_stride = self.w.cfg.conv_len() as u32;
         let n_seqs = self.n_seqs as u32;
         {
-            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, .. } = self;
-            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos } = b;
+            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, verify_graphs, .. } = self;
+            let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos, vseq, vpos } = b;
             let cap = *capacity;
-            // One-off graph (as in prefill): PDL off for the large prefill kernels.
+            // Verification passes of equal-length parts (at least two: their segments are all
+            // table-driven, so the graph replays for any sequences and positions) reuse a graph
+            // per (parts, tokens); anything else runs a one-off graph (as in prefill).
+            let key = (verify && segs.len() >= 2 && segs.iter().all(|sg| sg.len == segs[0].len) && std::env::var_os("ASTRAL_VERIFY_NO_CACHE").is_none()).then(|| (segs.len(), segs[0].len));
+            if let Some(g) = key.and_then(|k| verify_graphs.get(&k)) {
+                g.launch(stream)?;
+                stream.synchronize()?;
+            } else {
+            // PDL off for the large prefill kernels.
             let prev = stream.context().set_pdl(std::env::var_os("ASTRAL_PREFILL_PDL").is_some());
             let g = stream.capture(|st| {
-                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, logits, next, part_v, part_i, dops };
+                let vr = verify.then_some(BatchRows { rows: SeqRows { seq: &*vseq, n_seqs, conv_stride }, pos: &*vpos });
+                let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride }, pos: &*pos, verify: vr, logits, next, part_v, part_i, dops };
                 forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
             });
             stream.context().set_pdl(prev);
-            g?.launch(stream)?;
+            let g = g?;
+            g.launch(stream)?;
             stream.synchronize()?;
+            if let Some(k) = key {
+                verify_graphs.insert(k, g);
+            }
+            }
         }
         let next = self.b.next.to_vec()?;
+        if verify && self.w.output.ty == GemvType::Q8_0 && rows <= self.b.next.len() {
+            // Every row's pick: the segment's last row is its next token.
+            self.last_rows = next[..rows].iter().map(|&t| t as u32).collect();
+            return Ok(segs.iter().map(|sg| next[sg.row0 + sg.len - 1] as u32).collect());
+        }
+        self.last_rows.clear();
         Ok(next[..segs.len()].iter().map(|&t| t as u32).collect())
+    }
+
+    /// Verification pass: every part's tokens (at most 8 each) fed to its sequence, returning
+    /// the greedy pick after each of them (`picks[p][i]` follows token i of part p).
+    pub fn step_verify(&mut self, parts: &[(usize, u32, &[u32])]) -> Result<Vec<Vec<u32>>> {
+        if parts.iter().any(|p| p.2.len() > 8) || parts.iter().all(|p| p.2.len() == 1) || self.w.output.ty != GemvType::Q8_0 {
+            return Err(bad("step_verify: parts of 1..=8 tokens (not all one), Q8_0 LM head".into()));
+        }
+        self.step_mixed(parts)?;
+        let mut out = Vec::with_capacity(parts.len());
+        let mut r = 0usize;
+        for p in parts {
+            out.push(self.last_rows[r..r + p.2.len()].to_vec());
+            r += p.2.len();
+        }
+        Ok(out)
     }
 
     /// Prefills `tokens` into sequence `seq` from position `pos` (0 for a new sequence, after
@@ -1562,6 +1629,9 @@ struct BatchRows<'a> {
 struct BatchIo<'a> {
     rows: SeqRows<'a>,
     pos: &'a DeviceBuffer<i32>,
+    /// Packed passes of short segments (verification): every row's sequence and position, for
+    /// the decode attention over each row's own cache.
+    verify: Option<BatchRows<'a>>,
     logits: &'a mut DeviceBuffer<f32>,
     next: &'a mut DeviceBuffer<i32>,
     part_v: &'a mut DeviceBuffer<f32>,
@@ -1609,6 +1679,10 @@ fn forward(
         }
         _ => None,
     };
+    let vrows = match (segs, batch.as_deref()) {
+        (Some(_), Some(b)) if dec.is_none() => b.verify,
+        _ => None,
+    };
     let d = cfg.dim;
     let td = ntok * d;
     let rs = s.tmax * d;
@@ -1633,7 +1707,7 @@ fn forward(
         }
         visit += 1;
         let mut hist = io.hist.as_deref_mut().map(|h| Hist { buf: &mut h[slot], rows: hist_rows });
-        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs, dec)?;
+        layer(ex, w, s, &mut kc[slot], &mut vc[slot], &mut conv[slot], ip, loop_i, blocks, next_row, capacity, pos0, ntok, hist.as_mut(), seq, brows, segs, dec, vrows)?;
         if let Some(c) = captured.as_deref_mut() {
             ex.st.synchronize()?;
             let mut v = s.cur.to_vec()?;
@@ -1701,6 +1775,19 @@ fn forward(
         }
     }
 
+    // Verification passes: logits and greedy pick of every row (row r into output row r).
+    if let (Some(_), Some(b), Some(_)) = (segs, batch.as_deref_mut(), vrows.as_ref()) {
+        if w.output.ty == GemvType::Q8_0 && ntok <= b.next.len() {
+            let vp = w.output.n as usize;
+            ex.ops.mix(ex.st, &s.bank, &blocks, rs, &s.cur, &w.output_res_query, 1, &mut s.m, d as u32, ntok as u32)?;
+            ex.ops.rms_q8(ex.st, &s.m, d, Some(&w.output_norm), Some(&mut s.mn), &mut s.qa[0], ntok as u32, cfg.rms_eps)?;
+            ex.gemv.launch_q_dense(ex.st, &mut [MultiItem { m: &w.output, x: &s.qa[0], y: &mut *b.logits }], ntok as u32)?;
+            if cfg.softcap != 0.0 {
+                ex.ops.softcap(ex.st, &mut *b.logits, (vp * ntok) as u32, cfg.softcap)?;
+            }
+            return b.dops.argmax_rows(ex.st, &*b.logits, vp as u32, cfg.vocab as u32, ntok as u32, &mut *b.part_v, &mut *b.part_i, &mut *b.next);
+        }
+    }
     // Packed prefill: logits and greedy pick after the last row of every segment (into the
     // batch output buffers, row i for segment i).
     if let (Some((list, _)), Some(b)) = (segs, batch.as_deref_mut()) {
@@ -1937,6 +2024,7 @@ fn layer(
     batch: Option<BatchRows>,
     segs: Option<(&[Seg], &DeviceBuffer<i32>)>,
     dec: Option<(BatchRows, usize)>,
+    verify: Option<BatchRows>,
 ) -> Result<()> {
     let cfg = &w.cfg;
     let l = &w.layers[ip];
@@ -2396,7 +2484,15 @@ fn layer(
         // Packed prefill: every segment's attention in one launch.
         let all_flash = list.iter().all(|sg| prefill && hd == 128 && n_rel <= 16 && n_rel.is_multiple_of(4) && !split_prefill() && sg.len > 0);
         let one_launch = packed && (list.len() > 1 || n_dec > 0) && all_flash && (sg_max_kv(list, kv_span) < i32::MAX as usize) && std::env::var_os("ASTRAL_ATTN_PER_SEG").is_none();
-        if one_launch {
+        // Verification passes (short segments, rows' sequences and positions given): the decode
+        // attention per row over its sequence's cache, which already holds the pass's K / V.
+        let per_row = verify.is_some() && n_dec == 0 && list.iter().all(|sg| sg.len <= 8) && std::env::var_os("ASTRAL_VERIFY_SEGS").is_none();
+        if per_row {
+            let vr = verify.as_ref().expect("checked");
+            let splits = capacity.div_ceil(ATT_CHUNK);
+            ex.ops.attn_decode_split(st, &s.q, &s.r, &s.sinks, &*kc_all, &*vc_all, &l.rel_bias, &mut s.attn_work, &mut s.attn, vr.pos, shape, nt, splits, false, None, Some(vr.rows))?;
+        }
+        if one_launch && !per_row {
             if let Some((dr, nd)) = dec.as_ref() {
                 // Decoding sequences: the batched decode attention over each row's own cache.
                 let splits = capacity.div_ceil(ATT_CHUNK);
@@ -2412,7 +2508,7 @@ fn layer(
             }
         }
         for (si, sg) in list.iter().enumerate() {
-            if one_launch {
+            if one_launch || per_row {
                 break;
             }
             let (r0, n) = (sg.row0, sg.len);

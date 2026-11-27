@@ -353,6 +353,43 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 }
             }
         }
+        "verifycheck" => {
+            // A packed pass of 3 tokens per sequence must pick what three decode steps pick.
+            let toks: Vec<Vec<u32>> = (0..n).map(|q| (0..3).map(|j| (1000 + (q * 3 + j) * 7919 % 150000) as u32).collect()).collect();
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let parts: Vec<(usize, u32, &[u32])> = (0..n).map(|q| (q, 64u32, &toks[q][..])).collect();
+            let a = s.step_verify(&parts)?;
+            for q in 0..n {
+                s.reset_seq(q)?;
+                s.prefill_seq(q, 0, &long[..64])?;
+            }
+            let mut b = vec![Vec::new(); n];
+            for j in 0..3 {
+                let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: 64 + j as u32, token: toks[q][j] }).collect();
+                for (q, t) in s.decode_batch(&rows)?.into_iter().enumerate() {
+                    b[q].push(t);
+                }
+            }
+            let same: usize = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).filter(|(u, v)| u == v).count()).sum();
+            let by: Vec<usize> = (0..3).map(|j| a.iter().zip(&b).filter(|(x, y)| x[j] == y[j]).count()).collect();
+            // The same rows through a plain prompt pass (the kernels verification uses).
+            let mut pf = vec![Vec::new(); n];
+            for j in 0..3 {
+                for q in 0..n {
+                    s.reset_seq(q)?;
+                    let mut p = long[..64].to_vec();
+                    p.extend_from_slice(&toks[q][..=j]);
+                    pf[q].push(s.prefill_seq(q, 0, &p)?);
+                }
+            }
+            let byp: Vec<usize> = (0..3).map(|j| a.iter().zip(&pf).filter(|(x, y)| x[j] == y[j]).count()).collect();
+            println!("verifycheck: verify vs prompt pass by position {byp:?}");
+            println!("verifycheck: {same} / {} picks equal decode's (by position {by:?})", 3 * n);
+            return Ok(same * 10 >= 3 * n * 9);
+        }
         "verify" => {
             // Cost of a pass where each of n sequences feeds v tokens (v = 1..=4), the shape
             // of a batched speculative verification.
@@ -364,16 +401,17 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
             let per = (t_end - std::time::Instant::now()).as_secs_f64() / 4.0;
             for v in 1..=4usize {
                 let parts: Vec<(usize, u32, &[u32])> = (0..n).map(|q| (q, 600u32, &toks[q][..v])).collect();
-                s.step_mixed(&parts)?;
+                let step = |s: &mut Session, p: &[(usize, u32, &[u32])]| -> Result<()> { if v > 1 { s.step_verify(p).map(|_| ()) } else { s.step_mixed(p).map(|_| ()) } };
+                step(&mut s, &parts)?;
                 if std::env::var("ASTRAL_PROFILE").ok().and_then(|x| x.parse::<usize>().ok()) == Some(v) {
                     astral_gpu::profiler(true)?;
-                    s.step_mixed(&parts)?;
+                    step(&mut s, &parts)?;
                     astral_gpu::profiler(false)?;
                     return Ok(true);
                 }
                 let (t0, mut c) = (std::time::Instant::now(), 0usize);
                 while t0.elapsed().as_secs_f64() < per {
-                    s.step_mixed(&parts)?;
+                    step(&mut s, &parts)?;
                     c += 1;
                 }
                 println!("verify {n} x {v}: {:.2} ms per pass", t0.elapsed().as_secs_f64() * 1e3 / c as f64);

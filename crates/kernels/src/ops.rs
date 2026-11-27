@@ -460,6 +460,8 @@ pub struct Gemv {
     ws256: [Function; 5],
     /// Dense prefill GEMM in two-block clusters (activation multicast).
     gemm_mc: Function,
+    /// Persistent expert GEMMs (tiles 128, 64).
+    ws_p: [Function; 2],
     /// Persistent dense prefill GEMM (contiguous tokens, TMA for both operands).
     gemm_dense_p: Function,
     /// Persistent dense TMA GEMMs (tiles 128, 256).
@@ -530,6 +532,14 @@ const GEMM_MC_SMEM: u32 = 4 * (128 * 64 * 2 + 256 * 64 * 2);
 /// tiles of fragments and their scales, rounded to 1 KB (`FWStage<256, 1>`).
 /// One stage of the two-blocks-per-SM variant (`FWStage<128, 4>`: 64 weight rows).
 const WS_X2_STAGE: u32 = (128u32 * 64 * 2 + 4 * 32 * 16 + 4 * 8 * 8).next_multiple_of(1024);
+
+/// One stage of the persistent 128-token kernel (`FWStage<128, 8>`).
+const WS_P128_STAGE: u32 = (128u32 * 64 * 2 + 8 * 32 * 16 + 8 * 8 * 8).next_multiple_of(1024);
+
+fn ws_persist() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ASTRAL_WS_PERSIST").is_ok_and(|v| v == "1"))
+}
 
 fn ws_dual() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -737,6 +747,13 @@ impl Gemv {
                 let k = f("astral_gemm_f16_dense_p")?;
                 let _ = k.set_max_dynamic_shared(GEMM_MC_SMEM);
                 k
+            },
+            ws_p: {
+                let a = f("astral_gemm_nvfp4_ws_p")?;
+                let b = f("astral_gemm_nvfp4_ws_p_t64")?;
+                let _ = a.set_max_dynamic_shared(WS256_SMEM);
+                let _ = b.set_max_dynamic_shared(WS256_SMEM);
+                [a, b]
             },
             gemm_mc: {
                 let k = f("astral_gemm_f16_mc")?;
@@ -1101,6 +1118,25 @@ impl Gemv {
         // Tile 256: 128 weight rows per block; else 256 rows (FW_STAGES = 5 stages either way).
         let (rows, stages) = if dual { (64, 5) } else if tile == 256 { (128, 5) } else { (256, 5) };
         let threads = if dual { 256 } else { 384 };
+        // ASTRAL_WS_PERSIST=1: the persistent kernel (tiles 128 / 64, no fused combine), one block
+        // per SM walking every (row tile, item) pair. Its single loader warp cannot keep the
+        // gathers up (measured slower), so it is off by default.
+        if (tile == 128 || tile == 64) && !dual && pcomb == 0 && ws_persist() {
+            static SMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let sms = *SMS.get_or_init(|| stream.context().device().attribute(astral_gpu::attr::MULTIPROCESSOR_COUNT).map_or(132, |v| v.max(1) as u32));
+            let (mut y16u, mut ni) = (y16 as u32, n_items);
+            let mut pp = [
+                param(&mut pq), param(&mut pa), param(&mut ph), param(&mut py), param(&mut n), param(&mut k), param(&mut pi), param(&mut pxi), param(&mut pyi),
+                param(&mut il), param(&mut xr), param(&mut yr), param(&mut psc), param(&mut nm), param(&mut pact), param(&mut beta), param(&mut lb), param(&mut y16u), param(&mut ni),
+            ];
+            // Tile 128: 128 weight rows per tile (one accumulator tile per warp, which fits the
+            // registers); tile 64: 256 rows.
+            let (f, prow, pstage) = if tile == 128 { (&self.ws_p[0], 128, WS_P128_STAGE) } else { (&self.ws_p[1], 256, stage) };
+            let cfg = LaunchConfig { grid: (((m.n / prow) * n_items).min(sms).max(1), 1, 1), block: (288, 1, 1), shared_mem_bytes: 5 * pstage };
+            // SAFETY: params match astral_gemm_nvfp4_ws_p*: as for ws256 (checked above), plus the
+            // item count; the kernel walks (n / 256) * n_items tiles and clamps every index.
+            return unsafe { f.launch(cfg, stream, &mut pp) };
+        }
         let cfg = LaunchConfig { grid: (m.n / rows, n_items, 1), block: (threads, 1, 1), shared_mem_bytes: stages * stage };
         // SAFETY: params match astral_gemm_nvfp4_ws256*; the fragment planes hold n_mats * n * k
         // values (checked), the f16 activations x_rows rows of k, the work lists cover n_items /

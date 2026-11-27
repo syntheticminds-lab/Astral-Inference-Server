@@ -1197,7 +1197,10 @@ impl Session {
         // Drafts verified this round (ASTRAL_SPEC_KV, default 2 of the k drafted): fewer rows per
         // sequence keep the verify pass (a MoE pass touching more experts per row) near the cost
         // of a plain decode step; 2 measured best serving 8 requests.
-        let kv = std::env::var("ASTRAL_SPEC_KV").ok().and_then(|x| x.parse::<usize>().ok()).unwrap_or(2).clamp(1, k);
+        // Default: a budget of ASTRAL_SPEC_ROWS (24) verify rows per round, so fewer sequences
+        // verify more drafts each.
+        let budget = std::env::var("ASTRAL_SPEC_ROWS").ok().and_then(|x| x.parse::<usize>().ok()).unwrap_or(24);
+        let kv = std::env::var("ASTRAL_SPEC_KV").ok().and_then(|x| x.parse::<usize>().ok()).unwrap_or((budget / entries.len().max(1)).saturating_sub(1)).clamp(1, k);
         let v = kv + 1;
         let mut rows = Vec::with_capacity(entries.len() * v);
         for &(q, p, a, ref d) in entries {

@@ -466,6 +466,7 @@ pub struct Gemv {
     ws_p: [Function; 2],
     /// Persistent dense prefill GEMM (contiguous tokens, TMA for both operands).
     gemm_dense_p: Function,
+    gemm_dense_p128: Function,
     /// Persistent dense TMA GEMMs (tiles 128, 256).
     gemm_tma_p: [Function; 2],
     /// Q8_0 rows kernels for 9..=16 and 17..=32 tokens ([`Gemv::launch_q_rows`]).
@@ -749,6 +750,11 @@ impl Gemv {
             gemm_dense_p: {
                 let k = f("astral_gemm_f16_dense_p")?;
                 let _ = k.set_max_dynamic_shared(GEMM_MC_SMEM);
+                k
+            },
+            gemm_dense_p128: {
+                let k = f("astral_gemm_f16_dense_p128")?;
+                let _ = k.set_max_dynamic_shared(4 * (128 * 64 * 2 + 128 * 64 * 2));
                 k
             },
             ws_p: {
@@ -1646,12 +1652,22 @@ impl Gemv {
         let mut tx = astral_gpu::TensorMap::f16_2d_sw128(xh, ntok as u64, k as u64, 128, 64)?;
         let (mut py, mut nn, mut kk, mut nt) = (y.dptr(), n, k, ntok);
         let mut params = [param(&mut tw), param(&mut tx), param(&mut py), param(&mut nn), param(&mut kk), param(&mut nt)];
-        let tiles = (n / 128) * ntok.div_ceil(256);
-        let cfg = LaunchConfig { grid: (tiles.min(sms), 1, 1), block: (288, 1, 1), shared_mem_bytes: GEMM_MC_SMEM };
+        // 128-token tiles when 256-token ones would leave SMs idle (mid-sized passes);
+        // ASTRAL_DENSE_BT=128/256 forces one.
+        let wide = (n / 128) * ntok.div_ceil(256);
+        let bt = match std::env::var("ASTRAL_DENSE_BT").ok().and_then(|v| v.parse::<u32>().ok()) {
+            Some(128) => 128,
+            Some(256) => 256,
+            _ if wide < sms => 128,
+            _ => 256,
+        };
+        let tiles = (n / 128) * ntok.div_ceil(bt);
+        let (f, smem) = if bt == 128 { (&self.gemm_dense_p128, 4 * (128 * 64 * 2 + 128 * 64 * 2)) } else { (&self.gemm_dense_p, GEMM_MC_SMEM) };
+        let cfg = LaunchConfig { grid: (tiles.min(sms), 1, 1), block: (288, 1, 1), shared_mem_bytes: smem };
         // SAFETY: params match astral_gemm_f16_dense_p (two tensor maps by value, y, n, k, ntok);
         // the tensor maps bound every read (token rows past ntok read as zero) and the kernel
         // writes only rows < ntok of y, which holds them (checked).
-        unsafe { self.gemm_dense_p.launch(cfg, stream, &mut params) }
+        unsafe { f.launch(cfg, stream, &mut params) }
     }
 
     /// Dense prefill product `y[t][n] = x[t] . w[n]` for `ntok` contiguous f16 token rows `xh`

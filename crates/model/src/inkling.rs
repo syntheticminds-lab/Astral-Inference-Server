@@ -2251,7 +2251,12 @@ fn split_prefill() -> bool {
 /// default). `ASTRAL_EXACT_BATCH=1` keeps the batch-exact kernels, which give every row the
 /// same result as decoding it alone.
 fn fast_batch(ntok: usize) -> bool {
-    ntok > QITEM_ROWS && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
+    // Rows above which batched decode takes the tensor-core kernels rather than the
+    // batch-exact ones (ASTRAL_FAST_MIN, default 4: 5 to 8 rows measured 7-15% faster on tensor
+    // cores, 2 to 4 rows no faster).
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| std::env::var("ASTRAL_FAST_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4));
+    ntok > min && std::env::var_os("ASTRAL_EXACT_BATCH").is_none()
 }
 
 /// A dense prefill product on the TMA GEMM: 256-token items when they still give two waves of
@@ -3119,7 +3124,11 @@ fn layer(
         ex.gemv.launch_q(st, &l.down, &s.qa_ff, &mut s.y, Some(&ids as &dyn Dev<i32>))?;
     } else {
         let p32 = pairs as u32;
-        if fast {
+        // Mid-sized packed passes (a decode batch plus a prompt chunk, ASTRAL_MOE_ITEMS_MAX
+        // pairs or fewer) can take the decode path's 8-token items instead of the prefill GEMM.
+        let items_max: usize = std::env::var("ASTRAL_MOE_ITEMS_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let items_ok = s.qa[0].f16_ptr().is_ok() && l.gate_up.frag.is_some() && pairs <= items_max && pairs <= s.items_gu.len() / QItem::WORDS * 8;
+        if fast || (prefill && items_ok) {
             // Large batched decode: tensor-core grouped products, each expert's weights read
             // once per 8 of its tokens.
             let mi = astral_kernels::inkling::moe_items_bound(p32, cfg.n_expert as u32);

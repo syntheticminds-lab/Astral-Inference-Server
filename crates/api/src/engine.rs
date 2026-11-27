@@ -330,7 +330,7 @@ impl<'a> Scheduler<'a> {
             };
             // Batched drafting while few requests run: the prompt now (with the draft context),
             // then speculative rounds.
-            let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
             let load = self.active.len() + self.prefilling.len() + self.waiting.len() + 1;
             let alone = load == 1;
             let spec = job.use_draft && self.s.batch_spec_k() > 0 && !alone && load <= spec_max;
@@ -373,7 +373,7 @@ impl<'a> Scheduler<'a> {
     /// drafting, a decode (or mixed) pass for the rest.
     fn step(&mut self) -> Result<()> {
         // Too many requests for drafting to pay: everyone decodes in one batch from now on.
-        let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         if self.active.len() + self.prefilling.len() + self.waiting.len() > spec_max {
             for a in &mut self.active {
                 a.drafts = None;
@@ -564,7 +564,8 @@ impl<'a> Scheduler<'a> {
     fn prefill_now(&self) -> bool {
         // While requests are drafting, prompts wait (300 ms, or two prompts' worth of tokens)
         // to share a pass: a pass streams the experts however few tokens it holds.
-        let drafting = self.active.iter().any(|a| a.drafts.is_some());
+        // (Only with several requests running: with one or two, the wait just idles the GPU.)
+        let drafting = self.active.len() >= 4 && self.active.iter().any(|a| a.drafts.is_some());
         let wait_ms: u64 = std::env::var("ASTRAL_PREFILL_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(if drafting { 300 } else { 0 });
         if wait_ms == 0 || self.active.is_empty() {
             return true;

@@ -353,6 +353,78 @@ fn cmd_probe(path: &str, what: &str, n: &str, secs: &str) -> Result<bool> {
                 }
             }
         }
+        "speccheck" => {
+            // Batched speculative decoding over n sequences with distinct prompts: 96 tokens each,
+            // against plain batched greedy decode (same prompts).
+            let k: usize = std::env::var("ASTRAL_SPEC_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+            s.enable_spec(std::path::Path::new(path), k)?;
+            s.enable_batch_spec(n)?;
+            let mut rng = 0x2545f4914f6cdd1du64;
+            let prompts: Vec<Vec<u32>> = (0..n)
+                .map(|_| {
+                    (0..256)
+                        .map(|_| {
+                            rng ^= rng << 13;
+                            rng ^= rng >> 7;
+                            rng ^= rng << 17;
+                            (1000 + rng % 150000) as u32
+                        })
+                        .collect()
+                })
+                .collect();
+            let len = 96usize;
+            // Plain greedy reference.
+            let mut plain = vec![Vec::new(); n];
+            let mut last = Vec::new();
+            for q in 0..n {
+                s.reset_seq(q)?;
+                last.push(s.prefill_seq(q, 0, &prompts[q])?);
+                plain[q].push(last[q]);
+            }
+            let t0 = std::time::Instant::now();
+            for step in 0..len - 1 {
+                let rows: Vec<DecodeRow> = (0..n).map(|q| DecodeRow { seq: q, pos: (256 + step) as u32, token: last[q] }).collect();
+                last = s.decode_batch(&rows)?;
+                for q in 0..n {
+                    plain[q].push(last[q]);
+                }
+            }
+            let tp = t0.elapsed().as_secs_f64();
+            // Speculative.
+            let mut out = vec![Vec::new(); n];
+            let mut st: Vec<(usize, u32, u32, Vec<u32>)> = Vec::new();
+            for q in 0..n {
+                s.reset_seq(q)?;
+                let nx = s.prefill_seq_spec(q, 0, &prompts[q])?;
+                out[q].push(nx);
+                let d = s.spec_first_draft(q, 256, nx)?;
+                st.push((q, 256, nx, d));
+            }
+            let (t1, mut rounds) = (std::time::Instant::now(), 0usize);
+            while out.iter().any(|o| o.len() < len) {
+                let res = s.spec_round(&st)?;
+                rounds += 1;
+                for (e, (acc, dr)) in res.into_iter().enumerate() {
+                    let q = st[e].0;
+                    out[q].extend_from_slice(&acc);
+                    st[e].1 += acc.len() as u32;
+                    st[e].2 = *acc.last().expect("non-empty");
+                    st[e].3 = dr;
+                }
+            }
+            let ts = t1.elapsed().as_secs_f64();
+            let made: usize = out.iter().map(|o| o.len() - 1).sum();
+            let same: usize = out.iter().zip(&plain).map(|(a, b)| a.iter().zip(b).take_while(|(x, y)| x == y).count().min(len)).sum();
+            println!(
+                "speccheck {n} x k{k}: {rounds} rounds, {:.2} tokens/round/seq, {:.2} ms/round; spec {:.0} tok/s vs plain {:.0} tok/s; prefix equal to plain {same} / {}",
+                made as f64 / (rounds * n) as f64,
+                ts * 1e3 / rounds as f64,
+                made as f64 / ts,
+                (n * (len - 1)) as f64 / tp,
+                n * len
+            );
+            return Ok(true);
+        }
         "chaincheck" => {
             // Chained verification on the decode kernels: 3 tokens per sequence must pick what
             // three decode steps pick; after keeping only the first, the next step must match a

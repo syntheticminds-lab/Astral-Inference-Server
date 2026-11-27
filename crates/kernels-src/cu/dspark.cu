@@ -202,6 +202,154 @@ extern "C" __global__ void __launch_bounds__(32 * DSP_ATT_WARPS) astral_dsp_attn
     }
 }
 
+// astral_dsp_attn for B blocks at once (grid z = block), each over its own sequence's cache.
+extern "C" __global__ void __launch_bounds__(32 * DSP_ATT_WARPS) astral_dsp_attn_b(const float* __restrict__ q, unsigned q_stride, const float* __restrict__ kc,
+                                                                  const float* __restrict__ vc, float* __restrict__ out, const int* __restrict__ pos_p,
+                                                                  unsigned pos_idx, unsigned nblk, unsigned heads, unsigned kv_heads,
+                                                                  unsigned window, float scale, unsigned capacity, const int* __restrict__ seq_p) { PDL_WAIT();
+    const unsigned t = blockIdx.x, kh = blockIdx.y, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    // Batched: blockIdx.z = block b of sequence seq_p[b], starting at pos_p[pos_idx + b].
+    {
+        const unsigned bz = blockIdx.z;
+        q += (u64)bz * nblk * q_stride;
+        const u64 so = (u64)max(seq_p[bz], 0) * capacity * kv_heads * DSP_HD;
+        kc += so;
+        vc += so;
+        out += (u64)bz * nblk * heads * DSP_HD;
+        pos_idx += bz;
+    }
+    const unsigned g = heads / kv_heads;
+    const int L = min(pos_p[pos_idx] + (int)nblk, (int)capacity);
+    const int lo = window ? max(0, L - (int)window) : 0;
+    const unsigned kvw = kv_heads * DSP_HD;
+    float qr[DSP_MAXG][4], m[DSP_MAXG], l[DSP_MAXG], acc[DSP_MAXG][4];
+#pragma unroll
+    for (unsigned j = 0; j < DSP_MAXG; j++) {
+        m[j] = -INFINITY;
+        l[j] = 0.0f;
+        for (int e = 0; e < 4; e++) { acc[j][e] = 0.0f; qr[j][e] = 0.0f; }
+        if (j < g) {
+            const float4 v = *reinterpret_cast<const float4*>(q + (u64)t * q_stride + (kh * g + j) * DSP_HD + lane * 4);
+            qr[j][0] = v.x * scale; qr[j][1] = v.y * scale; qr[j][2] = v.z * scale; qr[j][3] = v.w * scale;
+        }
+    }
+    for (int key = lo + (int)warp; key < L; key += DSP_ATT_WARPS) {
+        const u64 off = (u64)key * kvw + kh * DSP_HD + lane * 4;
+        const float4 k = *reinterpret_cast<const float4*>(kc + off);
+        const float4 v = *reinterpret_cast<const float4*>(vc + off);
+#pragma unroll
+        for (unsigned j = 0; j < DSP_MAXG; j++) {
+            if (j >= g) break;
+            const float s = warp_sum(qr[j][0] * k.x + qr[j][1] * k.y + qr[j][2] * k.z + qr[j][3] * k.w);
+            const float mn = fmaxf(m[j], s);
+            const float corr = __expf(m[j] - mn), p = __expf(s - mn);
+            l[j] = l[j] * corr + p;
+            acc[j][0] = acc[j][0] * corr + p * v.x;
+            acc[j][1] = acc[j][1] * corr + p * v.y;
+            acc[j][2] = acc[j][2] * corr + p * v.z;
+            acc[j][3] = acc[j][3] * corr + p * v.w;
+            m[j] = mn;
+        }
+    }
+    __shared__ float sm[DSP_ATT_WARPS][DSP_MAXG], sl[DSP_ATT_WARPS][DSP_MAXG], sacc[DSP_ATT_WARPS][DSP_MAXG][DSP_HD];
+#pragma unroll
+    for (unsigned j = 0; j < DSP_MAXG; j++) {
+        if (j >= g) break;
+        if (lane == 0) { sm[warp][j] = m[j]; sl[warp][j] = l[j]; }
+        for (int e = 0; e < 4; e++) sacc[warp][j][lane * 4 + e] = acc[j][e];
+    }
+    __syncthreads();
+    const unsigned d = threadIdx.x;  // the first 128 threads = head dim
+    if (d >= DSP_HD) return;
+    for (unsigned j = 0; j < g; j++) {
+        float mm = -INFINITY;
+        for (int w = 0; w < DSP_ATT_WARPS; w++) mm = fmaxf(mm, sm[w][j]);
+        float num = 0.0f, den = 0.0f;
+        for (int w = 0; w < DSP_ATT_WARPS; w++) {
+            if (sm[w][j] == -INFINITY) continue;
+            const float c = __expf(sm[w][j] - mm);
+            num += c * sacc[w][j][d];
+            den += c * sl[w][j];
+        }
+        out[(u64)t * heads * DSP_HD + (kh * g + j) * DSP_HD + d] = den > 0.0f ? num / den : 0.0f;
+    }
+}
+
+// Batched draft helpers (row t of B blocks of rps rows: block b = t / rps, row i = t % rps).
+// head_prep_b: as astral_dsp_head_prep with position pos_p[b] + i and, to_cache, row
+// seq_p[b] * capacity + position of dst. Grid (rows, heads), block 64.
+extern "C" __global__ void __launch_bounds__(64) astral_dsp_head_prep_b(const float* src, unsigned src_stride, float* dst, unsigned dst_stride,
+                                                                        const float* __restrict__ w, unsigned rope, const int* __restrict__ pos_p,
+                                                                        const int* __restrict__ seq_p, unsigned rps, unsigned to_cache, unsigned capacity,
+                                                                        float theta, float eps) { PDL_WAIT();
+    const unsigned t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+    const unsigned b = t / rps, ri = t - b * rps;
+    const float* s = src + (u64)t * src_stride + h * DSP_HD;
+    float x1 = s[i], x2 = s[i + 64];
+    if (w) {
+        const float inv = rsqrtf(block_sum(x1 * x1 + x2 * x2) / (float)DSP_HD + eps);
+        x1 *= inv * w[i];
+        x2 *= inv * w[i + 64];
+    }
+    const int pos = pos_p[b] + (int)ri;
+    if (rope) {
+        const float inv_freq = 1.0f / powf(theta, (float)(2 * i) / (float)DSP_HD);
+        float sn, cs;
+        sincosf((float)pos * inv_freq, &sn, &cs);
+        const float o1 = x1 * cs - x2 * sn, o2 = x2 * cs + x1 * sn;
+        x1 = o1;
+        x2 = o2;
+    }
+    const u64 row = to_cache ? (u64)max(seq_p[b], 0) * capacity + (u64)min((unsigned)max(pos, 0), capacity - 1u) : (u64)t;
+    float* d = dst + row * dst_stride + h * DSP_HD;
+    d[i] = x1;
+    d[i + 64] = x2;
+}
+
+// out[t][c] = sum_tap alpha[tap] * feat[tap * tap_stride + rows_p[t] * dim + c]. Grid (ceil(dim / 256), rows).
+extern "C" __global__ void astral_dsp_mix4_b(const float* __restrict__ feat, u64 tap_stride, const int* __restrict__ rows_p,
+                                             float a0, float a1, float a2, float a3, float* __restrict__ out, unsigned dim) { PDL_WAIT();
+    const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= dim) return;
+    const u64 r = (u64)max(rows_p[t], 0) * dim + c;
+    out[(u64)t * dim + c] = a0 * feat[r] + a1 * feat[tap_stride + r] + a2 * feat[2 * tap_stride + r] + a3 * feat[3 * tap_stride + r];
+}
+
+// astral_dsp_markov_in for B sequences: block b uses state row b, token prev[b], writes x row b.
+extern "C" __global__ void astral_dsp_markov_in_b(const float* __restrict__ state, const float* __restrict__ w1, const int* __restrict__ prev,
+                                                  unsigned vocab, unsigned first, float* __restrict__ x) { PDL_WAIT();
+    const unsigned i = threadIdx.x, r = blockDim.x, b = blockIdx.x;
+    const unsigned p = (unsigned)min(max(prev[b], 0), (int)vocab - 1);
+    x[(u64)b * 2 * r + i] = first ? 0.0f : state[(u64)b * r + i];
+    x[(u64)b * 2 * r + r + i] = w1[(u64)p * r + i];
+}
+
+// astral_dsp_markov_gate for B sequences: raw / cf rows b (3 rank), ch row b at ch + b * ch_stride,
+// state row b; the latent is quantised into row b of xq / xd.
+extern "C" __global__ void astral_dsp_markov_gate_b(const float* __restrict__ raw, const float* __restrict__ ch, unsigned ch_stride,
+                                                    const float* __restrict__ cf, const float* __restrict__ bias, float* __restrict__ state,
+                                                    unsigned first, signed char* __restrict__ xq, float* __restrict__ xd) { PDL_WAIT();
+    const unsigned i = threadIdx.x, r = blockDim.x, b = blockIdx.x;
+    raw += (u64)b * 3 * r;
+    ch += (u64)b * ch_stride;
+    cf += (u64)b * 3 * r;
+    const float g = raw[i] + ch[i] + cf[i] + bias[i];
+    const float c = raw[r + i] + ch[r + i] + cf[r + i] + bias[r + i];
+    const float o = raw[2 * r + i] + ch[2 * r + i] + cf[2 * r + i] + bias[2 * r + i];
+    const float gate = 1.0f / (1.0f + expf(-g));
+    const float s0 = first ? 0.0f : state[(u64)b * r + i];
+    state[(u64)b * r + i] = gate * s0 + (1.0f - gate) * tanhf(c);
+    q8_store(tanhf(o), xq + (u64)b * r, xd + (u64)b * (r >> 5), i >> 5, i & 31u, nullptr);
+}
+
+// y[b][j] += base[b * base_stride + j] + fb[j] for j < n, B rows of y_stride. Grid (ceil(n / 256), B).
+extern "C" __global__ void astral_dsp_add_rows(float* __restrict__ y, unsigned y_stride, const float* __restrict__ base, unsigned base_stride,
+                                               const float* __restrict__ fb, unsigned n) { PDL_WAIT();
+    const unsigned j = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
+    if (j >= n) return;
+    y[(u64)b * y_stride + j] += base[(u64)b * base_stride + j] + fb[j];
+}
+
 // One block per row: act = silu(gate) * up over gu = [gate (n_ff) | up (n_ff)], quantised.
 extern "C" __global__ void __launch_bounds__(1024) astral_dsp_swiglu_q8(const float* __restrict__ gu, unsigned n_ff, signed char* __restrict__ xq,
                                                                         float* __restrict__ xd, __half* __restrict__ xh) { PDL_WAIT();

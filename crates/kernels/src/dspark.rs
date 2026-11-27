@@ -54,6 +54,13 @@ pub struct DsparkOps {
     rowmax_part: Function,
     fold_part: Function,
     argmax_fin: Function,
+    /// Batched draft (B blocks or rows of several sequences).
+    head_prep_b: Function,
+    attn_b: Function,
+    mix4_b: Function,
+    markov_in_b: Function,
+    markov_gate_b: Function,
+    add_rows: Function,
 }
 
 /// Blocks of the multi-block argmax (partials per row).
@@ -77,7 +84,80 @@ impl DsparkOps {
             rowmax_part: f("astral_dsp_rowmax_part")?,
             fold_part: f("astral_dsp_fold_part")?,
             argmax_fin: f("astral_dsp_argmax_fin")?,
+            head_prep_b: f("astral_dsp_head_prep_b")?,
+            attn_b: f("astral_dsp_attn_b")?,
+            mix4_b: f("astral_dsp_mix4_b")?,
+            markov_in_b: f("astral_dsp_markov_in_b")?,
+            markov_gate_b: f("astral_dsp_markov_gate_b")?,
+            add_rows: f("astral_dsp_add_rows")?,
         })
+    }
+
+    /// [`DsparkOps::head_prep`] over `rows` rows in blocks of `rps`: row t is row t % rps of
+    /// block b = t / rps, at position `pos[b] + t % rps`; `to_cache` writes row
+    /// `seq[b] * capacity + position` of `dst` (a cache of `capacity` rows per sequence).
+    #[allow(clippy::too_many_arguments)]
+    pub fn head_prep_b(&self, s: &Stream, src: DevicePtr, src_stride: u32, dst: DevicePtr, dst_stride: u32, w: Option<&dyn Dev<f32>>, rope: bool, pos: &dyn Dev<i32>, seq: &dyn Dev<i32>, rps: u32, to_cache: bool, capacity: u32, rows: u32, heads: u32, theta: f32, eps: f32) -> Result<()> {
+        if rows == 0 || rps == 0 || heads == 0 || capacity == 0 || heads * HEAD_DIM > dst_stride {
+            return Err(invalid(format!("head_prep_b: {rows} rows x {heads} heads")));
+        }
+        need("head_prep_b pos", pos.dlen().min(seq.dlen()), rows.div_ceil(rps) as usize)?;
+        let (mut ps, mut ss, mut pd, mut ds, mut pw, mut r) = (src, src_stride, dst, dst_stride, w.map_or(0, |w| w.dptr()), rope as u32);
+        let (mut pp, mut sq, mut rp, mut tc, mut cap, mut th, mut e) = (pos.dptr(), seq.dptr(), rps, to_cache as u32, capacity, theta, eps);
+        let mut p = [param(&mut ps), param(&mut ss), param(&mut pd), param(&mut ds), param(&mut pw), param(&mut r), param(&mut pp), param(&mut sq), param(&mut rp), param(&mut tc), param(&mut cap), param(&mut th), param(&mut e)];
+        Self::go(&self.head_prep_b, s, LaunchConfig { grid: (rows, heads, 1), block: (64, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// [`DsparkOps::attn`] for `blocks` blocks of `nblk` queries (block b over sequence
+    /// `seq[b]`'s cache, `capacity` rows per sequence, ending at `pos[b] + nblk`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_b(&self, s: &Stream, q: DevicePtr, q_stride: u32, kc: DevicePtr, vc: DevicePtr, out: DevicePtr, pos: &dyn Dev<i32>, seq: &dyn Dev<i32>, blocks: u32, nblk: u32, heads: u32, kv_heads: u32, window: u32, capacity: u32) -> Result<()> {
+        if kv_heads == 0 || !heads.is_multiple_of(kv_heads) || heads / kv_heads > MAX_GROUP || nblk == 0 || blocks == 0 {
+            return Err(invalid(format!("dspark attn_b: {heads} heads over {kv_heads} KV heads")));
+        }
+        need("attn_b pos", pos.dlen().min(seq.dlen()), blocks as usize)?;
+        let (mut pq, mut qs, mut pk, mut pv, mut po, mut pp, mut pi) = (q, q_stride, kc, vc, out, pos.dptr(), 0u32);
+        let (mut nb, mut h, mut kh, mut win, mut sc, mut cap, mut sq) = (nblk, heads, kv_heads, window, 1.0f32 / (HEAD_DIM as f32).sqrt(), capacity, seq.dptr());
+        let mut p = [param(&mut pq), param(&mut qs), param(&mut pk), param(&mut pv), param(&mut po), param(&mut pp), param(&mut pi), param(&mut nb), param(&mut h), param(&mut kh), param(&mut win), param(&mut sc), param(&mut cap), param(&mut sq)];
+        Self::go(&self.attn_b, s, LaunchConfig { grid: (nblk, kv_heads, blocks), block: (32 * 16, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// `out[t] = sum alpha[i] * feat[i][rows[t]]` (4 taps `tap_stride` floats apart).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mix4_b(&self, s: &Stream, feat: &dyn Dev<f32>, tap_stride: usize, rows_idx: &dyn Dev<i32>, alpha: [f32; 4], out: &mut dyn DevMut<f32>, rows: u32, dim: u32) -> Result<()> {
+        need("mix4_b out", out.dlen(), (rows * dim) as usize)?;
+        need("mix4_b rows", rows_idx.dlen(), rows as usize)?;
+        let (mut pf, mut ts, mut pr, mut po, mut d) = (feat.dptr(), tap_stride as u64, rows_idx.dptr(), out.dptr(), dim);
+        let [mut a0, mut a1, mut a2, mut a3] = alpha;
+        let mut p = [param(&mut pf), param(&mut ts), param(&mut pr), param(&mut a0), param(&mut a1), param(&mut a2), param(&mut a3), param(&mut po), param(&mut d)];
+        Self::go(&self.mix4_b, s, LaunchConfig { grid: (dim.div_ceil(256), rows, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// [`DsparkOps::markov_in`] for `b` sequences (state rows, tokens `prev[0..b]`, x rows of 2 rank).
+    #[allow(clippy::too_many_arguments)]
+    pub fn markov_in_b(&self, s: &Stream, state: DevicePtr, w1: &dyn Dev<f32>, prev: DevicePtr, vocab: u32, first: bool, x: DevicePtr, rank: u32, b: u32) -> Result<()> {
+        let (mut ps, mut pw, mut pp, mut v, mut f, mut px) = (state, w1.dptr(), prev, vocab, first as u32, x);
+        let mut p = [param(&mut ps), param(&mut pw), param(&mut pp), param(&mut v), param(&mut f), param(&mut px)];
+        Self::go(&self.markov_in_b, s, LaunchConfig { grid: (b, 1, 1), block: (rank, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// [`DsparkOps::markov_gate`] for `b` sequences; `ch` rows `ch_stride` floats apart; the
+    /// latents go to rows 0..b of `qa`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn markov_gate_b(&self, s: &Stream, raw: DevicePtr, ch: DevicePtr, ch_stride: u32, cf: DevicePtr, bias: &dyn Dev<f32>, state: DevicePtr, first: bool, qa: &mut QAct, b: u32) -> Result<()> {
+        let rank = qa.k;
+        let (mut pq, mut pd, _) = qa.planes_for(b)?;
+        let (mut pr, mut pc, mut cs, mut pf, mut pb, mut pst, mut f) = (raw, ch, ch_stride, cf, bias.dptr(), state, first as u32);
+        let mut p = [param(&mut pr), param(&mut pc), param(&mut cs), param(&mut pf), param(&mut pb), param(&mut pst), param(&mut f), param(&mut pq), param(&mut pd)];
+        Self::go(&self.markov_gate_b, s, LaunchConfig { grid: (b, 1, 1), block: (rank, 1, 1), shared_mem_bytes: 0 }, &mut p)
+    }
+
+    /// `y[b][j] += base[b * base_stride + j] + fb[j]` for `j < n`, `rows` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rows(&self, s: &Stream, y: DevicePtr, y_stride: u32, base: DevicePtr, base_stride: u32, fb: &dyn Dev<f32>, n: u32, rows: u32) -> Result<()> {
+        let (mut py, mut ys, mut pb, mut bs, mut pf, mut nn) = (y, y_stride, base, base_stride, fb.dptr(), n);
+        let mut p = [param(&mut py), param(&mut ys), param(&mut pb), param(&mut bs), param(&mut pf), param(&mut nn)];
+        Self::go(&self.add_rows, s, LaunchConfig { grid: (n.div_ceil(256), rows, 1), block: (256, 1, 1), shared_mem_bytes: 0 }, &mut p)
     }
 
     fn go(f: &Function, stream: &Stream, cfg: LaunchConfig, params: &mut [*mut std::ffi::c_void]) -> Result<()> {

@@ -545,6 +545,8 @@ pub struct Spec {
     /// Rows of the last prefill chunk (its last row is the newest committed token's features).
     pub(crate) last_rows: usize,
     pub stats: SpecStats,
+    /// Batched drafting for many sequences ([`Spec::enable_batch`]).
+    pub(crate) batch: Option<Box<BatchDraft>>,
 }
 
 impl Spec {
@@ -624,6 +626,7 @@ impl Spec {
             forced: None,
             forced_host: Vec::new(),
             stats: SpecStats::default(),
+            batch: None,
             ops,
             w,
         })
@@ -712,6 +715,219 @@ impl Spec {
             gemv.launch(st, &self.w.w_s, &self.x2r, 0, &mut self.raw)?;
             self.ops.markov_gate(st, &self.raw, &self.ch.view(i * 3 * r, 3 * r)?, &self.cf, &self.w.rnn_bias, &mut self.state, i == 0, &mut self.qa_lat)?;
             self.ops.fold_argmax(st, &self.w.fold, &self.qa_lat, &self.base.view(i * vp, vp)?, &self.w.fold_bias, vocab, &mut self.part_v, &mut self.part_i, DevIndex::of(token, i as u32 + 1)?)?;
+        }
+        Ok(())
+    }
+}
+
+/// Drafting for up to `bmax` sequences at once: every sequence keeps its own draft K/V cache
+/// (`dcap` positions); a draft call runs B blocks of `block` rows through the draft and the
+/// Markov head for all of them; a context store writes the draft K/V of many target tokens
+/// (rows of the target features) at their sequences and positions.
+pub struct BatchDraft {
+    pub bmax: usize,
+    pub(crate) dcap: u32,
+    pub(crate) ctx_rows: usize,
+    kc: Vec<DeviceBuffer<f32>>,
+    vc: Vec<DeviceBuffer<f32>>,
+    xin: DeviceBuffer<f32>,
+    res: DeviceBuffer<f32>,
+    hid: DeviceBuffer<f32>,
+    hidk: DeviceBuffer<f32>,
+    tmp: DeviceBuffer<f32>,
+    mlp: DeviceBuffer<f32>,
+    qkv: DeviceBuffer<f32>,
+    att: DeviceBuffer<f32>,
+    gu: DeviceBuffer<f32>,
+    emb: DeviceBuffer<f32>,
+    anc: DeviceBuffer<f32>,
+    qa_d: QAct,
+    qa_o: QAct,
+    qa_f: QAct,
+    qa_h: QAct,
+    qa_lat: QAct,
+    ctxmix: DeviceBuffer<f32>,
+    kvctx: DeviceBuffer<f32>,
+    fmix: DeviceBuffer<f32>,
+    fnorm: DeviceBuffer<f32>,
+    cf: DeviceBuffer<f32>,
+    ch: DeviceBuffer<f32>,
+    x2r: DeviceBuffer<f32>,
+    raw: DeviceBuffer<f32>,
+    state: DeviceBuffer<f32>,
+    base: DeviceBuffer<f32>,
+    y: DeviceBuffer<f32>,
+    part_v: DeviceBuffer<f32>,
+    part_i: DeviceBuffer<u32>,
+    zero_ids: DeviceBuffer<i32>,
+    /// Per block: sequence, block start position, feature row of the Markov context.
+    pub(crate) seq_b: DeviceBuffer<i32>,
+    pub(crate) start_b: DeviceBuffer<i32>,
+    pub(crate) mark_b: DeviceBuffer<i32>,
+    /// Tokens `[block row i][b]`: anchors in row 0, then the drafts.
+    pub(crate) tok: DeviceBuffer<i32>,
+    /// Context store rows: feature row, sequence and position of each target token.
+    pub(crate) ctx_feat: DeviceBuffer<i32>,
+    pub(crate) ctx_seq: DeviceBuffer<i32>,
+    pub(crate) ctx_pos: DeviceBuffer<i32>,
+    /// Draft graphs by block count, context-store graphs by row count.
+    pub(crate) draft_graphs: std::collections::HashMap<usize, GraphExec>,
+    pub(crate) store_graphs: std::collections::HashMap<usize, GraphExec>,
+}
+
+impl Spec {
+    /// Batched drafting for up to `bmax` of `n_seqs` sequences of `capacity` positions.
+    pub fn enable_batch(&mut self, ctx: &Arc<Context>, bmax: usize, n_seqs: usize, capacity: u32, vocab_padded: usize) -> Result<()> {
+        let c = self.w.cfg.clone();
+        let z = |n: usize| DeviceBuffer::<f32>::zeroed(ctx, n);
+        let (d, nb, r, k) = (c.hidden, c.block, c.rank, self.k);
+        let (qw, kvw) = (c.heads * HEAD_DIM as usize, c.kv_heads * HEAD_DIM as usize);
+        let rows = bmax * nb;
+        let ctx_rows = self.tmax;
+        let dcap = capacity + nb as u32 + 8;
+        let mut xin = vec![0f32; rows * d];
+        for row in 0..rows {
+            if row % nb != 0 {
+                xin[row * d..(row + 1) * d].copy_from_slice(&self.w.mask_embed);
+            }
+        }
+        let b = BatchDraft {
+            bmax,
+            dcap,
+            ctx_rows,
+            kc: (0..c.layers).map(|_| z(n_seqs * dcap as usize * kvw)).collect::<Result<_>>()?,
+            vc: (0..c.layers).map(|_| z(n_seqs * dcap as usize * kvw)).collect::<Result<_>>()?,
+            xin: DeviceBuffer::from_slice(ctx, &xin)?,
+            res: z(rows * d)?,
+            hid: z(rows * d)?,
+            hidk: z(bmax * k * d)?,
+            tmp: z(rows * d)?,
+            mlp: z(rows * d)?,
+            qkv: z(rows * (qw + 2 * kvw))?,
+            att: z(rows * qw)?,
+            gu: z(rows * 2 * c.inter)?,
+            emb: z(bmax * d)?,
+            anc: z(bmax * d)?,
+            qa_d: QAct::with_f16(ctx, d as u32, rows.max(ctx_rows) as u32)?,
+            qa_o: QAct::with_f16(ctx, qw as u32, rows as u32)?,
+            qa_f: QAct::with_f16(ctx, c.inter as u32, rows as u32)?,
+            qa_h: QAct::with_f16(ctx, d as u32, (bmax * k) as u32)?,
+            qa_lat: QAct::with_f16(ctx, r as u32, bmax as u32)?,
+            ctxmix: z(ctx_rows * d)?,
+            kvctx: z(ctx_rows * 2 * kvw)?,
+            fmix: z(bmax * d)?,
+            fnorm: z(bmax * d)?,
+            cf: z(bmax * 3 * r)?,
+            ch: z(bmax * k * 3 * r)?,
+            x2r: z(bmax * 2 * r)?,
+            raw: z(bmax * 3 * r)?,
+            state: z(bmax * r)?,
+            base: z(bmax * k * vocab_padded)?,
+            y: z(bmax * vocab_padded)?,
+            part_v: z(bmax * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            part_i: DeviceBuffer::zeroed(ctx, bmax * astral_kernels::dspark::ARGMAX_PARTS as usize)?,
+            zero_ids: DeviceBuffer::zeroed(ctx, (bmax * k).max(bmax))?,
+            seq_b: DeviceBuffer::zeroed(ctx, bmax)?,
+            start_b: DeviceBuffer::zeroed(ctx, bmax)?,
+            mark_b: DeviceBuffer::zeroed(ctx, bmax)?,
+            tok: DeviceBuffer::zeroed(ctx, bmax * (k + 1))?,
+            ctx_feat: DeviceBuffer::zeroed(ctx, ctx_rows)?,
+            ctx_seq: DeviceBuffer::zeroed(ctx, ctx_rows)?,
+            ctx_pos: DeviceBuffer::zeroed(ctx, ctx_rows)?,
+            draft_graphs: std::collections::HashMap::new(),
+            store_graphs: std::collections::HashMap::new(),
+        };
+        self.batch = Some(Box::new(b));
+        Ok(())
+    }
+
+    /// Draft K/V of `rows` target tokens: feature rows `ctx_feat`, at sequences `ctx_seq` and
+    /// positions `ctx_pos` (uploaded by the caller).
+    pub(crate) fn batch_store(&mut self, st: &Stream, gemv: &Gemv, rows: usize) -> Result<()> {
+        let Spec { w, ops, feats, tmax, batch, .. } = self;
+        let b = batch.as_deref_mut().ok_or_else(|| bad("batch_store: not enabled".into()))?;
+        let c = &w.cfg;
+        let (d, kvh) = (c.hidden, c.kv_heads as u32);
+        let kvw = kvh * HEAD_DIM;
+        let tap = *tmax * d;
+        let nr = rows as u32;
+        for l in 0..c.layers {
+            let lw = &w.layers[l];
+            ops.mix4_b(st, &*feats, tap, &b.ctx_feat, w.alpha[l], &mut b.ctxmix, nr, d as u32)?;
+            ops.add_rms_q8(st, b.ctxmix.dptr(), rows * d, None, None, &lw.dflare_norm, None, Some(&mut b.qa_d), nr, d as u32, c.eps)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &lw.wkv_ctx, x: &b.qa_d, y: &mut b.kvctx }], nr)?;
+            let kp = b.kvctx.dptr();
+            ops.head_prep_b(st, kp, 2 * kvw, b.kc[l].dptr(), kvw, Some(&lw.k_norm_ctx), true, &b.ctx_pos, &b.ctx_seq, 1, true, b.dcap, nr, kvh, c.theta, c.eps)?;
+            ops.head_prep_b(st, kp + 4 * kvw as u64, 2 * kvw, b.vc[l].dptr(), kvw, None, false, &b.ctx_pos, &b.ctx_seq, 1, true, b.dcap, nr, kvh, c.theta, c.eps)?;
+        }
+        Ok(())
+    }
+
+    /// One draft for `nb` blocks: block b is sequence `seq_b[b]`, anchor `tok[0][b]` at position
+    /// `start_b[b]`, Markov context feature row `mark_b[b]`; writes the `k` drafts to
+    /// `tok[1..=k][b]`.
+    pub(crate) fn batch_draft(&mut self, st: &Stream, gemv: &Gemv, iops: &InklingOps, tw: &TargetWeights, nblocks: usize) -> Result<()> {
+        let Spec { w, ops, feats, tmax, batch, k, .. } = self;
+        let b = batch.as_deref_mut().ok_or_else(|| bad("batch_draft: not enabled".into()))?;
+        let c = &w.cfg;
+        let (d, nb, r, n) = (c.hidden, c.block, c.rank, *k);
+        let (du, nbu, bu) = (d as u32, nb as u32, nblocks as u32);
+        let (heads, kvh) = (c.heads as u32, c.kv_heads as u32);
+        let (qw, kvw) = (heads * HEAD_DIM, kvh * HEAD_DIM);
+        let qkvw = qw + 2 * kvw;
+        let rows = nblocks * nb;
+        let ru = rows as u32;
+        let tap = *tmax * d;
+        // Markov context: each sequence's last committed token's features.
+        ops.mix4_b(st, &*feats, tap, &b.mark_b, w.alpha[c.layers], &mut b.fmix, bu, du)?;
+        ops.add_rms_q8(st, b.fmix.dptr(), nblocks * d, None, None, &w.mk_norm, Some(&mut b.fnorm), None, bu, du, c.eps)?;
+        gemv.launch_ids(st, &w.w_f, &b.fnorm.view(0, nblocks * d)?, du, &mut b.cf, &b.zero_ids.view(0, nblocks)?)?;
+        // Anchors: normalised target embeddings into row 0 of every block.
+        iops.embed(st, &tw.tok_embd, &b.tok.view(0, nblocks)?, &mut b.emb, bu)?;
+        ops.add_rms_q8(st, b.emb.dptr(), nblocks * d, None, None, &tw.tok_norm, Some(&mut b.anc), None, bu, du, tw.cfg.rms_eps)?;
+        for i in 0..nblocks {
+            b.xin.copy_range_from_async(i * nb * d, &b.anc, i * d, d, st)?;
+        }
+        for l in 0..c.layers {
+            let lw = &w.layers[l];
+            let (x, add) = if l == 0 { (b.xin.dptr(), None) } else { (b.res.dptr(), Some(&b.mlp as &dyn Dev<f32>)) };
+            ops.add_rms_q8(st, x, rows * d, add, Some(b.res.dptr()), &lw.in_ln, None, Some(&mut b.qa_d), ru, du, c.eps)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &lw.wqkv, x: &b.qa_d, y: &mut b.qkv }], ru)?;
+            let qp = b.qkv.dptr();
+            ops.head_prep_b(st, qp, qkvw, qp, qkvw, Some(&lw.q_norm), true, &b.start_b, &b.seq_b, nbu, false, b.dcap, ru, heads, c.theta, c.eps)?;
+            ops.head_prep_b(st, qp + 4 * qw as u64, qkvw, b.kc[l].dptr(), kvw, Some(&lw.k_norm), true, &b.start_b, &b.seq_b, nbu, true, b.dcap, ru, kvh, c.theta, c.eps)?;
+            ops.head_prep_b(st, qp + 4 * (qw + kvw) as u64, qkvw, b.vc[l].dptr(), kvw, None, false, &b.start_b, &b.seq_b, nbu, true, b.dcap, ru, kvh, c.theta, c.eps)?;
+            let window = if c.local[l] { c.window + nbu } else { 0 };
+            ops.attn_b(st, qp, qkvw, b.kc[l].dptr(), b.vc[l].dptr(), b.att.dptr(), &b.start_b, &b.seq_b, bu, nbu, heads, kvh, window, b.dcap)?;
+            ops.quant(st, &b.att, qw, ru, &mut b.qa_o)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &lw.wo, x: &b.qa_o, y: &mut b.tmp }], ru)?;
+            ops.add_rms_q8(st, b.res.dptr(), rows * d, Some(&b.tmp), Some(b.res.dptr()), &lw.post_ln, None, Some(&mut b.qa_d), ru, du, c.eps)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &lw.wgu, x: &b.qa_d, y: &mut b.gu }], ru)?;
+            ops.swiglu_q8(st, &b.gu, ru, &mut b.qa_f)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &lw.wdown, x: &b.qa_f, y: &mut b.mlp }], ru)?;
+        }
+        ops.add_rms_q8(st, b.res.dptr(), rows * d, Some(&b.mlp), Some(b.res.dptr()), &w.norm, Some(&mut b.hid), None, ru, du, c.eps)?;
+        // Mask rows 1..=n of every block, compacted: base logits and the rnn_proj hidden terms.
+        for i in 0..nblocks {
+            b.hidk.copy_range_from_async(i * n * d, &b.hid, (i * nb + 1) * d, n * d, st)?;
+        }
+        let kr = (nblocks * n) as u32;
+        ops.quant(st, &b.hidk, du, kr, &mut b.qa_h)?;
+        gemv.launch_q_dense(st, &mut [MultiItem { m: &tw.output, x: &b.qa_h, y: &mut b.base }], kr)?;
+        gemv.launch_ids(st, &w.w_h, &b.hidk.view(0, nblocks * n * d)?, du, &mut b.ch, &b.zero_ids.view(0, nblocks * n)?)?;
+        // The Markov head, step by step for all blocks.
+        let vp = tw.output.n;
+        let vocab = tw.cfg.vocab as u32;
+        let ru32 = r as u32;
+        for i in 0..n {
+            let ti = b.tok.dptr() + 4 * (i * nblocks) as u64;
+            ops.markov_in_b(st, b.state.dptr(), &w.w1, ti, w.w1_rows, i == 0, b.x2r.dptr(), ru32, bu)?;
+            gemv.launch_ids(st, &w.w_s, &b.x2r.view(0, nblocks * 2 * r)?, 2 * ru32, &mut b.raw, &b.zero_ids.view(0, nblocks)?)?;
+            ops.markov_gate_b(st, b.raw.dptr(), b.ch.dptr() + 4 * (i * 3 * r) as u64, (n * 3 * r) as u32, b.cf.dptr(), &w.rnn_bias, b.state.dptr(), i == 0, &mut b.qa_lat, bu)?;
+            gemv.launch_q_dense(st, &mut [MultiItem { m: &w.fold, x: &b.qa_lat, y: &mut b.y }], bu)?;
+            ops.add_rows(st, b.y.dptr(), vp, b.base.dptr() + 4 * (i as u64 * vp as u64), n as u32 * vp, &w.fold_bias, vocab, bu)?;
+            let mut out = b.tok.view_mut((i + 1) * nblocks, nblocks)?;
+            ops.argmax_rows(st, &b.y, vp, vocab, bu, &mut b.part_v, &mut b.part_i, &mut out)?;
         }
         Ok(())
     }

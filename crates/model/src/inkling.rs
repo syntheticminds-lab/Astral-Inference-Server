@@ -1034,12 +1034,18 @@ impl Session {
         if !self.chain_graphs.contains_key(&n) {
             let conv_stride = self.w.cfg.conv_len() as u32;
             let n_seqs = self.n_seqs as u32;
-            let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, chain_graphs, rowstates, .. } = self;
+            let Session { w, stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, chain_graphs, rowstates, spec, .. } = self;
             let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, chain, .. } = b;
             let cp = chain.device_ptr();
+            // Batched drafting: every row's target features for the draft.
+            let feats = spec.as_deref_mut().filter(|sp| sp.batch.is_some()).map(|sp| ([sp.w.cfg.taps[0], sp.w.cfg.taps[1], sp.w.cfg.taps[2]], &mut sp.feats));
             let g = stream.capture(|st| {
+                let mut sio = match feats {
+                    Some((taps, f)) => SpecIo { feats: Some(f), taps, hist: None, hist_rows: 0, all: None, argmax: None },
+                    None => SpecIo::none(),
+                };
                 let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: cp, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: None, rowstates: Some(&rowstates[..]), logits, next, part_v, part_i, dops };
-                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut SpecIo::none(), 0, Some(&mut io), None)
+                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, *capacity, 0, n, None, &mut sio, 0, Some(&mut io), None)
             })?;
             chain_graphs.insert(n, g);
         }
@@ -1047,6 +1053,136 @@ impl Session {
         self.stream.synchronize()?;
         let next = self.b.next.to_vec()?;
         Ok(next[..n].iter().map(|&t| t as u32).collect())
+    }
+
+    /// Batched drafting for up to `bmax` sequences (after [`Session::enable_spec`]).
+    pub fn enable_batch_spec(&mut self, bmax: usize) -> Result<()> {
+        let ctx = self.stream.context().clone();
+        let (n, cap, vp) = (self.n_seqs, self.capacity, self.w.output.n as usize);
+        let sp = self.spec.as_deref_mut().ok_or_else(|| bad("enable_batch_spec: speculative decoding is not enabled".into()))?;
+        sp.enable_batch(&ctx, bmax.min(self.max_batch), n, cap, vp)?;
+        self.chain_graphs.clear();
+        Ok(())
+    }
+
+    /// Drafts per round of batched speculative decoding (0 when not enabled).
+    pub fn batch_spec_k(&self) -> usize {
+        self.spec.as_ref().filter(|sp| sp.batch.is_some()).map_or(0, |sp| sp.k)
+    }
+
+    /// Runs one batched draft: block b is sequence `blocks[b].0`, anchor token `.2` at position
+    /// `.1`, Markov context feature row `.3` (of the last pass); returns each block's drafts.
+    fn batch_draft_run(&mut self, blocks: &[(usize, u32, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        let nb = blocks.len();
+        let Session { w, stream, gemv, ops, spec, .. } = self;
+        let sp = spec.as_deref_mut().ok_or_else(|| bad("spec_round: speculative decoding is not enabled".into()))?;
+        let k = sp.k;
+        let b = sp.batch.as_deref_mut().ok_or_else(|| bad("spec_round: batched drafting is not enabled".into()))?;
+        if nb == 0 || nb > b.bmax {
+            return Err(bad(format!("spec_round: {nb} sequences, at most {}", b.bmax)));
+        }
+        let mut sq = vec![0i32; b.bmax];
+        let mut st = vec![0i32; b.bmax];
+        let mut mk = vec![0i32; b.bmax];
+        let mut tk = vec![0i32; b.bmax * (k + 1)];
+        for (i, &(q, p, t, m)) in blocks.iter().enumerate() {
+            sq[i] = q as i32;
+            st[i] = p as i32;
+            mk[i] = m as i32;
+            tk[i] = t as i32;
+        }
+        b.seq_b.copy_from_slice(&sq)?;
+        b.start_b.copy_from_slice(&st)?;
+        b.mark_b.copy_from_slice(&mk)?;
+        b.tok.copy_from_slice(&tk)?;
+        if !b.draft_graphs.contains_key(&nb) {
+            let g = stream.capture(|s| sp.batch_draft(s, gemv, ops, w, nb))?;
+            sp.batch.as_deref_mut().expect("checked").draft_graphs.insert(nb, g);
+        }
+        let b = sp.batch.as_deref_mut().expect("checked");
+        b.draft_graphs[&nb].launch(stream)?;
+        stream.synchronize()?;
+        let tok = b.tok.to_vec()?;
+        Ok((0..nb).map(|i| (1..=k).map(|r| tok[r * nb + i] as u32).collect()).collect())
+    }
+
+    /// After a prompt (prefilled with the draft context through [`Session::prefill_seq_spec`]):
+    /// the first drafts of sequence `seq`, whose next token `next` sits at position `pos`.
+    pub fn spec_first_draft(&mut self, seq: usize, pos: u32, next: u32) -> Result<Vec<u32>> {
+        let last = self.spec.as_ref().map_or(1, |sp| sp.last_rows).max(1) - 1;
+        Ok(self.batch_draft_run(&[(seq, pos, next, last)])?.remove(0))
+    }
+
+    /// [`Session::prefill_seq`] that also stores the draft's context (batched drafting).
+    pub fn prefill_seq_spec(&mut self, seq: usize, pos: u32, tokens: &[u32]) -> Result<u32> {
+        if seq >= self.n_seqs {
+            return Err(bad(format!("prefill_seq_spec: sequence {seq} of {}", self.n_seqs)));
+        }
+        self.prefill_inner(seq, pos, tokens, true)
+    }
+
+    /// One round of batched speculative decoding. Entry `(seq, pos, anchor, drafts)`: the
+    /// sequence's next input `anchor` at `pos` and its `k` drafts. Verifies all, keeps each
+    /// sequence's matching prefix plus the target's next pick, rolls the conv states back,
+    /// stores the draft context and drafts again. Returns per entry the accepted tokens (the
+    /// matching drafts, then the target's pick: the new anchor, at `pos + len`) and its new drafts.
+    pub fn spec_round(&mut self, entries: &[(usize, u32, u32, Vec<u32>)]) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
+        let k = self.batch_spec_k();
+        if k == 0 || entries.iter().any(|e| e.3.len() != k) {
+            return Err(bad("spec_round: batched drafting is not enabled or drafts are not k long".into()));
+        }
+        let v = k + 1;
+        let mut rows = Vec::with_capacity(entries.len() * v);
+        for &(q, p, a, ref d) in entries {
+            rows.push(DecodeRow { seq: q, pos: p, token: a });
+            for (i, &t) in d.iter().enumerate() {
+                rows.push(DecodeRow { seq: q, pos: p + 1 + i as u32, token: t });
+            }
+        }
+        let picks = self.decode_verify(&rows)?;
+        let mut keep = Vec::with_capacity(entries.len());
+        let mut acc = Vec::with_capacity(entries.len());
+        let mut blocks = Vec::with_capacity(entries.len());
+        for (e, &(q, p, _, ref d)) in entries.iter().enumerate() {
+            let pk = &picks[e * v..(e + 1) * v];
+            let j = d.iter().zip(pk).take_while(|(x, y)| x == y).count();
+            let mut out = d[..j].to_vec();
+            out.push(pk[j]);
+            keep.push((q, e * v + j));
+            blocks.push((q, p + j as u32 + 1, pk[j], e * v + j));
+            acc.push(out);
+        }
+        self.commit_verify(&keep)?;
+        // The draft context of every verified row (rows past the accepted ones are rewritten
+        // by later rounds before they are read).
+        {
+            let Session { stream, gemv, spec, .. } = self;
+            let sp = spec.as_deref_mut().expect("checked by batch_spec_k");
+            let b = sp.batch.as_deref_mut().expect("checked");
+            let n = b.ctx_rows;
+            let (mut f, mut sq, mut ps) = (vec![0i32; n], vec![0i32; n], vec![0i32; n]);
+            for (r, row) in rows.iter().enumerate() {
+                f[r] = r as i32;
+                sq[r] = row.seq as i32;
+                ps[r] = row.pos as i32;
+            }
+            b.ctx_feat.copy_from_slice(&f)?;
+            b.ctx_seq.copy_from_slice(&sq)?;
+            b.ctx_pos.copy_from_slice(&ps)?;
+            let nr = rows.len();
+            if !b.store_graphs.contains_key(&nr) {
+                let g = stream.capture(|s| sp.batch_store(s, gemv, nr))?;
+                sp.batch.as_deref_mut().expect("checked").store_graphs.insert(nr, g);
+            }
+            sp.batch.as_deref_mut().expect("checked").store_graphs[&nr].launch(stream)?;
+        }
+        let drafts = self.batch_draft_run(&blocks)?;
+        if let Some(sp) = self.spec.as_deref_mut() {
+            sp.stats.rounds += entries.len() as u64;
+            sp.stats.drafted += (entries.len() * k) as u64;
+            sp.stats.accepted += acc.iter().map(|a| a.len() as u64 - 1).sum::<u64>();
+        }
+        Ok(acc.into_iter().zip(drafts).collect())
     }
 
     /// After [`Session::decode_verify`]: sequence `seq` keeps the conv state after verify row
@@ -1402,7 +1538,23 @@ impl Session {
             r?;
             stream.synchronize()?;
             // Speculative decoding: the draft's context K/V for this chunk (one-off graph).
-            if let Some(sp) = spec.as_deref_mut() {
+            if let Some(sp) = spec.as_deref_mut().filter(|sp| sp.batch.is_some()) {
+                // Batched drafting: this sequence's draft context for the chunk's rows.
+                let b = sp.batch.as_deref_mut().expect("checked");
+                let n = b.ctx_rows;
+                let rows: Vec<i32> = (0..n as i32).collect();
+                let seqs = vec![seq as i32; n];
+                let poss: Vec<i32> = (0..n).map(|i| *pos as i32 + i.min(t - 1) as i32).collect();
+                b.ctx_feat.copy_from_slice(&rows)?;
+                b.ctx_seq.copy_from_slice(&seqs)?;
+                b.ctx_pos.copy_from_slice(&poss)?;
+                let prev = stream.context().set_pdl(false);
+                let g = stream.capture(|st| sp.batch_store(st, gemv, t));
+                stream.context().set_pdl(prev);
+                g?.launch(stream)?;
+                stream.synchronize()?;
+                sp.last_rows = t;
+            } else if let Some(sp) = spec.as_deref_mut() {
                 let mut wk = MmaWork::default();
                 wk.push(0, &(0..t as u32).map(|r| (r, r)).collect::<Vec<_>>());
                 sp.work_pf.upload(&wk)?;

@@ -16,7 +16,17 @@ Fast, lean LLM inference and serving in Rust and CUDA
 | <a href="https://www.syntheticmindslab.com/astral"><b>Website</b></a> | <a href="docs/README.md"><b>Documentation</b></a> | <a href="docs/getting_started/quickstart.md"><b>Quickstart</b></a> | <a href="docs/benchmarks/inkling2_mini.md"><b>Benchmarks</b></a> | <a href="docs/models/supported_models.md"><b>Supported Models</b></a> | <a href="CONTRIBUTING.md"><b>Contributing</b></a> |
 </p>
 
-🔥 **New:** speculative decoding with the official Inkling 2 Mini DSpark draft and an adaptive draft length. On one H100, Astral decodes **32%** faster than vLLM without a draft and **11%** faster with one. See the [benchmarks](docs/benchmarks/inkling2_mini.md).
+## Astral Inference Server Version: {version number}
+
+Astral now runs Inkling 2 Mini directly from its native safetensors checkpoint, with the model's own MTP draft and a new set of custom CUDA kernels. Tested on a GH200 against vLLM on the same model, **Astral is 54% faster** than vLLM with MTP enabled; vLLM without a draft is slower still.
+
+| Engine | Model | Config | Tokens/s |
+|---|---|---|---|
+| **Astral Inference Server** | Inkling 2 Mini (safetensors) | MTP draft, GH200 | **265** |
+| vLLM | Inkling 2 Mini (safetensors) | MTP draft (DSpark, 7 tokens), GH200 | 162 |
+
+Single-stream decode, 512-token prompts and 128 output tokens, through each engine's OpenAI-compatible server.
+
 
 > **Status:** Version 2.5 is now open source and ready for testing.
 
@@ -58,21 +68,6 @@ Astral currently supports:
 
 Support for more models is coming soon. Find the full list of supported models [here](docs/models/supported_models.md).
 
-## Performance
-
-Single-stream decode speed on an H100 PCIe 80 GB, averaged over 32 prompts and measured through each engine's OpenAI-compatible server:
-
-<p align="center">
-  <img alt="Inkling 2 Mini decode speed relative to vLLM" src="bench/charts/astral_vs_vllm_python.png" width=70%>
-</p>
-
-| Inkling 2 Mini | vLLM | SGLang | **Astral** |
-|---|---|---|---|
-| Without MTP | 130.2 tok/s | 135.6 tok/s | **172.0 tok/s (+32%)** |
-| With MTP (DSpark draft) | 209.6 tok/s | 205.9 tok/s | **233.3 tok/s (+11%)** |
-
-The methodology, per-prompt-set results and the vLLM Rust-frontend comparison are in the [benchmark report](docs/benchmarks/inkling2_mini.md).
-
 ## Getting Started
 
 Install Astral with one command (Linux, an NVIDIA GPU, and the CUDA toolkit with `nvcc` 12.8+):
@@ -88,6 +83,14 @@ Serve Inkling 2 Mini with its DSpark draft, straight from Hugging Face (download
 ```bash
 astral serve thinkingmachines/Inkling-2-Mini
 ```
+
+Or serve one of our GGUF quantisations, with the tokenizer and draft taken from the original model:
+
+```bash
+astral serve synthetic-minds/Inkling-2-Mini-Astral-GGUF/Inkling-2-Mini-Astral-Q-Q8_0.gguf --tokenizer thinkingmachines/Inkling-2-Mini
+```
+
+The server is OpenAI-compatible at `http://localhost:8000/v1`.
 
 Visit our [documentation](docs/README.md) to learn more.
 

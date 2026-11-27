@@ -163,7 +163,10 @@ impl GgmlType {
 
     /// Whether [`dequantize`] supports this type.
     pub fn can_dequantize(self) -> bool {
-        matches!(self, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 | GgmlType::Q8_0 | GgmlType::Nvfp4 | GgmlType::Mxfp4)
+        matches!(
+            self,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 | GgmlType::Q8_0 | GgmlType::Nvfp4 | GgmlType::Mxfp4 | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+        )
     }
 }
 
@@ -431,15 +434,207 @@ pub fn dequantize(ty: GgmlType, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
                 dequant_mxfp4(b, o);
             }
         }
+        GgmlType::Q4_0 => {
+            for (o, b) in out.as_chunks_mut::<32>().0.iter_mut().zip(bytes.as_chunks::<18>().0) {
+                dequant_q4_0(b, o);
+            }
+        }
+        GgmlType::Q4_1 => {
+            for (o, b) in out.as_chunks_mut::<32>().0.iter_mut().zip(bytes.as_chunks::<20>().0) {
+                dequant_q4_1(b, o);
+            }
+        }
+        GgmlType::Q5_0 => {
+            for (o, b) in out.as_chunks_mut::<32>().0.iter_mut().zip(bytes.as_chunks::<22>().0) {
+                dequant_q5_0(b, o);
+            }
+        }
+        GgmlType::Q5_1 => {
+            for (o, b) in out.as_chunks_mut::<32>().0.iter_mut().zip(bytes.as_chunks::<24>().0) {
+                dequant_q5_1(b, o);
+            }
+        }
+        GgmlType::Q4K => {
+            for (o, b) in out.as_chunks_mut::<256>().0.iter_mut().zip(bytes.as_chunks::<144>().0) {
+                dequant_q4_k(b, o);
+            }
+        }
+        GgmlType::Q5K => {
+            for (o, b) in out.as_chunks_mut::<256>().0.iter_mut().zip(bytes.as_chunks::<176>().0) {
+                dequant_q5_k(b, o);
+            }
+        }
+        GgmlType::Q6K => {
+            for (o, b) in out.as_chunks_mut::<256>().0.iter_mut().zip(bytes.as_chunks::<210>().0) {
+                dequant_q6_k(b, o);
+            }
+        }
         other => return Err(AstralError::Unsupported(format!("dequantize {}", other.name()))),
     }
     Ok(out)
+}
+
+fn half(b: &[u8], at: usize) -> f32 {
+    f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]))
+}
+
+/// Q4_0 block: f16 scale, 16 bytes of nibbles (low nibbles are values 0-15, high 16-31), minus 8.
+fn dequant_q4_0(b: &[u8; 18], out: &mut [f32; 32]) {
+    let d = half(b, 0);
+    for i in 0..16 {
+        out[i] = ((b[2 + i] & 0xf) as i32 - 8) as f32 * d;
+        out[i + 16] = ((b[2 + i] >> 4) as i32 - 8) as f32 * d;
+    }
+}
+
+/// Q4_1 block: f16 scale and minimum, then the nibbles as in Q4_0.
+fn dequant_q4_1(b: &[u8; 20], out: &mut [f32; 32]) {
+    let (d, m) = (half(b, 0), half(b, 2));
+    for i in 0..16 {
+        out[i] = (b[4 + i] & 0xf) as f32 * d + m;
+        out[i + 16] = (b[4 + i] >> 4) as f32 * d + m;
+    }
+}
+
+/// Q5_0 block: f16 scale, 32 high bits, 16 bytes of nibbles; values are 5 bits minus 16.
+fn dequant_q5_0(b: &[u8; 22], out: &mut [f32; 32]) {
+    let d = half(b, 0);
+    let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+    for j in 0..16 {
+        let lo = ((b[6 + j] & 0xf) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+        let hi = ((b[6 + j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+        out[j] = lo as f32 * d;
+        out[j + 16] = hi as f32 * d;
+    }
+}
+
+/// Q5_1 block: f16 scale and minimum, 32 high bits, nibbles; values are 5 bits.
+fn dequant_q5_1(b: &[u8; 24], out: &mut [f32; 32]) {
+    let (d, m) = (half(b, 0), half(b, 2));
+    let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    for j in 0..16 {
+        let lo = (b[8 + j] & 0xf) as u32 | (((qh >> j) & 1) << 4);
+        let hi = (b[8 + j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+        out[j] = lo as f32 * d + m;
+        out[j + 16] = hi as f32 * d + m;
+    }
+}
+
+/// The 6-bit scale and minimum of sub-block `j` (0..8) of a Q4_K / Q5_K block's packed scales.
+fn k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+    }
+}
+
+/// Q4_K block (256 values): f16 d and dmin, 12 bytes of 6-bit scales and minimums for 8
+/// sub-blocks of 32, 128 bytes of nibbles.
+fn dequant_q4_k(b: &[u8; 144], out: &mut [f32; 256]) {
+    let (d, dmin) = (half(b, 0), half(b, 2));
+    let (scales, qs) = (&b[4..16], &b[16..144]);
+    let mut is = 0;
+    for (g, chunk) in out.chunks_exact_mut(64).enumerate() {
+        let q = &qs[g * 32..g * 32 + 32];
+        let (sc1, m1) = k_scale_min(is, scales);
+        let (sc2, m2) = k_scale_min(is + 1, scales);
+        let (d1, mm1, d2, mm2) = (d * sc1 as f32, dmin * m1 as f32, d * sc2 as f32, dmin * m2 as f32);
+        for l in 0..32 {
+            chunk[l] = d1 * (q[l] & 0xf) as f32 - mm1;
+            chunk[32 + l] = d2 * (q[l] >> 4) as f32 - mm2;
+        }
+        is += 2;
+    }
+}
+
+/// Q5_K block (256 values): as Q4_K with a fifth bit of every value in 32 more bytes.
+fn dequant_q5_k(b: &[u8; 176], out: &mut [f32; 256]) {
+    let (d, dmin) = (half(b, 0), half(b, 2));
+    let (scales, qh, qs) = (&b[4..16], &b[16..48], &b[48..176]);
+    let (mut is, mut u1, mut u2) = (0, 1u8, 2u8);
+    for (g, chunk) in out.chunks_exact_mut(64).enumerate() {
+        let ql = &qs[g * 32..g * 32 + 32];
+        let (sc1, m1) = k_scale_min(is, scales);
+        let (sc2, m2) = k_scale_min(is + 1, scales);
+        let (d1, mm1, d2, mm2) = (d * sc1 as f32, dmin * m1 as f32, d * sc2 as f32, dmin * m2 as f32);
+        for l in 0..32 {
+            chunk[l] = d1 * ((ql[l] & 0xf) as u32 + if qh[l] & u1 != 0 { 16 } else { 0 }) as f32 - mm1;
+            chunk[32 + l] = d2 * ((ql[l] >> 4) as u32 + if qh[l] & u2 != 0 { 16 } else { 0 }) as f32 - mm2;
+        }
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Q6_K block (256 values): 128 bytes of low nibbles, 64 bytes of high 2-bit pairs, 16 int8
+/// scales (one per 16 values) and an f16 d at the end; values are 6 bits minus 32.
+fn dequant_q6_k(b: &[u8; 210], out: &mut [f32; 256]) {
+    let (ql, qh, sc) = (&b[0..128], &b[128..192], &b[192..208]);
+    let d = half(b, 208);
+    for h in 0..2 {
+        let (ql, qh, sc, y) = (&ql[h * 64..], &qh[h * 32..], &sc[h * 8..], &mut out[h * 128..h * 128 + 128]);
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = ((ql[l] & 0xf) | ((qh[l] & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+            y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+            y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+            y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+            y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_and_k_quants_dequantize() {
+        // Q4_0: d = 0.5, nibble 8 is zero, 0xf9 = low 9 (+1), high 15 (+7).
+        let mut b = [0u8; 18];
+        b[..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        b[2..].fill(0x88);
+        b[2] = 0xf9;
+        let mut o = [0f32; 32];
+        dequant_q4_0(&b, &mut o);
+        assert_eq!((o[0], o[16], o[1]), (0.5, 3.5, 0.0));
+        // Q5_0: high bit set on value 0 and 16 makes 16 - 16 = 0 and (0 | 16) - 16 = 0 for a zero nibble.
+        let mut b = [0u8; 22];
+        b[..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        b[2..6].copy_from_slice(&((1u32 << 0) | (1u32 << 16)).to_le_bytes());
+        b[6] = 0x21; // low 1, high 2
+        let mut o = [0f32; 32];
+        dequant_q5_0(&b, &mut o);
+        assert_eq!((o[0], o[16], o[1]), (1.0, 2.0, -16.0));
+        // Q6_K: all-zero quants decode to -32 * scale * d.
+        let mut b = [0u8; 210];
+        b[192..208].fill(2);
+        b[208..].copy_from_slice(&f32_to_f16(0.25).to_le_bytes());
+        let mut o = [0f32; 256];
+        dequant_q6_k(&b, &mut o);
+        assert!(o.iter().all(|&v| v == -16.0));
+        // Q4_K: d = 1, dmin = 1, scale 3 / min 2 for every sub-block, nibble 5: 3 * 5 - 2 = 13.
+        let mut b = [0u8; 144];
+        b[..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        b[2..4].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        for j in 0..4 {
+            b[4 + j] = 3;
+            b[8 + j] = 2;
+        }
+        for j in 4..8 {
+            b[8 + j] = 3 | (2 << 4); // low: scale, high: min (the "j >= 4" packing)
+        }
+        b[16..].fill(0x55);
+        let mut o = [0f32; 256];
+        dequant_q4_k(&b, &mut o);
+        assert!(o.iter().all(|&v| v == 13.0), "{:?}", &o[..4]);
+    }
 
     #[test]
     fn f16_known_values() {
@@ -554,7 +749,8 @@ mod tests {
         assert!(dequantize(GgmlType::Q8_0, &[0u8; 34], 32).is_ok());
         assert!(dequantize(GgmlType::Q8_0, &[0u8; 33], 32).is_err());
         assert!(dequantize(GgmlType::Nvfp4, &[0u8; 36], 32).is_err(), "NVFP4 blocks are 64 elements");
-        assert!(dequantize(GgmlType::Q4K, &[0u8; 144], 256).is_err(), "unsupported types error, not garbage");
+        assert!(dequantize(GgmlType::Q4K, &[0u8; 144], 256).is_ok());
+        assert!(dequantize(GgmlType::Q2K, &[0u8; 84], 256).is_err(), "unsupported types error, not garbage");
     }
 
     #[test]

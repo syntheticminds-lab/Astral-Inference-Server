@@ -226,6 +226,39 @@ fn interleave_gate_up(raw: &mut [u8], n: usize, mats: usize) -> std::result::Res
     Ok(())
 }
 
+/// `rows` rows of `k` values stored as `ty`, dequantised and requantised to Q8_0 (planes as
+/// [`astral_quant::quantize_q8_0_rows`]), the rows split over the CPU cores.
+fn requant_q8_0(ty: GgmlType, raw: &[u8], rows: usize, k: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (blk, sz) = ty.layout().ok_or_else(|| bad(format!("layout of {}", ty.name())))?;
+    if rows == 0 || !k.is_multiple_of(blk) || !k.is_multiple_of(32) || raw.len() != rows * (k / blk) * sz {
+        return Err(bad(format!("{}: {rows} rows of {k} do not fit {} bytes", ty.name(), raw.len())));
+    }
+    let row_bytes = k / blk * sz;
+    let threads = std::thread::available_parallelism().map_or(8, |p| p.get()).clamp(1, 64);
+    let per = rows.div_ceil(threads);
+    let parts: Vec<Result<(Vec<u8>, Vec<u8>)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .filter(|t| t * per < rows)
+            .map(|t| {
+                let (r0, r1) = (t * per, ((t + 1) * per).min(rows));
+                let bytes = &raw[r0 * row_bytes..r1 * row_bytes];
+                sc.spawn(move || {
+                    let v = astral_quant::dequantize(ty, bytes, (r1 - r0) * k)?;
+                    astral_quant::quantize_q8_0_rows(&v, r1 - r0, k)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(bad("requantise: worker panicked".into())))).collect()
+    });
+    let (mut qs, mut aux) = (Vec::with_capacity(rows * k), Vec::with_capacity(rows * k / 16));
+    for p in parts {
+        let (q, a) = p?;
+        qs.extend(q);
+        aux.extend(a);
+    }
+    Ok((qs, aux))
+}
+
 struct Loader<'a> {
     g: &'a Gguf,
     ctx: &'a Arc<Context>,
@@ -262,6 +295,12 @@ impl Loader<'_> {
             GgmlType::Nvfp4 => {
                 let (q, a) = astral_quant::repack_nvfp4(&raw)?;
                 (GemvType::Nvfp4, q, a)
+            }
+            // llama.cpp quantisations (Q4_0 .. Q6_K): requantised to Q8_0 on load, so the GPU
+            // kernels see the same format as a Q8_0 file (about 8.5 bits per weight).
+            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+                let (q, a) = requant_q8_0(t.ty, &raw, (n * mats) as usize, k as usize).map_err(|e| bad(format!("{name}: {e}")))?;
+                (GemvType::Q8_0, q, a)
             }
             other => return Err(bad(format!("{name}: type {} not supported by the P1 GEMV", other.name()))),
         };

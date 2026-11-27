@@ -2,6 +2,19 @@
 
 Single-stream decode speed of Astral, vLLM and SGLang serving Inkling 2 Mini on one GPU.
 
+## GH200: safetensors checkpoint with the MTP draft
+
+Single-stream decode of Inkling 2 Mini (native safetensors checkpoint) on a GH200, 512-token prompts and 128 output tokens, through each engine's OpenAI-compatible server.
+
+| Engine | Model | Config | Tokens/s |
+|---|---|---|---|
+| **Astral Inference Server** | Inkling 2 Mini (safetensors) | MTP draft, GH200 | **265** |
+| vLLM | Inkling 2 Mini (safetensors) | MTP draft (DSpark, 7 tokens), GH200 | 162 |
+
+Astral is 54% faster than vLLM with MTP enabled. vLLM without a draft reaches 159 tokens/s.
+
+## H100 PCIe
+
 ## Setup
 
 | | |

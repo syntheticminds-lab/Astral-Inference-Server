@@ -942,7 +942,7 @@ fn cmd_serve(a: &[String]) -> Result<bool> {
     }
     let m = astral_loader::hub::resolve(&model, &opts)?;
     let tok_dir = match tokenizer {
-        Some(t) => astral_loader::hub::resolve(&t, &opts)?.weights,
+        Some(t) => astral_loader::hub::resolve_companion(&t, &opts)?.weights,
         None => m.tokenizer_dir.clone().ok_or_else(|| bad(format!("serve: no tokenizer.json next to {}; pass --tokenizer <dir or org/name>", m.weights.display())))?,
     };
     if !tok_dir.join("tokenizer.json").exists() {

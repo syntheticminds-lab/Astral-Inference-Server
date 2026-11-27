@@ -41,6 +41,17 @@ pub struct HubOptions {
 /// Resolves a model argument (local path or Hugging Face repository id) to local files,
 /// downloading them if needed.
 pub fn resolve(model: &str, opts: &HubOptions) -> Result<ResolvedModel> {
+    resolve_with(model, opts, false)
+}
+
+/// Resolves the companion of a GGUF model (`--tokenizer`): like [`resolve`], but a repository
+/// supplies only its tokenizer, chat template, configuration and draft (`mtp.safetensors`), not
+/// its weights.
+pub fn resolve_companion(model: &str, opts: &HubOptions) -> Result<ResolvedModel> {
+    resolve_with(model, opts, true)
+}
+
+fn resolve_with(model: &str, opts: &HubOptions, companion: bool) -> Result<ResolvedModel> {
     let p = Path::new(model);
     if p.exists() {
         let name = p.file_stem().or_else(|| p.file_name()).map_or_else(|| model.to_string(), |s| s.to_string_lossy().into_owned());
@@ -63,6 +74,7 @@ pub fn resolve(model: &str, opts: &HubOptions) -> Result<ResolvedModel> {
         .iter()
         .filter(|f| match &repo.file {
             Some(g) => f.path == *g || is_tokenizer_file(&f.path),
+            None if companion => is_tokenizer_file(&f.path) || f.path == "mtp.safetensors",
             None => is_checkpoint_file(&f.path),
         })
         .collect();
@@ -71,7 +83,7 @@ pub fn resolve(model: &str, opts: &HubOptions) -> Result<ResolvedModel> {
     {
         return Err(AstralError::Invalid(format!("{}: no file {g} at revision {rev}", repo.id)));
     }
-    if repo.file.is_none() && !wanted.iter().any(|f| f.path.ends_with(".safetensors")) {
+    if repo.file.is_none() && !companion && !wanted.iter().any(|f| f.path.ends_with(".safetensors")) {
         let ggufs: Vec<&str> = listing.iter().filter(|f| f.path.ends_with(".gguf")).map(|f| f.path.as_str()).collect();
         let hint = if ggufs.is_empty() { String::new() } else { format!("; for a GGUF file use {}/{}", repo.id, ggufs[0]) };
         return Err(AstralError::Invalid(format!("{}: no safetensors weights at revision {rev}{hint}", repo.id)));

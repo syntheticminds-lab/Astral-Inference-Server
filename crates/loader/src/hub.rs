@@ -36,6 +36,28 @@ pub struct HubOptions {
     pub revision: Option<String>,
     /// Download directory (default `$ASTRAL_CACHE` or `~/.cache/astral/hub`).
     pub download_dir: Option<PathBuf>,
+    /// `model_type`s of `config.json` the caller can serve. When not empty, a checkpoint of
+    /// another type is refused before its weights are downloaded.
+    pub model_types: Vec<String>,
+}
+
+/// Refuses a checkpoint directory whose `config.json` has a `model_type` outside `accepted`
+/// (no `config.json`, or an empty list, accepts).
+pub fn check_model_type(dir: &Path, accepted: &[String]) -> Result<()> {
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else { return Ok(()) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return Ok(()) };
+    let Some(ty) = v.get("model_type").and_then(|t| t.as_str()) else { return Ok(()) };
+    if accepted.iter().any(|a| a == ty) {
+        return Ok(());
+    }
+    let arch = v.get("architectures").and_then(|a| a.get(0)).and_then(|a| a.as_str()).unwrap_or("unknown architecture");
+    Err(AstralError::Invalid(format!(
+        "this model is {ty} ({arch}), which `astral serve` does not support; it serves Inkling 2 Mini ({}). See docs/models/supported_models.md for the models Astral supports",
+        accepted.join(", ")
+    )))
 }
 
 /// Resolves a model argument (local path or Hugging Face repository id) to local files,
@@ -55,6 +77,9 @@ fn resolve_with(model: &str, opts: &HubOptions, companion: bool) -> Result<Resol
     let p = Path::new(model);
     if p.exists() {
         let name = p.file_stem().or_else(|| p.file_name()).map_or_else(|| model.to_string(), |s| s.to_string_lossy().into_owned());
+        if p.is_dir() && !companion {
+            check_model_type(p, &opts.model_types)?;
+        }
         let tokenizer_dir = if p.is_dir() { Some(p.to_path_buf()) } else { p.parent().filter(|d| d.join("tokenizer.json").exists()).map(Path::to_path_buf) };
         return Ok(ResolvedModel { weights: p.to_path_buf(), tokenizer_dir, name });
     }
@@ -87,6 +112,15 @@ fn resolve_with(model: &str, opts: &HubOptions, companion: bool) -> Result<Resol
         let ggufs: Vec<&str> = listing.iter().filter(|f| f.path.ends_with(".gguf")).map(|f| f.path.as_str()).collect();
         let hint = if ggufs.is_empty() { String::new() } else { format!("; for a GGUF file use {}/{}", repo.id, ggufs[0]) };
         return Err(AstralError::Invalid(format!("{}: no safetensors weights at revision {rev}{hint}", repo.id)));
+    }
+    // The configuration first: a model Astral cannot serve is refused before its weights download.
+    if repo.file.is_none()
+        && !companion
+        && !opts.model_types.is_empty()
+        && let Some(cfg) = wanted.iter().find(|f| f.path == "config.json")
+    {
+        download(&repo.id, &rev, cfg, &root)?;
+        check_model_type(&root, &opts.model_types)?;
     }
     let total: u64 = wanted.iter().map(|f| f.size).sum();
     eprintln!("astral: {} ({rev}): {} files, {:.2} GB -> {}", repo.id, wanted.len(), total as f64 / 1e9, root.display());

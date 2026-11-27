@@ -888,6 +888,8 @@ fn cmd_serve(a: &[String]) -> Result<bool> {
     }
     let model = a[0].clone();
     let mut opts = astral_loader::hub::HubOptions::default();
+    // `astral serve` serves Inkling 2 Mini (checkpoint `model_type` inkling2_loop).
+    opts.model_types = vec!["inkling2_loop".to_string()];
     let (mut tokenizer, mut name, mut draft, mut k, mut host, mut port, mut ctx, mut queue, mut max_seqs) = (None::<String>, None::<String>, true, 6usize, "0.0.0.0".to_string(), 8000u16, 8192u32, 64usize, 0usize);
     let (mut util, mut batched) = (None::<f32>, None::<usize>);
     let mut i = 1;

@@ -11,6 +11,7 @@ All notable changes to Astral Inference Server are documented here.
 ### Added
 
 - `install.sh`: one-line install (`curl -fsSL .../install.sh | sh`) that builds Astral for the local GPUs.
+- `astral serve` takes a Hugging Face repository id (`org/name`, or `org/name/file.gguf`) and downloads it on first use, reusing the Hugging Face cache; new vLLM-style options `--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--kv-cache-dtype`, `--served-model-name`, `--tokenizer`, `--revision`, `--download-dir`, `--num-speculative-tokens`, and `--help`.
 - Inkling 2 Mini loads straight from its native safetensors checkpoint (`astral serve <checkpoint dir>`), converted on load to the same tensors as the GGUF path.
 - OpenAI-compatible server (`astral serve`): `/v1/completions`, `/v1/chat/completions` (streaming, stop strings, reasoning output, tool calls), `/v1/models`, `/tokenize`, `/health`.
 - Inkling 2 Mini chat template and tokenizer, matching reference token ids.

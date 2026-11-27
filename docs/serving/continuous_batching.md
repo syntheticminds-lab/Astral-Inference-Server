@@ -53,34 +53,3 @@ For many concurrent short requests, lower `--ctx`:
 ```bash
 astral serve Inkling-2-Mini/ --ctx 2048 --max-seqs 64
 ```
-
-## Performance
-
-Inkling 2 Mini on one H100 PCIe 80 GB, served with `--ctx 2048 --max-seqs 64`;
-vLLM (`vllm/vllm-openai:nightly`) and SGLang (`lmsysorg/sglang:inkling-2-mini`) serve the
-native checkpoint with their defaults. Load from `vllm bench serve`: random prompts, 512 input
-and 128 output tokens, `ignore_eos`, 8 x concurrency prompts (at least 16).
-[`bench/baseline_servers.sh`](../../bench/baseline_servers.sh) runs it.
-
-| Concurrency | Astral | Astral + DSpark (previous build) | vLLM | SGLang |
-|---|---|---|---|---|
-| 1 | 149.1 tok/s | **165.7 tok/s** | 113.9 tok/s | 123.3 tok/s |
-| 8 | 422.0 tok/s | 409.7 tok/s | 316.7 tok/s | **509.8 tok/s** |
-| 32 | 623.1 tok/s | 595.8 tok/s | **1203.3 tok/s** | 901.7 tok/s |
-| 64 | 682.4 tok/s | 649.9 tok/s | **1781.5 tok/s** | 1195.8 tok/s |
-
-Time to first token, p50 / p99:
-
-| Concurrency | Astral | vLLM | SGLang |
-|---|---|---|---|
-| 1 | 104 / 751 ms | 57 / 1953 ms | 81 / 233 ms |
-| 8 | 558 / 1255 ms | 229 / 6810 ms | 375 / 736 ms |
-| 32 | 2114 / 6519 ms | 613 / 2909 ms | 1046 / 1443 ms |
-| 64 | 4180 / 11974 ms | 607 / 3366 ms | 1839 / 2717 ms |
-
-Astral leads at concurrency 1 and is ahead of vLLM at 8; from 32 up it is behind both. At
-these concurrencies the workload is dominated by prefill (four prompt tokens per output
-token), and Astral's prefill runs at about 5,000 tokens/s (512 tokens in 100 ms alone, 16 x
-512 in 1.0 s packed), well below what the GPU allows. A batched decode step takes 5.5 ms
-for 1 sequence, 13.9 ms for 9, 30.8 ms for 33 and 51 ms for 64. Faster prefill GEMMs and
-batched decode kernels are the next work.

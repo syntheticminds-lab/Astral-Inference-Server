@@ -4,14 +4,12 @@ This guide serves Inkling 2 Mini with its DSpark draft and sends requests to it.
 
 ## 1. Get the model files
 
-Astral runs Inkling 2 Mini from its native checkpoint directory: the safetensors weights, the tokenizer (`tokenizer.json`), the configuration (`config.json`, with `mtp_config`) and the DSpark draft (`mtp.safetensors`).
-
-A GGUF file of the model works too: pass it as the model and the checkpoint directory with `--checkpoint`, for the tokenizer and the draft.
+Nothing to do: `astral serve thinkingmachines/Inkling-2-Mini` downloads the native checkpoint (safetensors weights, tokenizer, configuration and the DSpark draft) on first use. To use files you already have, pass their directory instead, or a GGUF file with `--tokenizer`. See the [server reference](../serving/openai_compatible_server.md#the-model-argument).
 
 ## 2. Start the server
 
 ```bash
-astral serve Inkling-2-Mini/
+astral serve thinkingmachines/Inkling-2-Mini
 ```
 
 Loading takes about half a minute: weights, draft, and CUDA graph capture. The server is ready when it prints:

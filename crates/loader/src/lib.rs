@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hub;
 pub mod inkling_checkpoint;
 pub mod safetensors;
 

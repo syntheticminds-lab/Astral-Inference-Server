@@ -711,6 +711,12 @@ impl Session {
     /// A session with `n_seqs` independent sequences of `capacity` positions each, decoded
     /// together up to `max_batch` at a time ([`Session::decode_batch`]).
     pub fn with_seqs(ctx: &Arc<Context>, w: Weights, capacity: u32, n_seqs: usize, max_batch: usize) -> Result<Self> {
+        Self::with_pass_rows(ctx, w, capacity, n_seqs, max_batch, None)
+    }
+
+    /// [`Session::with_seqs`] with at most `pass_rows` tokens per forward pass (prompt chunks
+    /// and decoding sequences together; default [`PREFILL_TMAX`], or `ASTRAL_TMAX`).
+    pub fn with_pass_rows(ctx: &Arc<Context>, w: Weights, capacity: u32, n_seqs: usize, max_batch: usize, pass_rows: Option<usize>) -> Result<Self> {
         if capacity == 0 || capacity > astral_kernels::inkling::MAX_CTX {
             return Err(bad(format!("capacity {capacity} outside 1..={}", astral_kernels::inkling::MAX_CTX)));
         }
@@ -718,7 +724,7 @@ impl Session {
         let reg = KernelRegistry::load(ctx)?;
         let c = &w.cfg;
         // Rows per pass. Packed passes hold several sequences, so this may exceed the context.
-        let tmax = std::env::var("ASTRAL_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_TMAX).clamp(1, MAX_PASS_ROWS);
+        let tmax = pass_rows.or_else(|| std::env::var("ASTRAL_TMAX").ok().and_then(|v| v.parse().ok())).unwrap_or(PREFILL_TMAX).clamp(1, MAX_PASS_ROWS);
         let max_batch = max_batch.clamp(1, n_seqs).min(PREFILL_TMAX);
         // Batch rows share the prefill scratch: it must hold max_batch tokens.
         let tmax = tmax.max(max_batch);

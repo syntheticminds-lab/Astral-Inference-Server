@@ -83,10 +83,10 @@ curl -fsSL https://raw.githubusercontent.com/syntheticminds-lab/Astral-Inference
 
 The script builds Astral for the GPUs in your machine, installs Rust if it is missing, links `astral` into `~/.local/bin` and runs the kernel self-test. To build by hand instead, see [installation](docs/getting_started/installation.md).
 
-Serve Inkling 2 Mini with its DSpark draft, straight from the checkpoint directory:
+Serve Inkling 2 Mini with its DSpark draft, straight from Hugging Face (downloaded on first use; a local checkpoint directory or a GGUF file works too):
 
 ```bash
-astral serve Inkling-2-Mini/
+astral serve thinkingmachines/Inkling-2-Mini
 ```
 
 Visit our [documentation](docs/README.md) to learn more.

@@ -644,6 +644,10 @@ pub struct Session {
     rowstates: Vec<DeviceBuffer<f32>>,
     state_ptrs: Option<(DeviceBuffer<u64>, DeviceBuffer<u64>)>,
     chain_graphs: std::collections::HashMap<usize, GraphExec>,
+    /// The next prefill stores batched drafting's context (set by prefill_seq_spec).
+    batch_prefill: bool,
+    /// The next step_mixed captures the target features (set by step_mixed_spec).
+    mixed_feats: bool,
 }
 
 /// Device buffers of the batched decode pass.
@@ -830,6 +834,8 @@ impl Session {
             rowstates: Vec::new(),
             state_ptrs: None,
             chain_graphs: std::collections::HashMap::new(),
+            batch_prefill: false,
+            mixed_feats: false,
             w,
         };
         me.capture_graph()?;
@@ -1118,7 +1124,64 @@ impl Session {
         if seq >= self.n_seqs {
             return Err(bad(format!("prefill_seq_spec: sequence {seq} of {}", self.n_seqs)));
         }
+        self.batch_prefill = true;
         self.prefill_inner(seq, pos, tokens, true)
+    }
+
+    /// [`Session::step_mixed`] that also stores batched drafting's context for the parts marked
+    /// in `spec` (prompt chunks of drafting requests), and drafts for the marked parts in `first`
+    /// (prompts this pass finishes: their pick is the anchor at the part's end). Returns the
+    /// picks and, per `first` part, its drafts.
+    pub fn step_mixed_spec(&mut self, parts: &[(usize, u32, &[u32])], spec: &[bool], first: &[bool]) -> Result<(Vec<u32>, Vec<Option<Vec<u32>>>)> {
+        let any = spec.iter().any(|&x| x) && self.batch_spec_k() > 0;
+        self.mixed_feats = any;
+        let picks = self.step_mixed(parts)?;
+        let mut drafts = vec![None; parts.len()];
+        if !any {
+            return Ok((picks, drafts));
+        }
+        let mut row0 = 0usize;
+        let (mut f, mut sq, mut ps) = (Vec::new(), Vec::new(), Vec::new());
+        let mut blocks = Vec::new();
+        let mut which = Vec::new();
+        for (i, &(q, p, t)) in parts.iter().enumerate() {
+            if spec[i] {
+                for r in 0..t.len() {
+                    f.push((row0 + r) as i32);
+                    sq.push(q as i32);
+                    ps.push((p as usize + r) as i32);
+                }
+                if first[i] {
+                    blocks.push((q, p + t.len() as u32, picks[i], row0 + t.len() - 1));
+                    which.push(i);
+                }
+            }
+            row0 += t.len();
+        }
+        {
+            let Session { stream, gemv, spec: sp, .. } = self;
+            let sp = sp.as_deref_mut().expect("checked by batch_spec_k");
+            let b = sp.batch.as_deref_mut().expect("checked");
+            let n = b.ctx_rows;
+            let nr = f.len();
+            f.resize(n, 0);
+            sq.resize(n, 0);
+            ps.resize(n, 0);
+            b.ctx_feat.copy_from_slice(&f)?;
+            b.ctx_seq.copy_from_slice(&sq)?;
+            b.ctx_pos.copy_from_slice(&ps)?;
+            let prev = stream.context().set_pdl(false);
+            let g = stream.capture(|s| sp.batch_store(s, gemv, nr));
+            stream.context().set_pdl(prev);
+            g?.launch(stream)?;
+            stream.synchronize()?;
+        }
+        if !blocks.is_empty() {
+            for (i, d) in which.into_iter().zip(self.batch_draft_run(&blocks)?) {
+                drafts[i] = Some(d);
+            }
+        }
+        Ok((picks, drafts))
     }
 
     /// One round of batched speculative decoding. Entry `(seq, pos, anchor, drafts)`: the
@@ -1409,13 +1472,16 @@ impl Session {
         let conv_stride = self.w.cfg.conv_len() as u32;
         let n_seqs = self.n_seqs as u32;
         {
-            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, verify_graphs, .. } = self;
+            let want_feats = std::mem::take(&mut self.mixed_feats);
+            let Session { w, eager_stream: stream, gemv, ops, rms, kc, vc, conv, s, capacity, b, verify_graphs, spec, .. } = self;
+            // Batched drafting: the pass's target features (for the draft context of prompts).
+            let mut feats = if want_feats { spec.as_deref_mut().filter(|sp| sp.batch.is_some()).map(|sp| ([sp.w.cfg.taps[0], sp.w.cfg.taps[1], sp.w.cfg.taps[2]], &mut sp.feats)) } else { None };
             let BatchBufs { seq, pos, logits, next, part_v, part_i, dops, seg_pos, vseq, vpos, .. } = b;
             let cap = *capacity;
             // Verification passes of equal-length parts (at least two: their segments are all
             // table-driven, so the graph replays for any sequences and positions) reuse a graph
             // per (parts, tokens); anything else runs a one-off graph (as in prefill).
-            let key = (verify && segs.len() >= 2 && segs.iter().all(|sg| sg.len == segs[0].len) && std::env::var_os("ASTRAL_VERIFY_NO_CACHE").is_none()).then(|| (segs.len(), segs[0].len));
+            let key = (feats.is_none() && verify && segs.len() >= 2 && segs.iter().all(|sg| sg.len == segs[0].len) && std::env::var_os("ASTRAL_VERIFY_NO_CACHE").is_none()).then(|| (segs.len(), segs[0].len));
             if let Some(g) = key.and_then(|k| verify_graphs.get(&k)) {
                 g.launch(stream)?;
                 stream.synchronize()?;
@@ -1425,7 +1491,11 @@ impl Session {
             let g = stream.capture(|st| {
                 let vr = verify.then_some(BatchRows { rows: SeqRows { seq: &*vseq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*vpos });
                 let mut io = BatchIo { rows: SeqRows { seq: &*seq, n_seqs, conv_stride, chain: 0, rowstate: 0, conv_base: 0 }, pos: &*pos, verify: vr, rowstates: None, logits, next, part_v, part_i, dops };
-                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut SpecIo::none(), 0, Some(&mut io), Some((&segs, &*seg_pos)))
+                let mut sio = match feats.take() {
+                    Some((taps, f)) => SpecIo { feats: Some(f), taps, hist: None, hist_rows: 0, all: None, argmax: None },
+                    None => SpecIo::none(),
+                };
+                forward(&Exec { st, gemv, ops, rms }, w, kc, vc, conv, s, cap, 0, rows, None, &mut sio, 0, Some(&mut io), Some((&segs, &*seg_pos)))
             });
             stream.context().set_pdl(prev);
             let g = g?;
@@ -1473,6 +1543,8 @@ impl Session {
     }
 
     fn prefill_inner(&mut self, seq: usize, pos_start: u32, tokens: &[u32], draft: bool) -> Result<u32> {
+        // Batched drafting's context (prefill_seq_spec), or the lone draft's.
+        let batch_ctx = std::mem::take(&mut self.batch_prefill);
         if tokens.is_empty() {
             return Err(bad("prefill: no tokens".into()));
         }
@@ -1538,7 +1610,7 @@ impl Session {
             r?;
             stream.synchronize()?;
             // Speculative decoding: the draft's context K/V for this chunk (one-off graph).
-            if let Some(sp) = spec.as_deref_mut().filter(|sp| sp.batch.is_some()) {
+            if let Some(sp) = spec.as_deref_mut().filter(|sp| sp.batch.is_some() && batch_ctx) {
                 // Batched drafting: this sequence's draft context for the chunk's rows.
                 let b = sp.batch.as_deref_mut().expect("checked");
                 let n = b.ctx_rows;

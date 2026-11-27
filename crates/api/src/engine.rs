@@ -117,7 +117,9 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
     let per_seq = astral_model::inkling::seq_bytes(&w.cfg, cfg.ctx);
     let (free, _) = ctx.mem_info()?;
     // The draft's weights and buffers come out of the same memory.
-    let reserve = RESERVE_BYTES + if cfg.draft.is_some() { 2 << 30 } else { 0 };
+    // (Batched drafting adds per-sequence draft caches and verification row states: ~5 GB.)
+    let batch_spec = std::env::var("ASTRAL_BATCH_SPEC").is_ok_and(|v| v == "1");
+    let reserve = RESERVE_BYTES + if cfg.draft.is_some() { if batch_spec { 7 << 30 } else { 2 << 30 } } else { 0 };
     let fit = free.saturating_sub(reserve) / per_seq.max(1);
     let seqs = if cfg.max_seqs == 0 { fit.clamp(1, AUTO_MAX_SEQS) } else { cfg.max_seqs };
     if seqs > fit.max(1) {
@@ -142,6 +144,17 @@ fn load(cfg: &EngineConfig) -> Result<Session> {
             s.spec_next()?;
         }
         s.reset()?;
+        // ASTRAL_BATCH_SPEC=1: batched drafting for requests that start while few are running.
+        // At 8 concurrent requests its generation is ~24% faster, but its prompt passes cost
+        // more, so serving measured even; off by default until those passes are cheaper.
+        if std::env::var("ASTRAL_BATCH_SPEC").is_ok_and(|v| v == "1") {
+            s.enable_batch_spec(seqs)?;
+            s.reset_seq(0)?;
+            let first = s.prefill_seq_spec(0, 0, &warm)?;
+            let d = s.spec_first_draft(0, warm.len() as u32, first)?;
+            s.spec_round(&[(0, warm.len() as u32, first, d)])?;
+            s.reset_seq(0)?;
+        }
     }
     // Batched decode: one graph per batch size, exercised once on every slot.
     for n in 1..=s.max_batch() {
@@ -174,6 +187,9 @@ struct Active {
     sent: usize,
     /// Decoding with speculative rounds (sequence 0, alone).
     spec: bool,
+    /// Batched speculative decoding: the drafts for the next round (the draft context is
+    /// current only while set, so a request never leaves and rejoins).
+    drafts: Option<Vec<u32>>,
 }
 
 /// Why a request ended, if it did.
@@ -209,6 +225,9 @@ struct Pending {
     done: usize,
     /// When the request was admitted.
     since: std::time::Instant,
+    /// Batched drafting: the prompt's passes store the draft context and the request starts
+    /// with drafts.
+    spec: bool,
 }
 
 struct Scheduler<'a> {
@@ -308,7 +327,12 @@ impl<'a> Scheduler<'a> {
                 self.waiting.push_front(job);
                 break;
             };
-            let alone = self.active.is_empty() && self.waiting.is_empty() && self.prefilling.is_empty();
+            // Batched drafting while few requests run: the prompt now (with the draft context),
+            // then speculative rounds.
+            let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            let load = self.active.len() + self.prefilling.len() + self.waiting.len() + 1;
+            let alone = load == 1;
+            let spec = job.use_draft && self.s.batch_spec_k() > 0 && !alone && load <= spec_max;
             if alone && seq == 0 && job.use_draft && self.s.spec_enabled() {
                 match self.s.reset().and_then(|_| self.s.spec_begin(&job.prompt)) {
                     Ok(first) => self.start(job, seq, first, true),
@@ -323,14 +347,14 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             self.free[seq] = false;
-            self.prefilling.push_back(Pending { job, seq, done: 0, since: std::time::Instant::now() });
+            self.prefilling.push_back(Pending { job, seq, done: 0, since: std::time::Instant::now(), spec });
         }
     }
 
     /// A request whose prompt is in slot `seq` and whose first token is `first`.
     fn start(&mut self, job: Job, seq: usize, first: u32, spec: bool) {
         self.free[seq] = false;
-        let mut a = Active { pos: job.prompt.len() as u32, job, seq, last: first, sent: 0, spec };
+        let mut a = Active { pos: job.prompt.len() as u32, job, seq, last: first, sent: 0, spec, drafts: None };
         match a.emit(first) {
             Emit::More => self.active.push(a),
             end => self.retire(a, end),
@@ -344,8 +368,114 @@ impl<'a> Scheduler<'a> {
         self.free[a.seq] = true;
     }
 
-    /// One decode step for every running request.
+    /// One decode step for every running request: a batched speculative round for those
+    /// drafting, a decode (or mixed) pass for the rest.
     fn step(&mut self) -> Result<()> {
+        // Too many requests for drafting to pay: everyone decodes in one batch from now on.
+        let spec_max: usize = std::env::var("ASTRAL_SPEC_MAX_ACTIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        if self.active.len() + self.prefilling.len() + self.waiting.len() > spec_max {
+            for a in &mut self.active {
+                a.drafts = None;
+            }
+        }
+        // While prompts are pending, drafting requests ride in the packed pass as one-token
+        // rows (their context is stored and they draft again after it).
+        let mixing = !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= self.s.max_batch() && self.prefill_now();
+        if self.active.iter().any(|a| a.drafts.is_some()) && !mixing {
+            let (spec, rest): (Vec<Active>, Vec<Active>) = std::mem::take(&mut self.active).into_iter().partition(|a| a.drafts.is_some());
+            self.active = rest;
+            let kept = self.spec_step(spec);
+            let r = if self.active.is_empty() && self.prefilling.is_empty() { Ok(()) } else { self.plain_step() };
+            match kept {
+                Ok(k) => self.active.extend(k),
+                Err(e) => return Err(e),
+            }
+            return r;
+        }
+        self.plain_step()
+    }
+
+    /// One batched speculative round for `spec` (requests with drafts); returns those still running.
+    fn spec_step(&mut self, spec: Vec<Active>) -> Result<Vec<Active>> {
+        let cap = self.s.capacity() as usize;
+        let k = self.s.batch_spec_k();
+        let (mut live, mut done) = (Vec::new(), Vec::new());
+        for a in spec {
+            if a.pos as usize + k + 2 > cap {
+                done.push(a);
+            } else {
+                live.push(a);
+            }
+        }
+        for a in done {
+            self.retire(a, Emit::Finished("length"));
+        }
+        let mb = self.s.max_batch();
+        let mut kept = Vec::with_capacity(live.len());
+        for chunk in live.chunks_mut(mb) {
+            let entries: Vec<(usize, u32, u32, Vec<u32>)> = chunk.iter().map(|a| (a.seq, a.pos, a.last, a.drafts.clone().unwrap_or_default())).collect();
+            let t0 = std::time::Instant::now();
+            let res = self.s.spec_round(&entries)?;
+            if std::env::var_os("ASTRAL_SPEC_STATS").is_some() {
+                static C: std::sync::Mutex<(u64, u64, u64, f64, Option<std::time::Instant>)> = std::sync::Mutex::new((0, 0, 0, 0.0, None));
+                let mut c = C.lock().unwrap_or_else(|e| e.into_inner());
+                c.0 += 1;
+                c.1 += entries.len() as u64;
+                c.2 += res.iter().map(|r| r.0.len() as u64).sum::<u64>();
+                c.3 += t0.elapsed().as_secs_f64();
+                let since = *c.4.get_or_insert(t0);
+                if c.0 % 100 == 0 {
+                    eprintln!(
+                        "astral: spec rounds {}: {:.2} requests per round, {:.2} tokens per request, {:.2} ms per round, {:.1} s in rounds of {:.1} s",
+                        c.0,
+                        c.1 as f64 / c.0 as f64,
+                        c.2 as f64 / c.1 as f64,
+                        c.3 * 1e3 / c.0 as f64,
+                        c.3,
+                        since.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            if let Some(st) = self.stats.as_mut() {
+                st.decode.0 += 1;
+                st.decode.1 += t0.elapsed().as_secs_f64();
+                st.decode.2 += res.iter().map(|r| r.0.len()).sum::<usize>();
+                st.report();
+            }
+            for (a, (acc, d)) in chunk.iter_mut().zip(res) {
+                a.pos += acc.len() as u32;
+                a.drafts = Some(d);
+                let mut end = Emit::More;
+                for &t in &acc {
+                    end = a.emit(t);
+                    if !matches!(end, Emit::More) {
+                        break;
+                    }
+                }
+                if let Some(&t) = acc.last() {
+                    a.last = t;
+                }
+                if !matches!(end, Emit::More) {
+                    a.drafts = None;
+                    a.sent = usize::MAX;
+                    if let Emit::Finished(f) = end {
+                        let _ = a.job.tx.send(Event::Done { finish: f });
+                    }
+                }
+            }
+        }
+        for a in live {
+            if a.sent == usize::MAX {
+                self.free[a.seq] = true;
+            } else {
+                kept.push(a);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// One decode (or mixed) step for the requests without drafts.
+    fn plain_step(&mut self) -> Result<()> {
         if self.active.is_empty() && self.prefilling.is_empty() {
             return Ok(());
         }
@@ -387,6 +517,10 @@ impl<'a> Scheduler<'a> {
         let mb = self.s.max_batch();
         if !self.prefilling.is_empty() && self.active.len() + self.prefilling.len() <= mb && self.prefill_now() {
             return self.mixed_step();
+        }
+        // A plain decode step does not store the draft context: drafting stops for these.
+        for a in &mut self.active {
+            a.drafts = None;
         }
         let mut start = 0;
         while start < self.active.len() {
@@ -454,8 +588,22 @@ impl<'a> Scheduler<'a> {
             left -= n;
         }
         let views: Vec<(usize, u32, &[u32])> = parts.iter().map(|(q, pos, t)| (*q, *pos, t.as_slice())).collect();
+        // Drafting requests' prompt chunks also store the draft context; the ones finishing
+        // here get their first drafts.
+        let n_dec0 = self.active.len();
+        let mut spec_f = vec![false; views.len()];
+        let mut first_f = vec![false; views.len()];
+        for (i, a) in self.active.iter().enumerate() {
+            spec_f[i] = a.drafts.is_some();
+            first_f[i] = a.drafts.is_some();
+        }
+        for (c, &(i, n)) in chunks.iter().enumerate() {
+            let p = &self.prefilling[i];
+            spec_f[n_dec0 + c] = p.spec;
+            first_f[n_dec0 + c] = p.spec && p.done + n == p.job.prompt.len();
+        }
         let t0 = std::time::Instant::now();
-        let next = self.s.step_mixed(&views)?;
+        let (next, mut first_drafts) = self.s.step_mixed_spec(&views, &spec_f, &first_f)?;
         if let Some(st) = self.stats.as_mut() {
             let p: usize = chunks.iter().map(|c| c.1).sum();
             st.mixed.0 += 1;
@@ -465,17 +613,20 @@ impl<'a> Scheduler<'a> {
             st.report();
         }
         let n_dec = self.active.len();
-        for (a, &t) in self.active.iter_mut().zip(&next[..n_dec]) {
+        for (i, (a, &t)) in self.active.iter_mut().zip(&next[..n_dec]).enumerate() {
             a.pos += 1;
             a.last = t;
+            if a.drafts.is_some() {
+                a.drafts = first_drafts[i].take();
+            }
         }
         // Prompts that finished this pass start decoding with the token it produced.
         let mut finished = Vec::new();
-        for (&(i, n), &t) in chunks.iter().zip(&next[n_dec..]) {
+        for (c, (&(i, n), &t)) in chunks.iter().zip(&next[n_dec..]).enumerate() {
             let p = &mut self.prefilling[i];
             p.done += n;
             if p.done == p.job.prompt.len() {
-                finished.push((i, t));
+                finished.push((i, t, c));
             }
         }
         let mut i = 0;
@@ -489,9 +640,15 @@ impl<'a> Scheduler<'a> {
                 }
             }
         }
-        for &(i, t) in finished.iter().rev() {
+        for &(i, t, c) in finished.iter().rev() {
             let p = self.prefilling.remove(i).expect("finished prompt is pending");
-            self.start(p.job, p.seq, t, false);
+            let seq = p.seq;
+            self.start(p.job, seq, t, false);
+            if let Some(d) = first_drafts[n_dec0 + c].take()
+                && let Some(a) = self.active.iter_mut().find(|a| a.seq == seq)
+            {
+                a.drafts = Some(d);
+            }
         }
         Ok(())
     }
